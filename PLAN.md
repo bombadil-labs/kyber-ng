@@ -82,6 +82,34 @@ slots are filled. The T10 built-in agent-loop handler is the degenerate case (a 
 reactor's future {inputs, function} declaration and the gather's dispatch are the
 same shape, so the L4 upgrade is a drop-in.
 
+**Ad-hoc containers = the hyperview's type (user refinement, 2026-08-06 — the
+synthesis of loam's container primitive and the gather):** the ideal abstraction to
+"gather-into" is the container — loam's §27 primitive (its own delta-set, resolvable
+in its own right, spawn/seed/resolve/ship/drop) IS the lifecycle of a handler's
+accumulated input view. A handler's declared input shape compiles to a container's
+MEMBERSHIP TERM — no new language. The contract: `{ inputs: [container_spec, ...],
+function: (containers) -> [delta] }`; partial application = each incoming delta
+routes into the containers whose membership it satisfies; SATURATION = the bound
+container's membership is complete; the function fires when every bound argument is
+saturated. Consequences: (a) content-addressing gives determinism — a saturated
+container's identity derives from its contents, so a firing is reproducible and the
+door dedups its outputs (idempotence stays structural, one level up); (b) the
+ephemeral/persisted axis is POSTURE — a SHARED hyperview (live reading, dropped after
+firing) is the pulse; a SEPARATE one (materialized bytes) is memory; the admission
+knob tunes which containers a delta gathers into (persist-everything default = every
+container separate until tuned shared); (c) PROMOTION is the one operation — a pulse
+container worth remembering is materialized (same deltas, same identity, posture
+flipped: the quarantine→blessed, ephemeral→memory, untrusted-peer→trusted arcs are
+all the same move); (d) the reactor graph closes — firing outputs gather into
+downstream containers, making the L4 reactor a router over one primitive. The vault
+(T7) is retroactively validated: it WAS a shared container (membership =
+memory-shaped deltas, resolved into markdown); the cap is a bounded-membership
+container. T10 discipline: ad-hoc containers stay GATHER-INTERNAL (no curated
+entity, no new claim vocabulary — their declaration lives in the handler spec);
+promotion to a named loam.container (§27 vocabulary) is the later landing point,
+after loam's container design settles — kyber never races the substrate, but the
+gather is container-shaped on day one.
+
 **Success Criteria (the gate):**
 - `mix test` green; `! grep -r "Process.sleep" test/`; `mix format --check-formatted` exits 0.
 - THE operational run (the gate's verification, executed by Hermes): the daemon boots,
