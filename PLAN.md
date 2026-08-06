@@ -175,7 +175,13 @@ interpretation, vault-to-store writes.
   OPERATIONAL run: boot the daemon, ingest live, watch the loop close and the vault
   grow; re-boot idempotent. The Gather is container-shaped per the model (ad-hoc
   containers, admission-policy default persist-everything, `(delta[]) -> delta[]`
-  handler contract).
+  handler contract). **Launch notes: (a) RE-TRIAL PRIME-AGENT on T10** — the shared
+  daemon's other-tab work is nearly done; prime-agent gets a genuine shot at this
+  build (T-series brief, per the 2026-08-06 agreement) before defaulting to
+  claude-code — its ARC-AGI-3-class model may generalize where Opus pattern-matches;
+  (b) **cache-warm sessions** — no more cold-start `claude -p` per step where it
+  matters: use `--continue`/`--resume <session>` for follow-up steps in a loop so the
+  substrate context stays warm (user note 2026-08-06: cold starts forfeit caching).
 
 ## 2. Active Backlog
 
