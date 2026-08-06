@@ -31,7 +31,7 @@ defmodule Kyber.CLI do
   never a crash.
   """
 
-  alias Kyber.{DurableStore, Federation, Harness, Migration, Vault}
+  alias Kyber.{DurableStore, Federation, Harness, Migration, Peer, Vault}
 
   @usage """
   kyber [--log <path>] <command> [args]
@@ -42,6 +42,8 @@ defmodule Kyber.CLI do
     export                                 Federation.export; prints the wire text verbatim + "\\n"; exit 0
     import <wire.jsonl>                    Federation.import; prints the import report; exit 0
     migrate <legacy.jsonl> --keyring <dir> Migration.migrate; prints the migration report; exit 0
+    serve --port <N>                       start a federation peer; prints "listening on <port>"; then blocks
+    send <host> <port>                     Federation.export -> the peer; prints its status line; exit 0
     help | (no args)                       this text; exit 0
     <unknown> | help <extra>               this text; exit 2
   """
@@ -147,6 +149,14 @@ defmodule Kyber.CLI do
   defp extract_log_path(["--log", path | _rest]), do: path
   defp extract_log_path(_argv), do: nil
 
+  # the ONLY serve special case in main/1 (rev 2): print the marker line,
+  # then BLOCK in a receive that never matches — the no-sleep rule is
+  # absolute, and the peer's live socket keeps the VM alive. Never returns.
+  defp print_and_halt({:ok, {:serve, line, _pid}}) do
+    IO.puts(line)
+    block_forever()
+  end
+
   defp print_and_halt({:ok, message}) do
     print(message)
     System.halt(0)
@@ -160,6 +170,12 @@ defmodule Kyber.CLI do
   defp print_and_halt({:error, message}) do
     print(message)
     System.halt(1)
+  end
+
+  defp block_forever do
+    receive do
+      :never -> :ok
+    end
   end
 
   # a map ok-message (render/refresh/import/migrate reports) prints as a
@@ -185,6 +201,10 @@ defmodule Kyber.CLI do
           {:ok, String.t() | map()} | {:error, String.t()} | {:error, :usage, String.t()}
   def run(argv) do
     case strip_log_prefix(argv) do
+      # serve returns its marker/error UNCHANGED — run/1 stays pure (no
+      # print, no block): main/1's wrapper is the only place that blocks
+      {:ok, ["serve", "--port", port_str]} -> serve_start(port: port_str)
+      {:ok, ["serve" | _rest]} -> {:error, :usage, @usage}
       {:ok, rest} -> dispatch(rest) |> finalize()
       {:error, :usage} -> {:error, :usage, @usage}
     end
@@ -219,7 +239,64 @@ defmodule Kyber.CLI do
   defp dispatch(["migrate", legacy_path, "--keyring", dir]),
     do: Migration.migrate(legacy_path, dir)
 
+  defp dispatch(["send", host, port_str]), do: cmd_send(host, port_str)
+
   defp dispatch(_other), do: {:error, :usage, @usage}
+
+  # ------------------------------------------------------------------ serve
+
+  @doc """
+  Start a federation peer and return the MARKER (rev 2): `{:ok, {:serve,
+  line, pid}}` where `line` is `"listening on <actual-bound-port>"` (port 0
+  binds an ephemeral port; the printed line carries the real number). A
+  non-integer/out-of-range `--port` → a usage error; a listen failure (e.g.
+  the port is in use) → the `"listen failed: <reason>"` one-liner. This
+  starts a live socket but does NOT print or block — `main/1` does that.
+  """
+  @spec serve_start(port: String.t()) ::
+          {:ok, {:serve, String.t(), pid()}}
+          | {:error, String.t()}
+          | {:error, :usage, String.t()}
+  def serve_start(opts) do
+    case parse_port(Keyword.fetch!(opts, :port)) do
+      {:ok, port} ->
+        case Peer.start_link(port: port) do
+          {:ok, pid} -> {:ok, {:serve, "listening on #{Peer.port(pid)}", pid}}
+          {:error, reason} -> {:error, "listen failed: #{inspect(reason)}"}
+        end
+
+      :error ->
+        {:error, :usage, @usage}
+    end
+  end
+
+  # ------------------------------------------------------------------- send
+
+  # export the running store, ship it to the peer, print its status verbatim;
+  # a store-down/export failure surfaces the store's own tagged tuple (T8
+  # discipline), a transport failure the "peer unreachable" one-liner, and a
+  # non-integer port a usage error (exit 2)
+  defp cmd_send(host, port_str) do
+    case parse_port(port_str) do
+      {:ok, port} ->
+        with {:ok, text} <- Federation.export() do
+          case Peer.send_wire(host, port, text) do
+            {:ok, status} -> {:ok, status}
+            {:error, _reason} -> {:error, {:peer_unreachable, host, port}}
+          end
+        end
+
+      :error ->
+        {:error, :usage, @usage}
+    end
+  end
+
+  defp parse_port(str) do
+    case Integer.parse(str) do
+      {n, ""} when n >= 0 and n <= 65_535 -> {:ok, n}
+      _ -> :error
+    end
+  end
 
   # ----------------------------------------------------------------- view
 
@@ -325,5 +402,6 @@ defmodule Kyber.CLI do
   # total coverage should Federation's contract ever route :malformed_text
   # through this call.
   defp format_error(:malformed_text), do: "malformed wire"
+  defp format_error({:peer_unreachable, host, port}), do: "peer unreachable: #{host} #{port}"
   defp format_error(other), do: "error: #{inspect(other)}"
 end

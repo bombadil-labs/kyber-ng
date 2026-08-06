@@ -298,6 +298,49 @@ defmodule Kyber.CLITest do
              CLI.run(["ingest", non_map_path, "--keyring", keyring_dir])
   end
 
+  # ------------------------------------------------- T9 serve/send (AC5)
+
+  test "T9 AC5: serve_start binds and reports the actual port; send round-trips its status" do
+    assert {:ok, {:serve, line, pid}} = CLI.serve_start(port: "0")
+    on_exit(fn -> if Process.alive?(pid), do: Kyber.Peer.stop(pid) end)
+
+    assert is_pid(pid)
+    port = Kyber.Peer.port(pid)
+    assert line == "listening on #{port}"
+
+    # export (an empty store -> "") ships to the peer; the status prints verbatim
+    assert {:ok, status} = CLI.run(["send", "localhost", Integer.to_string(port)])
+    assert status == "ok imported=0 skipped=0 refused=0"
+
+    assert :ok = Kyber.Peer.stop(pid)
+  end
+
+  test "T9 AC5: a send to an unlistened port -> the peer-unreachable one-liner" do
+    assert {:ok, pid} = Kyber.Peer.start_link(port: 0)
+    free_port = Kyber.Peer.port(pid)
+    assert :ok = Kyber.Peer.stop(pid)
+
+    assert {:error, message} = CLI.run(["send", "localhost", Integer.to_string(free_port)])
+    assert message == "peer unreachable: localhost #{free_port}"
+  end
+
+  test "T9 AC5: serve with a non-integer --port -> usage exit 2" do
+    assert {:error, :usage, _usage} = CLI.run(["serve", "--port", "abc"])
+    assert {:error, :usage, _usage} = CLI.run(["serve", "--port", "99999999"])
+    assert {:error, :usage, _usage} = CLI.serve_start(port: "abc")
+  end
+
+  test "T9 AC5: a --port already in use -> the listen-failure one-liner" do
+    assert {:ok, {:serve, _line, pid}} = CLI.serve_start(port: "0")
+    on_exit(fn -> if Process.alive?(pid), do: Kyber.Peer.stop(pid) end)
+    in_use = Kyber.Peer.port(pid)
+
+    assert {:error, message} = CLI.run(["serve", "--port", Integer.to_string(in_use)])
+    assert message =~ "listen failed"
+
+    assert :ok = Kyber.Peer.stop(pid)
+  end
+
   # ------------------------------------------------------------------ AC8
 
   # (AC8 is a repo-wide grep for the sleep primitive across test/ — no
@@ -397,6 +440,44 @@ defmodule Kyber.CLITest do
 
       {_out, bogus_code} = System.cmd(binary, ["bogus"], stderr_to_stdout: true)
       assert bogus_code == 2, "an unknown command must exit 2"
+
+      # 7. federation over TCP (T9 AC6): spawn `serve` on an EMPTY serve-side
+      #    store (a DIFFERENT --log from the seeded sender store — a shared
+      #    --log would replay the claim at boot and the import would be all
+      #    skipped). `serve` blocks forever, so it must be a Port (System.cmd
+      #    would block); assert_receive the listening line (the pinned
+      #    no-sleep polling), send the seeded store to it, then prove the
+      #    claim LANDED in the serve-side store post-kill.
+      serve_log = Path.join(fixture_dir, "serve-store.jsonl")
+
+      serve_port =
+        Port.open(
+          {:spawn_executable, binary},
+          [:binary, :exit_status, {:line, 1024}, args: ["--log", serve_log, "serve", "--port", "0"]]
+        )
+
+      assert_receive {^serve_port, {:data, {:eol, listening}}}, 60_000
+      assert [_, n_str] = Regex.run(~r/listening on (\d+)/, listening)
+      n = String.to_integer(n_str)
+
+      {send_out, send_code} =
+        System.cmd(binary, ["--log", tmp_log, "send", "localhost", Integer.to_string(n)],
+          stderr_to_stdout: true
+        )
+
+      assert send_code == 0, "send smoke failed: #{send_out}"
+      assert send_out =~ "ok imported=1", "the peer must import the seeded claim: #{send_out}"
+
+      # kill the serve; the claim was already persisted to serve_log
+      Port.close(serve_port)
+
+      {serve_view, serve_view_code} =
+        System.cmd(binary, ["--log", serve_log, "view"], stderr_to_stdout: true)
+
+      assert serve_view_code == 0, "serve-side view failed: #{serve_view}"
+
+      assert serve_view =~ "received fc947730 1754512345678",
+             "the federated claim must have landed in the serve-side store: #{serve_view}"
     end
   end
 end

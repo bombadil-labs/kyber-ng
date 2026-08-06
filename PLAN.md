@@ -6,39 +6,50 @@ success criteria. Hermes owns updating this file; the coding agent does not over
 
 ---
 
-## 0. Next Ralph Loop: Federation Peers — the wire speaks to itself over the network (TCP)
+## 0. Next Ralph Loop: The Operational Harness — kyber becomes something you can run and live in (the daemon)
 
-**Objective:** T5 made the wire portable (export/import). T8 gave the operator a CLI.
-T9 makes federation REAL: two kyber instances exchange claims over the network. A
-`Kyber.Peer` listener (stdlib `:gen_tcp` — ZERO new deps) serves the federation wire;
-a client connects, sends the export text, the peer imports it through the SAME door.
-The framing is the wire text itself + a single blank-line terminator (the T5 import
-already treats the final empty segment as the delimiter — the protocol is the format).
-The trust model IS the claims: the door verifies every signature; a peer can only ADD
-(signed, content-addressed) claims — the store only learns; garbage input is refused
-per line, never a crash. `kyber serve [--port N]` + `kyber send <host> <port>` extend
-the CLI (lib/ scope). Store-down answers a clean refusal line, never a crash.
+**Objective (user direction 2026-08-06: "I don't see the kyber aspects yet — get an
+operational harness sooner than later that you can invoke and test against"):** T1–T9
+built the claims substrate (door, store, wire, events, federation, migration, vault,
+CLI, peers). The kyber aspect is the RUNTIME LOOP: event in → signed claim → action →
+memory, with an agent actually operating it. T10 makes kyber runnable: a `kyber daemon`
+(long-lived; boots the app; watches the log for new claims via a send_after ticker —
+NEVER Process.sleep; dispatches each claim to registered handlers; blocks in a
+receive-forever) + `Kyber.Gather` (the provisional harness-side subscription registry,
+spec/04 §6 — handlers register for claim shapes by role/pointer target) + the agent
+loop proven at RUNTIME (a built-in handler pair: `message.received` in → response →
+`message.sent` out). THE acceptance test is operational: I (Hermes, the delegated
+primary user) BOOT the daemon on a tmp store, ingest a real event through the CLI, and
+watch the claim land, the handler fire, and the vault grow — the loop closing
+end-to-end, live, not in a unit test. The Discord transport later plugs in as just
+another handler (the deployment, unblocked without the substrate L4 reactor).
 
-**Requirements (contract: .adlc/specs/T9.md):**
-1. `Kyber.Peer` — a supervised listener: `start_link(port: p)` (port 0 → ephemeral),
-   accepts connections, reads the framed wire text, `Federation.import/1`s it, replies
-   with a status line (`ok <imported>/<skipped>` or a tagged refusal); a client
-   disconnect mid-frame never crashes the listener; garbage input → refused lines.
-2. `Kyber.Peer.send_wire(host, port, text)` (or the client half) — connects, sends the
-   export text + the blank-line terminator, reads the status line.
-3. CLI: `kyber serve --port N` (foreground listener; prints the bound address) and
-   `kyber send <host> <port>` (exports + sends + prints the peer's status).
+**Requirements (contract: .adlc/specs/T10.md):**
+1. `Kyber.Gather` — a subscription registry: `subscribe(handler, matcher)` /
+   `notify(claim)`; handlers match claims by role/pointer shape; the daemon's tailer
+   routes each new claim through the registry.
+2. `kyber daemon` — the long-lived loop: boot (T8 discipline), tail the store log
+   (send_after ticks; never a sleep), dispatch claims to matching handlers, block
+   forever; clean shutdown on SIGTERM.
+3. The built-in agent-loop handlers: `message.received` → a response handler emits a
+   `message.sent` claim (the T4 harness loop at runtime); the response is
+   deterministic (pinned response text) so the operational test is byte-exact.
+4. The operational test (THE gate): boot the daemon on a fresh tmp store → CLI ingest
+   of a fixture source → assert the received claim lands → assert the sent claim lands
+   (the handler fired) → assert the vault renders both → stop the daemon → re-boot →
+   the loop continues (replay-idempotent: the already-handled claim is not re-fired).
 
 **Success Criteria (the gate):**
 - `mix test` green; `! grep -r "Process.sleep" test/`; `mix format --check-formatted` exits 0.
-- A live exchange: peer A exports → sends to peer B (ephemeral port) → B imports →
-  both stores hold the claim; re-send → all skipped (dedup across the network).
-- The peer survives: garbage lines refused with line numbers, a dropped connection
-  mid-frame is a non-event, store-down answers the refusal line.
+- THE operational run (the gate's verification, executed by Hermes): the daemon boots,
+  the loop closes live, the memory grows, and the vault shows it.
+- Re-boot idempotence: the daemon survives restarts without re-firing handled claims
+  (the store only learns; the gather is a lens over the log, never a source of truth).
 
-**Out of scope (later loops):** the Discord transport (gated on substrate L4), auth/TLS
-for peers (the claims ARE the trust; transport encryption is a later concern), legacy
-semantic interpretation, sqlite/packs backends, the reactor/subscriptions.
+**Out of scope (later loops):** the substrate L4 reactor (the gather is the
+provisional harness-side mechanism, spec/04 §6), the Discord transport (a handler
+plugged into the daemon — the deployment), peer auth/TLS, legacy semantic
+interpretation, vault-to-store writes.
 
 ---
 
@@ -84,6 +95,11 @@ semantic interpretation, sqlite/packs backends, the reactor/subscriptions.
 - **Loop 9 (T9, in flight)** — federation peers: `Kyber.Peer` TCP listener (stdlib
   :gen_tcp) + send_wire client; the wire text + blank-line framing; `kyber serve` /
   `kyber send`.
+- **Loop 10 (T10, next — user direction: the kyber aspect)** — the operational
+  harness: `kyber daemon` + `Kyber.Gather` (provisional subscriptions) + the
+  runtime agent loop (`message.received` → handler → `message.sent`); the gate is an
+  OPERATIONAL run: boot the daemon, ingest live, watch the loop close and the vault
+  grow; re-boot idempotent.
 
 ## 2. Active Backlog
 
