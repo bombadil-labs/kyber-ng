@@ -163,14 +163,19 @@ interpretation, vault-to-store writes.
   (pure run/1, boot-ownership load->put_env->start, pre-flight never-boot pins,
   committed KYBER_SMOKE=1 smoke artifact). 142 tests; P1–P7 green; review 4/4 fixed
   (2 medium: boot-before-validation, unpinned boot sequence).
-- **Loop 9 (T9, in flight)** — federation peers: `Kyber.Peer` TCP listener (stdlib
-  :gen_tcp) + send_wire client; the wire text + blank-line framing; `kyber serve` /
-  `kyber send`.
+- **Loop 9 COMPLETE (T9, archived)** — federation peers: `Kyber.Peer` TCP listener
+  (stdlib :gen_tcp) + send_wire client; wire text + blank-line framing; strip-then-
+  join (two-claim pin imported=2); resource caps (1 MiB frame, 16-handler pool);
+  `kyber serve`/`send` (taxonomy: unreachable/timeout/closed). 158 tests; P1–P7
+  green; premortem 8/8 folded (off-by-one frame deadlock); review 4/4 killed
+  (resource-exhaustion, failure-atomic smoke, crash-dump hygiene, error taxonomy).
 - **Loop 10 (T10, next — user direction: the kyber aspect)** — the operational
   harness: `kyber daemon` + `Kyber.Gather` (provisional subscriptions) + the
   runtime agent loop (`message.received` → handler → `message.sent`); the gate is an
   OPERATIONAL run: boot the daemon, ingest live, watch the loop close and the vault
-  grow; re-boot idempotent.
+  grow; re-boot idempotent. The Gather is container-shaped per the model (ad-hoc
+  containers, admission-policy default persist-everything, `(delta[]) -> delta[]`
+  handler contract).
 
 ## 2. Active Backlog
 
