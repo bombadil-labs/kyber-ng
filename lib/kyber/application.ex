@@ -17,7 +17,7 @@ defmodule Kyber.Application do
 
   use Application
 
-  alias Kyber.DurableStore
+  alias Kyber.{Daemon, DurableStore, Gather}
 
   @impl true
   def start(_type, _args) do
@@ -26,16 +26,39 @@ defmodule Kyber.Application do
     # the parent dir exists before the child starts (AC8) — only then can the
     # lazy-open first append land instead of failing with :persist_failed
     with :ok <- File.mkdir_p(Path.dirname(log_path)) do
-      Supervisor.start_link(
+      # rest_for_one models the real dependency chain: the gather and daemon
+      # both stand on the store, and the daemon subscribes to the gather in
+      # its init. If the store dies, everything above it restarts; if the
+      # gather dies, the daemon restarts and re-subscribes; a lone daemon
+      # crash re-derives its cursor from the store. With the daemon disabled
+      # the list is a single child, so this is one_for_one for the store.
+      children =
         [
+          %{id: DurableStore, start: {DurableStore, :start_link, [log_path]}, restart: :permanent}
+        ] ++ daemon_children()
+
+      Supervisor.start_link(children, strategy: :rest_for_one)
+    end
+  end
+
+  # the operational harness (T10) starts ONLY when `kyber daemon` set the
+  # `:daemon` env (keyring + log_path). Otherwise the app is just the store —
+  # every other command (view/ingest/render/export/...) runs against it
+  # unchanged.
+  defp daemon_children do
+    case Application.get_env(:kyber, :daemon) do
+      %{keyring: keyring, log_path: log_path} ->
+        [
+          %{id: Gather, start: {Gather, :start_link, [[pulse_only: Daemon.pulse_only()]]}},
           %{
-            id: DurableStore,
-            start: {DurableStore, :start_link, [log_path]},
-            restart: :permanent
+            id: Daemon,
+            start:
+              {Daemon, :start_link, [[keyring: keyring, log_path: log_path, auto_tick: true]]}
           }
-        ],
-        strategy: :one_for_one
-      )
+        ]
+
+      _ ->
+        []
     end
   end
 

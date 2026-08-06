@@ -140,3 +140,63 @@ smoke`) exercises AC1/AC3/AC4/AC5 against a tmp store and leaves zero leaked
 processes (the os_pid kill idiom — Port.close does not terminate
 spawn_executable children); **and the AC7 operational run** (Hermes boots and
 operates the harness for real — the loop's gate).
+
+## Rev 2 — amendments folded during implementation (T10-claude)
+
+The contradiction is the deliverable; each of these was RECORDED here rather
+than papered over, and each is verified by a test that ships with the code.
+
+- **Rev 2.1 — AC7 is inherently multi-process, which the store layer called
+  "out of scope."** AC7 runs `kyber ingest` "via the CLI" while `kyber daemon`
+  runs. Each `kyber` invocation is its OWN VM, so the ingest and the daemon are
+  two processes on ONE `--log` — exactly what `Kyber.DurableStore`'s moduledoc
+  declared out of scope ("two DurableStore instances on one log is out of
+  scope"). The operational gate cannot be met without it. RESOLUTION: the
+  daemon watches the FILE, not just its own in-memory set — `DurableStore.poll/0`
+  re-streams the log through the same door each tick, so a claim another process
+  appended is observed and routed (AC2's "polls the store for claims newer than
+  the cursor" reads as the log on disk, the shared medium). Cross-process
+  appends are safe by construction: every append is one `IO.binwrite` of a
+  single line under POSIX `O_APPEND` (atomic at EOF; a concurrent partial line
+  is torn-tolerant — skipped this pass, admitted once complete). This does NOT
+  reopen "multi-writer coordination" as a general store feature; it is the
+  narrow, append-only, door-verified sharing the gate requires. Verified by the
+  daemon smoke (ingest in a separate VM → the ack persists) and the AC7 run.
+
+- **Rev 2.2 — the "flavor" is the first-pointer role.** AC4 names claims by
+  "role `message` with the received flavor" / "role `message`, flavor `sent`",
+  but a kyber claim carries no separate role/flavor field — roles live on
+  pointers (spec/00 §3, "Roles/contexts on pointers; vocabulary as data").
+  RESOLUTION: the routing flavor IS the first-pointer role — `received` for
+  `message.received`, `sent` for its reply, `tick`/`checkpoint` for the pulse
+  and cursor claims. This is what makes AC2's "a handler is not its own
+  subscriber" STRUCTURAL (the `received` handler cannot match its own `sent`
+  output) rather than a guard. Verified by the gather/daemon routing tests.
+
+- **Rev 2.3 — the checkpoint claim is visible in the vault; "exactly one
+  exchange" means exactly one reply.** AC3 recommends the cursor persist as a
+  `daemon.checkpoint` claim (state as data — the shape chosen here), and AC2
+  treats those checkpoints as claims the daemon wrote. Because the store only
+  learns, the vault (a lens over the store) therefore renders the
+  `daemon.checkpoint` claims alongside the `message.received`/`message.sent`
+  pair. AC7's "the vault still shows exactly one exchange" is read as "exactly
+  one `message.sent` ack" — the conversation is singular; the checkpoints are
+  daemon bookkeeping, not a second exchange. (A sidecar cursor file — the
+  AC3-sanctioned alternative — would hide them, at the cost of a cursor that is
+  no longer a claim. The claim shape was kept: the cursor as data is the more
+  kyber answer.) Verified by the smoke asserting exactly one `sent` line
+  survives ingest, kill, and re-boot.
+
+- **Rev 2.4 — AC5/AC6 are verified in-VM, not in the escript smoke.** The
+  Verification note lists the daemon smoke as exercising AC5, and AC6 says "a
+  smoke test … pushes that shape." A pulse is pushed through
+  `Kyber.Gather.notify/1` — an OTP-level bus with, by design, NO CLI surface (a
+  pulse is ephemeral and never becomes memory; D5 — giving it a persistent
+  operator command would contradict its nature). RESOLUTION: AC5/AC6 are driven
+  by `test/daemon_test.exs`, which boots the REAL daemon supervision tree
+  (`Kyber.Gather` + `Kyber.Daemon` with `pulse_only: ["tick"]`) and pushes the
+  tuned shape via `notify/1`, asserting the subscriber fires with a visible
+  side effect while no claim of that shape lands, and that an unsigned pulse is
+  refused by the door and never fires. The escript smoke covers the OS-level
+  criteria a separate process is needed for (AC1 boot/refusal/SIGTERM, AC3
+  kill/re-boot, AC4 ack, AC7). Together they cover the whole contract.

@@ -139,6 +139,61 @@ defmodule Kyber.Events do
     end
   end
 
+  @doc """
+  `watcher.tick` — an ephemeral watcher pulse (the operational harness, T10).
+  Author: the agent's key. First pointer role `tick` (the routing flavor); a
+  tick is a signed delta by shape (the pulse bus verifies it) but is admitted
+  pulse-only — it fires handlers and NEVER becomes memory (D5: heartbeats are
+  not deltas). Pointers: tick / at.
+  """
+  @spec watcher_tick(String.t(), number(), String.t()) ::
+          {:ok, signed()} | {:error, term()}
+  def watcher_tick(agent_seed_hex, ts, watcher_id) do
+    with {:ok, ts} <- timestamp(ts),
+         {:ok, author} <- author_for(agent_seed_hex) do
+      claims = %{
+        timestamp: ts,
+        author: author,
+        pointers: [
+          %{role: "tick", target: {:entity, watcher_id, "ticks"}},
+          %{role: "at", target: {:entity, "watcher:kyber", "ticks"}}
+        ]
+      }
+
+      signed(claims, agent_seed_hex)
+    end
+  end
+
+  @doc """
+  `daemon.checkpoint` — the dispatch cursor as data (T10, AC3). Author: the
+  agent's key. First pointer role `checkpoint` (the routing flavor — the
+  daemon skips its own checkpoints, so they never re-dispatch and never
+  self-checkpoint). One `dispatched` DeltaRef per claim id the daemon has
+  routed; the cursor is the UNION of every checkpoint's `dispatched` refs
+  (merge is union — a grow-only set, each checkpoint small), re-derived from
+  the store on re-boot. The cursor is a derived reading, never a source of
+  truth: even a lagging checkpoint cannot cause a re-fire, because the
+  handler is deterministic and its output is content-addressed (a re-run
+  merges to the same id — a union no-op).
+  """
+  @spec daemon_checkpoint(String.t(), number(), [String.t()]) ::
+          {:ok, signed()} | {:error, term()}
+  def daemon_checkpoint(agent_seed_hex, ts, dispatched_ids) do
+    with {:ok, ts} <- timestamp(ts),
+         {:ok, author} <- author_for(agent_seed_hex) do
+      claims = %{
+        timestamp: ts,
+        author: author,
+        pointers: [
+          %{role: "checkpoint", target: {:entity, "daemon:kyber", "cursor"}}
+          | Enum.map(dispatched_ids, &%{role: "dispatched", target: {:delta, &1, nil}})
+        ]
+      }
+
+      signed(claims, agent_seed_hex)
+    end
+  end
+
   # ---------------------------------------------------------------- helpers
 
   # validate at the boundary, then sign: reject, never repair

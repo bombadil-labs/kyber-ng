@@ -60,6 +60,22 @@ defmodule Kyber.DurableStore do
     GenServer.call(__MODULE__, :set)
   end
 
+  @doc """
+  Re-stream the log from disk and merge whatever it holds now — the daemon's
+  ticker calls this so it observes claims another process appended to the same
+  `--log` (the operational gate: `kyber ingest` runs in its OWN VM against the
+  file the daemon watches, AC2/AC7). Merge is union, so re-reading the
+  daemon's own prior appends is a harmless no-op; a concurrent partial final
+  line is torn-tolerant (skipped this pass, admitted once the writer completes
+  it). Returns the refreshed set. Re-verifies the whole log each call — boring
+  and correct for the harness's scale; an incremental tail is a later
+  optimization, never a correctness need (the store only learns).
+  """
+  @spec poll() :: DeltaSet.t()
+  def poll do
+    GenServer.call(__MODULE__, :poll)
+  end
+
   @doc "The pinned replay observable: refused/torn line numbers from the last boot, plus the live count of failed live appends."
   @spec replay_report() :: replay_report()
   def replay_report do
@@ -112,6 +128,15 @@ defmodule Kyber.DurableStore do
   end
 
   def handle_call(:set, _from, state), do: {:reply, state.set, state}
+
+  # re-read the file into the set (a superset of what we held: every append
+  # writes the file before it merges, so disk is always >= memory — replacing
+  # the set never loses). The boot report (refused/torn) is left untouched;
+  # it names the boot replay, not a live poll.
+  def handle_call(:poll, _from, state) do
+    {set, _refused, _torn} = replay(state.path)
+    {:reply, set, %{state | set: set}}
+  end
 
   def handle_call(:replay_report, _from, state) do
     {:reply, %{refused: state.refused, torn: state.torn, failed_appends: state.failed_appends},

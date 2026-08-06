@@ -72,6 +72,26 @@ defmodule Kyber.Store do
   def admit(_, _), do: {:error, :malformed_envelope}
 
   @doc """
+  Verify a single wire envelope through the door WITHOUT merging into any
+  store — the one-delta form of `admit/2` used by the live pulse bus
+  (`Kyber.Gather.notify/1`): the door's verification applies to pulses too
+  (AC5), so a malformed/unsigned pulse is refused, never fired. Returns the
+  atom-keyed signed delta `{claims, sig_hex}` on success — exactly the shape
+  the delta set holds — reusing the ONE verification path (`admit/2`).
+  """
+  @spec verify(map()) :: {:ok, DeltaSet.element()} | {:error, term()}
+  def verify(wire) do
+    case admit(wire, DeltaSet.new()) do
+      {:ok, set} ->
+        [{_id, element}] = Map.to_list(set)
+        {:ok, element}
+
+      {:error, _reason} = err ->
+        err
+    end
+  end
+
+  @doc """
   The current delta set — explicit state polling for tests and views. Returns
   `{:error, :store_not_running}` when the door has not been started.
   """

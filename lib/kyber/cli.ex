@@ -31,7 +31,7 @@ defmodule Kyber.CLI do
   never a crash.
   """
 
-  alias Kyber.{DurableStore, Federation, Harness, Migration, Peer, Vault}
+  alias Kyber.{Daemon, DurableStore, Federation, Harness, Migration, Peer, Vault}
 
   @usage """
   kyber [--log <path>] <command> [args]
@@ -44,6 +44,8 @@ defmodule Kyber.CLI do
     migrate <legacy.jsonl> --keyring <dir> Migration.migrate; prints the migration report; exit 0
     serve --port <N>                       start a federation peer; prints "listening on <port>"; then blocks
     send <host> <port>                     Federation.export -> the peer; prints its status line; exit 0
+    daemon --log <path> --keyring <dir>    boot the operational harness on <path>; prints "kyber daemon on <path>"; then blocks
+
     help | (no args)                       this text; exit 0
     <unknown> | help <extra>               this text; exit 2
   """
@@ -74,20 +76,107 @@ defmodule Kyber.CLI do
   """
   @spec main([String.t()]) :: no_return()
   def main(argv) do
-    # P5 finding 1: PRE-FLIGHT the argv BEFORE any boot — a usage-error path
-    # (a stray/bare --log, no command, help misuse) must NEVER boot the store:
-    # the escript's whole data-safety design (app: nil) exists so the real
-    # ~/.kyber store is never touched on malformed input. Only a recognized
-    # command shape reaches the boot.
-    case preflight(argv) do
-      {:ok, command_argv, log_path} ->
-        boot_and_run(command_argv, log_path)
+    # `daemon` is the one long-lived command whose --log/--keyring are its OWN
+    # options (not the global prefix) and which must configure the app BEFORE
+    # boot and acquire its lock BEFORE touching the store — so it is handled
+    # ahead of the generic pre-flight (the same way `serve` needs a bespoke
+    # block-forever path). It still never boots on a usage error (parse first).
+    case argv do
+      ["daemon" | rest] ->
+        boot_daemon(rest)
 
-      {:usage, exit_code} ->
-        IO.puts(@usage)
-        System.halt(exit_code)
+      _ ->
+        # P5 finding 1: PRE-FLIGHT the argv BEFORE any boot — a usage-error path
+        # (a stray/bare --log, no command, help misuse) must NEVER boot the store:
+        # the escript's whole data-safety design (app: nil) exists so the real
+        # ~/.kyber store is never touched on malformed input. Only a recognized
+        # command shape reaches the boot.
+        case preflight(argv) do
+          {:ok, command_argv, log_path} ->
+            boot_and_run(command_argv, log_path)
+
+          {:usage, exit_code} ->
+            IO.puts(@usage)
+            System.halt(exit_code)
+        end
     end
   end
+
+  # ------------------------------------------------------------------ daemon
+
+  # `kyber daemon --log <path> --keyring <dir>`: parse first (a usage error
+  # NEVER boots, exit 2), acquire the daemon lock (a second daemon on the same
+  # log is refused with the pinned one-liner, exit 1 — the lock carries the OS
+  # pid and reclaims a dead one, so a killed daemon never bricks re-boot), then
+  # LOAD -> put_env(--log + daemon opts) -> start. The app supervisor sees the
+  # `:daemon` env and starts the gather + daemon subtree. On success the marker
+  # prints and the VM blocks (the daemon's ticker keeps it alive; SIGTERM ->
+  # init:stop -> the daemon's terminate releases the lock, exit 0).
+  defp boot_daemon(rest) do
+    case parse_daemon(rest, %{}) do
+      {:ok, log_path, keyring} ->
+        acquire_and_start(log_path, keyring)
+
+      {:error, :usage} ->
+        IO.puts(@usage)
+        System.halt(2)
+    end
+  end
+
+  defp acquire_and_start(log_path, keyring) do
+    case Daemon.acquire_lock(log_path) do
+      :ok ->
+        start_daemon(log_path, keyring)
+
+      {:error, {:already_running, path}} ->
+        IO.puts("daemon already running on #{path}")
+        System.halt(1)
+
+      {:error, reason} ->
+        IO.puts("daemon lock error: #{inspect(reason)}")
+        System.halt(1)
+    end
+  end
+
+  defp start_daemon(log_path, keyring) do
+    with :ok <- load_kyber() do
+      Application.put_env(:kyber, :log_path, log_path)
+      Application.put_env(:kyber, :daemon, %{keyring: keyring, log_path: log_path})
+
+      case Application.ensure_all_started(:kyber) do
+        {:ok, _apps} ->
+          IO.puts("kyber daemon on #{log_path}")
+          block_forever()
+
+        {:error, reason} ->
+          Daemon.release_lock(log_path)
+          IO.puts("store failed to start: #{inspect(reason)}")
+          System.halt(1)
+      end
+    else
+      {:error, reason} ->
+        Daemon.release_lock(log_path)
+        IO.puts("store failed to start: #{inspect(reason)}")
+        System.halt(1)
+    end
+  end
+
+  # daemon options are the command's OWN flags (order-flexible); both required,
+  # unknown/missing -> a usage error (exit 2, no boot)
+  defp parse_daemon([], acc) do
+    case {acc[:log], acc[:keyring]} do
+      {log, keyring} when is_binary(log) and is_binary(keyring) -> {:ok, log, keyring}
+      _ -> {:error, :usage}
+    end
+  end
+
+  defp parse_daemon(["--log", value | rest], acc),
+    do: parse_daemon(rest, Map.put(acc, :log, value))
+
+  defp parse_daemon(["--keyring", value | rest], acc),
+    do: parse_daemon(rest, Map.put(acc, :keyring, value))
+
+  defp parse_daemon(_other, _acc), do: {:error, :usage}
 
   # the single source of truth: the SAME parser run/1 uses, plus the command
   # check. [] and ["help"] -> usage, exit 0; ["help" | _] -> usage, exit 2;
