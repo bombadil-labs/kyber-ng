@@ -72,21 +72,56 @@ defmodule Kyber.CLI do
   """
   @spec main([String.t()]) :: no_return()
   def main(argv) do
-    load_kyber()
+    # P5 finding 1: PRE-FLIGHT the argv BEFORE any boot — a usage-error path
+    # (a stray/bare --log, no command, help misuse) must NEVER boot the store:
+    # the escript's whole data-safety design (app: nil) exists so the real
+    # ~/.kyber store is never touched on malformed input. Only a recognized
+    # command shape reaches the boot.
+    case preflight(argv) do
+      {:ok, command_argv, log_path} ->
+        boot_and_run(command_argv, log_path)
 
-    case extract_log_path(argv) do
-      nil -> :ok
-      path -> Application.put_env(:kyber, :log_path, path)
+      {:usage, exit_code} ->
+        IO.puts(@usage)
+        System.halt(exit_code)
     end
+  end
 
-    case Application.ensure_all_started(:kyber) do
-      {:ok, _apps} ->
-        argv |> run() |> print_and_halt()
+  # the single source of truth: the SAME parser run/1 uses, plus the command
+  # check. [] and ["help"] -> usage, exit 0; ["help" | _] -> usage, exit 2;
+  # a stray/bare --log -> usage, exit 2. Usage shapes NEVER boot (a
+  # `kyber --log view` must not create ./view). Only a real command boots.
+  defp preflight(argv) do
+    case strip_log_prefix(argv) do
+      {:error, :usage} ->
+        {:usage, 2}
 
-      {:error, {:kyber, reason}} ->
-        IO.puts("store failed to start: #{inspect(reason)}")
-        System.halt(1)
+      {:ok, rest} ->
+        case check_command(rest) do
+          {:usage, exit_code} -> {:usage, exit_code}
+          :run -> {:ok, rest, extract_log_path(argv)}
+        end
+    end
+  end
 
+  defp check_command([]), do: {:usage, 0}
+  defp check_command(["help"]), do: {:usage, 0}
+  defp check_command(["help" | _rest]), do: {:error, :usage}
+  defp check_command(_command), do: :run
+
+  defp boot_and_run(command_argv, log_path) do
+    with :ok <- load_kyber() do
+      if log_path, do: Application.put_env(:kyber, :log_path, log_path)
+
+      case Application.ensure_all_started(:kyber) do
+        {:ok, _apps} ->
+          command_argv |> run() |> print_and_halt()
+
+        {:error, reason} ->
+          IO.puts("store failed to start: #{inspect(reason)}")
+          System.halt(1)
+      end
+    else
       {:error, reason} ->
         IO.puts("store failed to start: #{inspect(reason)}")
         System.halt(1)
@@ -95,13 +130,14 @@ defmodule Kyber.CLI do
 
   # load (not start) FIRST so the baked config default is applied BEFORE the
   # --log override; an already-loaded app (the mix-test path) is a no-op.
-  # This is the intervening step the pinned sequence omits (see main/1's
-  # recorded contradiction).
+  # P5 finding 3: a REAL load error is surfaced (never folded into :ok) —
+  # main/1 renders it as the clean "store failed to start" one-liner; only
+  # the :already_loaded case is benign.
   defp load_kyber do
     case Application.load(:kyber) do
       :ok -> :ok
       {:error, {:already_loaded, :kyber}} -> :ok
-      {:error, _reason} -> :ok
+      {:error, reason} -> {:error, reason}
     end
   end
 
@@ -132,6 +168,10 @@ defmodule Kyber.CLI do
   # IO.puts's own trailing newline (export's pinned "verbatim + \n")
   defp print(message) when is_map(message), do: IO.inspect(message, limit: :infinity)
   defp print(message) when is_binary(message), do: IO.puts(message)
+  # P5 finding 4: the format_error-style defensive-completeness fallback — a
+  # future non-binary/non-map ok-message prints cleanly instead of crashing
+  # post-success with FunctionClauseError
+  defp print(message), do: IO.inspect(message, limit: :infinity)
 
   # ---------------------------------------------------------------------- run
 

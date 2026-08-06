@@ -303,4 +303,100 @@ defmodule Kyber.CLITest do
   # (AC8 is a repo-wide grep for the sleep primitive across test/ — no
   # test-local assertion needed; this suite polls state, it never waits on
   # a timer.)
+
+  # ------------------------------------------------------------------ AC9
+
+  # P5 finding 2: the AC9 smoke is a REPO ARTIFACT (no longer gate prose).
+  # The escript's boot sequence (load -> put_env -> start) and the store-fail
+  # trigger are structurally invisible in `mix test` (:kyber is already
+  # loaded), so this test builds the REAL binary and drives it via
+  # System.cmd — the load-clobber regression class (--log dead, real store
+  # booted) has a machine-checkable pin. The build takes ~30-60s, so it runs
+  # only with KYBER_SMOKE=1 (the gate's pinned invocation); otherwise it
+  # passes as a no-op. It never touches the real ~/.kyber.
+  @tag :smoke
+  test "AC9: escript smoke — --log wins over the baked default; store-fail trigger; exit codes; pre-flight never boots",
+       %{keyring_dir: keyring_dir, fixture_dir: fixture_dir} do
+    if System.get_env("KYBER_SMOKE") != "1" do
+      IO.puts("skipped: set KYBER_SMOKE=1 to run the escript smoke")
+    else
+      root = File.cwd!()
+      binary = Path.join(root, "kyber")
+      on_exit(fn -> File.rm(binary) end)
+
+      # 1. build the escript
+      {build_out, build_code} =
+        System.cmd("mix", ["escript.build"], cd: root, stderr_to_stdout: true)
+
+      assert build_code == 0, "escript.build failed: #{build_out}"
+
+      real_store = Path.join(System.user_home!(), ".kyber/store.jsonl")
+      real_before = if File.exists?(real_store), do: File.read!(real_store), else: :absent
+
+      # 2. the pre-flight pin (P5 finding 1): malformed argv NEVER boots —
+      #    a stray post-command --log prints usage (exit 2) and creates NOTHING
+      never_path = Path.join(fixture_dir, "never-created-store.jsonl")
+      {out, code} = System.cmd(binary, ["view", "--log", never_path], stderr_to_stdout: true)
+      assert code == 2, "stray --log must be usage exit 2, got #{code}: #{out}"
+      assert String.contains?(out, "<command> [args]"), "expected the usage block, got: #{out}"
+      refute File.exists?(never_path), "a usage-error path must never boot/create a store"
+
+      {_out, code} = System.cmd(binary, ["--log"], stderr_to_stdout: true)
+      assert code == 2, "a bare --log must be usage exit 2, got #{code}"
+
+      # 3. seed a tmp store through the CLI's own ingest (full-argv smoke)
+      source = %{
+        "message_id" => "message:discord:smoke:1",
+        "channel_id" => "channel:discord:smoke",
+        "session_id" => "session:discord:smoke",
+        "content" => "smoke hello",
+        "ts" => 1_754_512_345_678
+      }
+
+      source_path = Path.join(fixture_dir, "smoke-source.json")
+      File.write!(source_path, JSON.encode!(source))
+
+      tmp_log = Path.join(fixture_dir, "smoke-store.jsonl")
+
+      {ingest_out, ingest_code} =
+        System.cmd(binary, ["--log", tmp_log, "ingest", source_path, "--keyring", keyring_dir],
+          stderr_to_stdout: true
+        )
+
+      assert ingest_code == 0, "ingest smoke failed: #{ingest_out}"
+
+      # 4. --log wins over the baked default: the seeded claim is visible via
+      #    --log and the REAL store is untouched
+      {view_out, view_code} =
+        System.cmd(binary, ["--log", tmp_log, "view"], stderr_to_stdout: true)
+
+      assert view_code == 0, "view smoke failed: #{view_out}"
+      # the pinned line format (no content column): <id> <role> <author8> <ts>
+      assert view_out =~ "received fc947730 1754512345678",
+             "the seeded claim must render via --log: #{view_out}"
+
+      real_after = if File.exists?(real_store), do: File.read!(real_store), else: :absent
+      assert real_after == real_before, "the real ~/.kyber store must never change in the smoke"
+
+      # 5. the store-fail trigger: a --log whose PARENT is a regular file
+      #    (mkdir_p on the parent fails -> the boot failure one-liner, exit 1)
+      blocker = Path.join(fixture_dir, "blocker")
+      File.write!(blocker, "i am a file")
+      bad_log = Path.join(blocker, "store.jsonl")
+
+      {fail_out, fail_code} =
+        System.cmd(binary, ["--log", bad_log, "view"], stderr_to_stdout: true)
+
+      assert fail_code == 1, "the boot failure must exit 1, got #{fail_code}: #{fail_out}"
+      assert fail_out =~ "store failed to start", "expected the clean one-liner: #{fail_out}"
+
+      # 6. the pinned exit codes
+      {help_out, help_code} = System.cmd(binary, ["help"], stderr_to_stdout: true)
+      assert help_code == 0, "help must exit 0"
+      assert help_out =~ "<command> [args]"
+
+      {_out, bogus_code} = System.cmd(binary, ["bogus"], stderr_to_stdout: true)
+      assert bogus_code == 2, "an unknown command must exit 2"
+    end
+  end
 end
