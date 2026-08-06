@@ -82,7 +82,7 @@ defmodule Kyber.DurableStoreTest do
     start_store(path)
 
     assert DeltaSet.size(DurableStore.set()) == 1
-    assert DurableStore.replay_report() == %{refused: [], torn: [2]}
+    assert DurableStore.replay_report() == %{refused: [], torn: [2], failed_appends: 0}
   end
 
   # ------------------------------------------------------------------ AC4
@@ -104,7 +104,7 @@ defmodule Kyber.DurableStoreTest do
     set = DurableStore.set()
     assert DeltaSet.size(set) == 2
     refute DeltaSet.member?(set, w2["id"])
-    assert DurableStore.replay_report() == %{refused: [2], torn: []}
+    assert DurableStore.replay_report() == %{refused: [2], torn: [], failed_appends: 0}
   end
 
   # ------------------------------------------------------------------ AC5
@@ -184,7 +184,7 @@ defmodule Kyber.DurableStoreTest do
     assert DeltaSet.size(set) == 2
     assert DeltaSet.member?(set, w1["id"])
     assert DeltaSet.member?(set, w3["id"])
-    assert DurableStore.replay_report() == %{refused: [], torn: [2]}
+    assert DurableStore.replay_report() == %{refused: [], torn: [2], failed_appends: 0}
   end
 
   # ------------------------------------------------------------------ AC9
@@ -208,6 +208,7 @@ defmodule Kyber.DurableStoreTest do
 
     w2 = wire("message:discord:222222222222222222:2")
     assert {:error, :persist_failed} = DurableStore.append(w2)
+    assert DurableStore.replay_report().failed_appends == 1
 
     assert DurableStore.set() == before_set
     assert File.read!(path) == before_file
@@ -260,7 +261,7 @@ defmodule Kyber.DurableStoreTest do
   } do
     path = Path.join(tmp_dir, "log.jsonl")
     start_store(path)
-    assert DurableStore.replay_report() == %{refused: [], torn: []}
+    assert DurableStore.replay_report() == %{refused: [], torn: [], failed_appends: 0}
   end
 
   # -------------------------------------------------------- misc / duplicates
@@ -288,7 +289,7 @@ defmodule Kyber.DurableStoreTest do
     start_store(path)
 
     assert DeltaSet.size(DurableStore.set()) == 1
-    assert DurableStore.replay_report() == %{refused: [], torn: []}
+    assert DurableStore.replay_report() == %{refused: [], torn: [], failed_appends: 0}
   end
 
   test "a syntactically valid JSON line that is not the envelope shape is refused", %{
@@ -300,7 +301,7 @@ defmodule Kyber.DurableStoreTest do
     start_store(path)
 
     assert DeltaSet.size(DurableStore.set()) == 0
-    assert DurableStore.replay_report() == %{refused: [1], torn: []}
+    assert DurableStore.replay_report() == %{refused: [1], torn: [], failed_appends: 0}
   end
 
   test "AC5: the door rejects a signature by the wrong key, through DurableStore", %{

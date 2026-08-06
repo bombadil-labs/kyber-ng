@@ -31,7 +31,11 @@ defmodule Kyber.DurableStore do
   alias Kyber.{DeltaSet, Log, Store}
 
   @type line_no :: non_neg_integer()
-  @type replay_report :: %{refused: [line_no()], torn: [line_no()]}
+  @type replay_report :: %{
+          refused: [line_no()],
+          torn: [line_no()],
+          failed_appends: non_neg_integer()
+        }
 
   @doc "Boot the store: replay `log_path` through the door, then serve."
   @spec start_link(Path.t()) :: GenServer.on_start()
@@ -51,7 +55,7 @@ defmodule Kyber.DurableStore do
     GenServer.call(__MODULE__, :set)
   end
 
-  @doc "The pinned replay observable: line numbers refused/torn on the last boot."
+  @doc "The pinned replay observable: refused/torn line numbers from the last boot, plus the live count of failed live appends."
   @spec replay_report() :: replay_report()
   def replay_report do
     GenServer.call(__MODULE__, :replay_report)
@@ -62,7 +66,7 @@ defmodule Kyber.DurableStore do
   @impl true
   def init(log_path) do
     {set, refused, torn} = replay(log_path)
-    {:ok, %{path: log_path, io: nil, set: set, refused: refused, torn: torn}}
+    {:ok, %{path: log_path, io: nil, set: set, refused: refused, torn: torn, failed_appends: 0}}
   end
 
   @impl true
@@ -74,7 +78,8 @@ defmodule Kyber.DurableStore do
   def handle_call(:set, _from, state), do: {:reply, state.set, state}
 
   def handle_call(:replay_report, _from, state) do
-    {:reply, %{refused: state.refused, torn: state.torn}, state}
+    {:reply, %{refused: state.refused, torn: state.torn, failed_appends: state.failed_appends},
+     state}
   end
 
   @impl true
@@ -104,7 +109,9 @@ defmodule Kyber.DurableStore do
             # leaks an fd per failed append (P5 medium finding). A dead device
             # (closed behind our back) is skipped by the alive? guard.
             close_device(io)
-            {{:error, :persist_failed}, %{opened_state | io: nil}}
+
+            {{:error, :persist_failed},
+             %{opened_state | io: nil, failed_appends: opened_state.failed_appends + 1}}
         end
 
       {:error, _reason} ->
