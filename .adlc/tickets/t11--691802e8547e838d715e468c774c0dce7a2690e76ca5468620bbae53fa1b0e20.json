@@ -1,0 +1,24 @@
+{
+  "body": "T11 spec: .adlc/specs/T11.md (the full contract — 10 ACs, all spec-lint verified). Design captured from the 2026-08-06 conversation (Myk + Veles): deltas-as-events / entities-as-resolutions; primitives ride, composites point (thin InferenceRequested deltas, pointer crash-window guarantee over the immutable store); actors bound to containers (ContextBuilder = session hyperview + window lens, Engine = stateful turn holder, Memory = entity resolution + markdown projector/watcher + L0/L1 tierer + trajectory retriever, Schema = genesis schema deltas + admission validation); memory reified to human-editable markdown (Obsidian vault = L2 tier; human edits -> attested MemoryEdited deltas; provenance model|human|derived, human-canon authoritative); tool chains as cascades of linked deltas; rendering is a lens not data; OpenViking L0/L1/L2 as the reference shape but derived from the delta substrate (A/B-swappable memory container). Gate (AC4): Hermes executes the operational run with a REAL Moonshot kimi-k3 call on a tmp store/keyring — ingest real question -> context builder fires -> model answers -> message.sent persists -> vault renders -> SIGTERM -> re-boot -> no duplicate. Plus: memory-grounding follow-up (AC5), memory markdown round-trip (AC6), schema validation at admission (AC7), tool-chain link/restart/projection (AC8), T10 deterministic loop untouched (AC9), gates clean (AC10).",
+  "id": "T11",
+  "rails": [
+    "deps/",
+    "spec/",
+    "SPEC.md",
+    "mix.exs",
+    "config/"
+  ],
+  "scope": [
+    "lib/kyber/agent/llm_handler.ex",
+    "lib/kyber/agent/context_builder.ex",
+    "lib/kyber/agent/engine.ex",
+    "lib/kyber/agent/memory.ex",
+    "lib/kyber/schema.ex",
+    "lib/kyber/agent/tool_executor.ex",
+    "lib/kyber/cli.ex",
+    "test/agent/*_test.exs",
+    "test/schema_test.exs",
+    "test/agent_smoke_test.exs"
+  ],
+  "title": "T11: the agent actually lives in it — LLM handler + memory store + schema layer"
+}
