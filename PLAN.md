@@ -6,49 +6,49 @@ success criteria. Hermes owns updating this file; the coding agent does not over
 
 ---
 
-## 0. Next Ralph Loop: The Unified Event Layer
+## 0. Next Ralph Loop: The Durable Store
 
-**Objective:** Prove the unification at the atom. A kyber event — a Discord message in, a model
-response out — is now a signed rhizomatic claim, byte-compatible with loam, in a grow-only set
-whose merge is union.
+**Objective:** The store only learns — and it remembers across restarts. An append-only
+JSONL wire log (the pinned envelope, one JSON text per line) behind the door: every append
+verifies then merges AND persists; boot replays the log through the door (re-verify +
+re-merge, the `admit/2` shape) so a reopened store is provably the same ground.
 
 **Requirements:**
-1. `Kyber.Keys` — the keyring: agent seed mint/load (0600, never printed, `KYBER_SEED` import),
-   human key import, `author_for_seed/1` → `"ed25519:…"`, signing via the witness's
-   `Rhizomatic.Signer`. File I/O confined to this module.
-2. `Kyber.Events` — claim templates for the core events per spec/01-events.md §2:
-   `message_received/…`, `prompt_annotated/…`, `llm_response/…`, `message_sent/…`, `tool_exec/…`.
-   Each builds the SPEC-1 pointer structure and signs with the right key (human-origin → human
-   key; agent-origin → agent key).
-3. `Kyber.DeltaSet` — grow-only set: `merge/2`, `member?/2`, `size/1`. Union semantics.
-4. `Kyber.Store` — the door (spec/04-persistence.md §3): parse (JSON debug profile) → recompute
-   id → strict signature verify → merge. Refuses tampered ids and wrong-key signatures.
-5. Tests prove the loam-compatibility claim: the wire JSON of a kyber event round-trips through
-   `Rhizomatic.Profile` byte-identically.
+1. `Kyber.Log` — the append-only file: `open/1`, `append/1` (one wire-envelope JSON text per
+   line), `stream/1` (lazy lines for replay). Torn-write tolerant: a partial final line is
+   reported, never fatal. Nothing is ever rewritten or deleted (spec/04-persistence.md §2).
+2. `Kyber.DurableStore` — the door on disk: `start_link(log_path)` replays the log through
+   `Kyber.Store.admit/2` (re-verify every signature, re-merge by union) into the in-memory
+   set; `append/1` = door + log write (verify → merge → persist, in that order); `set/0`
+   for reads. Reuses `Kyber.Store`'s door machinery — no second verification path.
+3. Replay integrity: a tampered line mid-log is refused and reported, never silently merged;
+   a torn final line is tolerated and reported; duplicates are no-ops (union).
+4. TDD; no Process.sleep; `mix format` clean.
 
 **Success Criteria (the gate):**
-- `mix test` green; `! grep -r "Process.sleep" test/` (no sleep fragility, ever).
-- Every emitted delta: `id` recomputes from canonical bytes via the witness; signature verifies
-  via the witness's strict Ed25519.
-- `message_received` signed by the human's key; `llm_response`/`message_sent` signed by the
-  agent's key.
-- `DeltaSet.merge` commutative + idempotent on a 3-delta fixture (assert both orders converge).
-- The door rejects: (a) a delta whose id does not match its claims, (b) a signature by the wrong
-  key.
-- The wire JSON of a signed `message_received` parses via `Rhizomatic.Profile` and re-serializes
-  to identical canonical bytes.
+- `mix test` green; `! grep -r "Process.sleep" test/`; `mix format --check-formatted` exits 0.
+- A delta survives a restart: open → append → stop → reopen → the delta is present and its
+  signature re-verifies (replay is re-verify + re-merge, AC-proven).
+- A torn final line (simulated truncated write) is tolerated: earlier lines replay, the torn
+  line is reported, the store serves.
+- A tampered line mid-log is refused and reported; the store serves the honest remainder.
+- Replay is order-independent: the same log lines in shuffled order converge to the same set
+  (union — the CRDT stays honest on disk).
 
-**Out of scope (later loops):** reactor/subscriptions (gated on substrate L4), Discord plugin,
-persistence to disk, federation, vault-as-view.
+**Out of scope (later loops):** sqlite/packs backends, federation, the reactor, the Discord
+plugin, migration, vault-as-view.
 
 ---
 
 ## 1. Current State (What Works)
 
-- Repo initialized; founding spec landed (SPEC.md + spec/00–07).
-- Rhizomatic Elixir witness consumed as a git dep (spec/03-substrate.md) — Level 0: canonical
-  CBOR, content addressing, strict Ed25519, packs.
-- Loop 1 (above) is the first code.
+- Founding spec landed (SPEC.md + spec/00–07); repo runs ADLC (`.adlc/` contract).
+- **Loop 1 COMPLETE (T1, archived)** — the unified event layer: `Kyber.Keys` (0600 atomic
+  keyring, KYBER_SEED import), `Kyber.Events` (five claim templates, exact §2 vocabulary,
+  D14 float timestamps), `Kyber.DeltaSet` (grow-only union), `Kyber.Store` (the door:
+  closed envelope → Profile parse → id recompute → D1 unsigned refusal → strict Ed25519 →
+  union). 41 tests, 0 failures; loam-compat proof byte-identical through real JSON text;
+  P1–P7 gates green, adversarial review 8/8 findings fixed.
 
 ## 2. Active Backlog
 
