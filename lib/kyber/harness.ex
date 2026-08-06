@@ -22,7 +22,16 @@ defmodule Kyber.Harness do
 
   The store-down guard comes FIRST: with :kyber stopped the pipeline answers
   `{:error, :store_not_running}` instead of a bare `GenServer.call` raising
-  `exit(:noproc)` (DurableStore.append/1 has no whereis guard of its own).
+  `exit(:noproc)` (DurableStore.append/1 has no whereis guard of its own). The
+  promise is TOTAL — `persist/1` wraps the append in `catch_exit`, so even a
+  store stopping mid-pipeline (after the guard, during seed I/O) answers a
+  tagged tuple, never a crash (P5 low finding 2).
+
+  Value types: the required keys' values are binaries, enforced by the Events
+  builder + the frozen witness (`Delta.validate` — e.g. an integer message_id
+  surfaces `{:error, {:not_a_string, :entity_id}}`), a tagged tuple, never a
+  crash (P5 low finding 1 — the tag is builder/witness-owned, outside the
+  `:source` family, which covers only missing/unknown keys).
   """
 
   alias Kyber.{DurableStore, Events, Keys, Wire}
@@ -141,9 +150,22 @@ defmodule Kyber.Harness do
   defp persist(signed) do
     envelope = Wire.envelope(signed)
 
-    case DurableStore.append(envelope) do
+    # TOCTOU closure (P5 low finding 2): the whereis guard runs BEFORE the
+    # seed file I/O — if the store stops mid-pipeline, the bare GenServer.call
+    # would raise exit(:noproc). The try/catch makes the never-crash promise
+    # TOTAL: even a store stopping in the window answers a tagged tuple.
+    result =
+      try do
+        DurableStore.append(envelope)
+      catch
+        :exit, reason -> {:exit, reason}
+      end
+
+    case result do
       :ok -> {:ok, envelope["id"]}
       {:error, _reason} = err -> err
+      {:exit, {:noproc, _}} -> {:error, :store_not_running}
+      {:exit, _} = exit_info -> {:error, {:append_exit, exit_info}}
     end
   end
 end

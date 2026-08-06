@@ -288,6 +288,30 @@ defmodule Kyber.HarnessTest do
     assert is_list(Harness.view())
   end
 
+  test "P5: guard-first precedence — with the app stopped AND the source malformed, the store-down error wins",
+       %{keyring_dir: keyring_dir} do
+    :ok = stop_app()
+
+    # missing required key + store down -> guard wins (documented, now pinned)
+    assert {:error, :store_not_running} = Harness.ingest(%{}, keyring_dir)
+
+    # re-boot before returning
+    assert {:ok, _} = Application.ensure_all_started(:kyber)
+    assert is_pid(Process.whereis(DurableStore))
+  end
+
+  test "P5: non-binary required values are refused by the builder/witness with a tagged tuple (never a crash)",
+       %{keyring_dir: keyring_dir} do
+    # an integer message_id passes PRESENCE validation and flows to the Events
+    # builder, whose witness-backed Delta.validate refuses it — the pinned
+    # guarantee is a tagged tuple, whatever upstream tag surfaces
+    bad = Map.put(source_event("131313131313131313", 13), "message_id", 123)
+    before = Harness.view()
+
+    assert {:error, {:not_a_string, _}} = Harness.ingest(bad, keyring_dir)
+    assert Harness.view() == before
+  end
+
   # ------------------------------------------------------------------ AC10
 
   test "AC10: view/0 is deterministic and assertable — atom-keyed claims sorted by id_hex",
