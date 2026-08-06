@@ -212,3 +212,25 @@ operates the harness for real — the loop's gate).
   `mix run --no-start -e 'Kyber.Keys.import_human_seed(String.duplicate("cd", 32), "/tmp/t10-keyring") |> IO.inspect()'`
   (`--no-start` — nothing boots, the real store is untouched). The daemon needs no
   such step: a missing agent seed is minted on first boot (first boot IS the mint).
+
+- **The store is multi-process — the log is a concurrent-writer file (post-verdict,
+  from the sibling review).** The contract's phrasing ("the daemon tails the
+  store's new claims") reads single-process, but the store is a shared JSONL log
+  written by the daemon VM AND by separate `kyber ingest` CLI VMs (AC7 is
+  precisely this). Folded: the daemon treats the log as an append-only file with
+  concurrent writers — each tick re-reads from its cursor (no open-stream
+  assumptions), a torn line at the TAIL is held for the next tick (an ingest
+  VM's append may still be in flight — consuming it would skip the completed
+  claim forever), and a torn MID-log line is reported and skipped (replay
+  classification, applied live). The cross-VM shape is machine-checked: the
+  smoke ingests via a SEPARATE OS process against the live daemon.
+
+- **The pid-lock is taken with an atomic O_EXCL create (post-verdict fold).** The
+  first-built read-then-write lock (`File.read` then overwrite) had a TOCTOU
+  window: two racing daemons could both read "stale" and both boot. Folded: the
+  lock's exists-check and create are ONE atomic operation
+  (`File.open(lock, [:write, :exclusive, :binary])`); a held lock is reclaimed
+  only when its pid is provably dead (`ps -p` — EPERM-safe, bounded attempts), so
+  a force-killed daemon (lock survives, `terminate/2` never ran) never bricks
+  re-boot. Machine-checked in the smoke: the refusal path, and a kill -9 phase
+  proving the stale lock is re-taken with the new daemon's pid.

@@ -12,7 +12,9 @@ defmodule Kyber.DaemonSmokeTest do
   # escript, boot `kyber daemon` on a tmp store as a long-running OS process,
   # ingest a message.received through the CLI from a second process, watch
   # the loop close through the daemon's own narration (assert_receive on the
-  # port — the pinned no-sleep waiting), SIGTERM, re-boot, prove no re-fire.
+  # port — the pinned no-sleep waiting), SIGTERM, re-boot, prove no re-fire
+  # (byte-stable log window), then force-kill and prove the stale lock is
+  # reclaimed — a killed daemon never bricks re-boot.
   #
   # Process hygiene is the T9 lesson, applied: the daemon is spawned via
   # Port.open (System.cmd would block forever on a blocking command), the
@@ -129,6 +131,7 @@ defmodule Kyber.DaemonSmokeTest do
       {_, 0} = System.cmd("kill", [Integer.to_string(os1)])
       assert_receive {^port1, {:exit_status, 0}}, 30_000
       refute File.exists?(lock)
+      refute os_alive?(os1), "the SIGTERM'd daemon's OS pid must be gone"
 
       # ---- AC3: re-boot resumes from the persisted checkpoint; ticks run;
       # nothing re-fires
@@ -140,6 +143,11 @@ defmodule Kyber.DaemonSmokeTest do
       # proof the ticker is live past the cursor
       await_line(port2, &String.starts_with?(&1, "dispatched checkpoint "))
 
+      # ---- byte-stable log window: after the resumed dispatch, the log must
+      # not grow AT ALL across many ticks — no re-fire, no phantom checkpoints
+      # (the strongest no-re-fire proof: at the byte level, not narration)
+      stable_log = File.read!(log)
+
       # two full view round-trips (each boots a VM — many 100ms ticks apart):
       # still exactly one ack, twice
       {view2, 0} = System.cmd(binary, ["--log", log, "view"], stderr_to_stdout: true, cd: base)
@@ -147,6 +155,7 @@ defmodule Kyber.DaemonSmokeTest do
       {view3, 0} = System.cmd(binary, ["--log", log, "view"], stderr_to_stdout: true, cd: base)
       assert [only] = view_lines(view3, " sent ")
       assert String.starts_with?(only, ack8)
+      assert File.read!(log) == stable_log, "the log must be byte-stable across the window"
 
       # nothing fired on the re-booted daemon — drain its narration and look
       refute Enum.any?(drain_lines(port2), &String.starts_with?(&1, "fired "))
@@ -161,6 +170,33 @@ defmodule Kyber.DaemonSmokeTest do
       {_, 0} = System.cmd("kill", [Integer.to_string(os2)])
       assert_receive {^port2, {:exit_status, 0}}, 30_000
       refute File.exists?(lock)
+      refute os_alive?(os2)
+
+      # ---- force-kill: terminate/2 never runs, so the lock SURVIVES; the
+      # next boot must reclaim the stale lock — a killed daemon never bricks
+      # re-boot (the O_EXCL reclaim path, machine-checked)
+      port3 = spawn_daemon(binary, base, log, key_dir)
+      assert_receive {^port3, {:data, {:eol, marker3}}}, 30_000
+      assert marker3 == "daemon running on #{log}"
+
+      {:os_pid, os3} = Port.info(port3, :os_pid)
+      {_, _} = System.cmd("kill", ["-9", Integer.to_string(os3)])
+      assert_receive {^port3, {:exit_status, _}}, 30_000
+      assert File.exists?(lock), "a force-killed daemon leaves its lock behind"
+      refute os_alive?(os3)
+
+      port4 = spawn_daemon(binary, base, log, key_dir)
+      assert_receive {^port4, {:data, {:eol, marker4}}}, 30_000
+      assert marker4 == "daemon running on #{log}"
+      {:os_pid, os4} = Port.info(port4, :os_pid)
+
+      assert File.read!(lock) == Integer.to_string(os4),
+             "the re-boot must re-take the lock with its own pid"
+
+      {_, 0} = System.cmd("kill", [Integer.to_string(os4)])
+      assert_receive {^port4, {:exit_status, 0}}, 30_000
+      refute File.exists?(lock)
+      refute os_alive?(os4)
 
       real_after = if File.exists?(real_store), do: File.read!(real_store), else: :absent
       assert real_after == real_before, "the real ~/.kyber store must never change in the smoke"
@@ -216,6 +252,12 @@ defmodule Kyber.DaemonSmokeTest do
 
   defp view_lines(view_out, marker) do
     view_out |> String.split("\n", trim: true) |> Enum.filter(&String.contains?(&1, marker))
+  end
+
+  # belt-and-braces os-level liveness: the port's :exit_status proves the
+  # escript VM exited; this proves the OS pid is REALLY gone (no zombie)
+  defp os_alive?(pid) do
+    match?({_, 0}, System.cmd("ps", ["-p", Integer.to_string(pid)], stderr_to_stdout: true))
   end
 
   defp files_with_role(vault, role) do

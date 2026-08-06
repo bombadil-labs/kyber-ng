@@ -39,7 +39,8 @@ defmodule Kyber.Daemon do
   ticks write no further checkpoint, so the mechanism converges instead of
   checkpointing its own checkpoints.
 
-  **The lock (AC1).** `<log>.lock` beside the log carries the OS pid. A
+  **The lock (AC1).** `<log>.lock` beside the log carries the OS pid, acquired
+  with an atomic O_EXCL create (no TOCTOU between racing daemons). A
   live foreign pid refuses the second daemon (`{:already_running, path}`); a
   dead, unreadable, or own-pid lock is stale and is retaken — a killed
   daemon must never brick re-boot. The daemon joins the app supervision tree
@@ -59,6 +60,7 @@ defmodule Kyber.Daemon do
 
   @default_tick_ms 250
   @max_pulse_depth 8
+  @lock_attempts 3
 
   @type status :: %{
           cursor: non_neg_integer(),
@@ -419,25 +421,50 @@ defmodule Kyber.Daemon do
   defp lock_path(log_path), do: log_path <> ".lock"
 
   defp take_lock(log_path) do
-    lock = lock_path(log_path)
+    do_take_lock(lock_path(log_path), @lock_attempts)
+  end
 
-    case File.read(lock) do
-      {:ok, content} ->
-        pid = String.trim(content)
+  defp do_take_lock(_lock, 0), do: {:error, {:lock_failed, :contended}}
 
-        if pid != System.pid() and os_pid_alive?(pid) do
-          {:error, {:already_running, log_path}}
+  # O_EXCL create: the exists-check and the create are ONE atomic operation —
+  # no TOCTOU between two racing daemons (the sibling review's finding, folded
+  # in post-verdict). A held lock is reclaimed only when its pid is provably
+  # dead; a killed daemon must never brick re-boot.
+  defp do_take_lock(lock, attempts) do
+    case File.open(lock, [:write, :exclusive, :binary]) do
+      {:ok, io} ->
+        with :ok <- IO.binwrite(io, System.pid()), :ok <- File.close(io) do
+          :ok
         else
-          # dead, garbage, or our own pid: stale — a killed daemon must
-          # never brick re-boot
-          write_lock(lock)
+          {:error, reason} -> {:error, {:lock_failed, reason}}
         end
 
-      {:error, :enoent} ->
-        write_lock(lock)
+      {:error, :eexist} ->
+        # stale, garbage, or our own pid: reclaim (dead, unreadable, or a
+        # live foreign pid must refuse, not be presumed dead)
+        if lock_held_by_live_pid?(lock) do
+          {:error, {:already_running, Path.rootname(lock, ".lock")}}
+        else
+          File.rm(lock)
+          do_take_lock(lock, attempts - 1)
+        end
+
+      {:error, reason} ->
+        {:error, {:lock_failed, reason}}
+    end
+  end
+
+  defp lock_held_by_live_pid?(lock) do
+    case File.read(lock) do
+      {:ok, content} ->
+        # our own OS pid = a crash-restart of a daemon in THIS VM (the old
+        # instance died; the lock is ours to retake) — only a FOREIGN live
+        # pid refuses the second daemon
+        pid = String.trim(content)
+        pid != System.pid() and os_pid_alive?(pid)
 
       {:error, _unreadable} ->
-        write_lock(lock)
+        false
     end
   end
 
@@ -450,13 +477,6 @@ defmodule Kyber.Daemon do
 
       _ ->
         false
-    end
-  end
-
-  defp write_lock(lock) do
-    case File.write(lock, System.pid()) do
-      :ok -> :ok
-      {:error, reason} -> {:error, {:lock_failed, reason}}
     end
   end
 
