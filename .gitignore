@@ -1,0 +1,13 @@
+# compiled
+_build/
+*.beam
+# deps
+deps/
+# data
+priv/data/
+*.sqlite
+# env
+.env
+# editor
+.idea/
+.vscode/
