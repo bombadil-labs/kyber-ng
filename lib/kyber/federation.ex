@@ -51,18 +51,39 @@ defmodule Kyber.Federation do
   id_hex). Store-down -> `{:error, :store_not_running}` (the T4 guard shape,
   checked at call start).
   """
-  @spec export() :: {:ok, binary()} | {:error, :store_not_running}
+  @spec export() :: {:ok, binary()} | {:error, :store_not_running | {:export_failed, term()}}
   def export do
     if Process.whereis(DurableStore) do
-      text =
-        DurableStore.set()
-        |> Enum.sort_by(fn {id_hex, _element} -> id_hex end)
-        |> Enum.map(fn {_id_hex, {claims, sig_hex}} -> encode_line({claims, sig_hex}) end)
-        |> Enum.join("\n")
+      case set_with_catch() do
+        {:exit, {:noproc, _}} ->
+          {:error, :store_not_running}
 
-      {:ok, text}
+        {:exit, _} = exit_info ->
+          {:error, {:store_exit, exit_info}}
+
+        set ->
+          case render_export(set) do
+            {:ok, text} -> {:ok, text}
+            {:error, reason} -> {:error, {:export_failed, reason}}
+          end
+      end
     else
       {:error, :store_not_running}
+    end
+  end
+
+  defp render_export(set) do
+    sorted = Enum.sort_by(set, fn {id_hex, _element} -> id_hex end)
+
+    Enum.reduce_while(sorted, {:ok, []}, fn {_id_hex, signed}, {:ok, acc} ->
+      case Wire.encode(Wire.envelope(signed)) do
+        {:ok, json} -> {:cont, {:ok, [json | acc]}}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+    |> case do
+      {:ok, lines} -> {:ok, Enum.reverse(lines) |> Enum.join("\n")}
+      {:error, _reason} = err -> err
     end
   end
 
@@ -85,8 +106,11 @@ defmodule Kyber.Federation do
           {:error, reason}
 
         report ->
-          DurableStore.put_import_report(report)
-          {:ok, report}
+          case put_report_with_catch(report) do
+            :ok -> {:ok, report}
+            {:exit, {:noproc, _}} -> {:error, :store_not_running}
+            {:exit, _} = exit_info -> {:error, {:store_exit, exit_info}}
+          end
       end
     else
       {:error, :store_not_running}
@@ -95,16 +119,20 @@ defmodule Kyber.Federation do
 
   def import(_), do: {:error, :malformed_text}
 
+  # P5 low finding 4: precedence pinned — input validation wins over store
+  # state: a non-binary can never be imported regardless of the store; the
+  # store-down promise applies to binary input. See AC6 + the moduledoc.
+
   @doc "The last import's report, store-owned (rev 2). Zeros before any import has run."
   @spec import_report() :: import_report()
   def import_report, do: DurableStore.import_report()
 
   # ---------------------------------------------------------------- export
 
-  defp encode_line(signed) do
-    {:ok, json} = Wire.encode(Wire.envelope(signed))
-    json
-  end
+  # P5 low finding 3: encode failures fold into {:error, {:export_failed,
+  # reason}} — a tagged tuple, never a MatchError crash (today unreachable:
+  # the door admits only encodable {claims, sig} pairs; wire_test pins all 7
+  # target shapes — but the export path must not be a crash class)
 
   # ---------------------------------------------------------------- import
 
@@ -148,17 +176,42 @@ defmodule Kyber.Federation do
   # skipped, not re-appended; else the door decides, via the SAME TOCTOU
   # catch_exit closure Kyber.Harness uses for DurableStore.append/1
   defp admit_line(envelope, line_no, report) do
-    id = envelope["id"]
+    case set_with_catch() do
+      {:exit, {:noproc, _}} ->
+        {:halt, report, :store_not_running}
 
-    if is_binary(id) and DeltaSet.member?(DurableStore.set(), id) do
-      {:cont, %{report | skipped: report.skipped + 1}}
-    else
-      handle_append(append_with_catch(envelope), line_no, report)
+      {:exit, _} = exit_info ->
+        {:halt, report, {:store_exit, exit_info}}
+
+      set ->
+        id = envelope["id"]
+
+        if is_binary(id) and DeltaSet.member?(set, id) do
+          {:cont, %{report | skipped: report.skipped + 1}}
+        else
+          handle_append(append_with_catch(envelope), line_no, report)
+        end
     end
+  end
+
+  # P5 medium finding 1: EVERY stateful call is exit-protected, not just the
+  # append — a store death landing on set() (per-line pre-check or export) or
+  # the success-path put_import_report raises exit(:noproc) from a bare call,
+  # crashing the caller where the never-crash promise says tagged tuple.
+  defp set_with_catch do
+    DurableStore.set()
+  catch
+    :exit, reason -> {:exit, reason}
   end
 
   defp append_with_catch(envelope) do
     DurableStore.append(envelope)
+  catch
+    :exit, reason -> {:exit, reason}
+  end
+
+  defp put_report_with_catch(report) do
+    DurableStore.put_import_report(report)
   catch
     :exit, reason -> {:exit, reason}
   end
@@ -172,6 +225,11 @@ defmodule Kyber.Federation do
     {:halt, report, {:import_failed, line_no, :persist_failed}}
   end
 
+  # P5 low finding 2: dead defense against store-contract drift — today
+  # DurableStore.persist_then_merge normalizes EVERY Log.append failure
+  # (write AND encode alike) to :persist_failed, so {:write, _} is
+  # unreachable; kept so a future store change cannot silently leak a sink
+  # failure into the continue/refused bucket.
   defp handle_append({:error, {:write, _} = reason}, line_no, report) do
     {:halt, report, {:import_failed, line_no, reason}}
   end

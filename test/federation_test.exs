@@ -282,6 +282,21 @@ defmodule Kyber.FederationTest do
     assert is_list(Harness.view())
   end
 
+  test "P5: non-binary import input — input validation wins over store state, pinned",
+       %{log_path: log_path} do
+    # with the store RUNNING
+    assert {:error, :malformed_text} = Federation.import(123)
+
+    # and with the store STOPPED — the catch-all clause has no whereis guard,
+    # so :malformed_text wins over :store_not_running (documented precedence:
+    # a non-binary can never be imported regardless of the store)
+    :ok = stop_app()
+    assert {:error, :malformed_text} = Federation.import(123)
+
+    boot_on(log_path)
+    assert is_list(Harness.view())
+  end
+
   # ------------------------------------------------------------------ AC7
 
   test "AC7: import_report is a live, store-owned observable — zeros initially, reset per import" do
