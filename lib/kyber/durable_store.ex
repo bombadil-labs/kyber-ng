@@ -36,6 +36,11 @@ defmodule Kyber.DurableStore do
           torn: [line_no()],
           failed_appends: non_neg_integer()
         }
+  @type import_report :: %{
+          imported: non_neg_integer(),
+          refused: [line_no()],
+          skipped: non_neg_integer()
+        }
 
   @doc "Boot the store: replay `log_path` through the door, then serve."
   @spec start_link(Path.t()) :: GenServer.on_start()
@@ -61,12 +66,43 @@ defmodule Kyber.DurableStore do
     GenServer.call(__MODULE__, :replay_report)
   end
 
+  @doc """
+  The last `Kyber.Federation.import/1`'s report (rev 2): store-owned state,
+  same bare-call semantics as `replay_report/0` (no whereis guard — the
+  caller, `Kyber.Federation`, owns store-down handling). Zeros before any
+  import has run.
+  """
+  @spec import_report() :: import_report()
+  def import_report do
+    GenServer.call(__MODULE__, :import_report)
+  end
+
+  @doc """
+  Federation-owned: set the live import report, atomically, at import END.
+  Internal to the `Kyber.Federation` flow — not part of the door's own
+  lifecycle.
+  """
+  @spec put_import_report(import_report()) :: :ok
+  def put_import_report(report) do
+    GenServer.call(__MODULE__, {:put_import_report, report})
+  end
+
   # -------------------------------------------------------------- callbacks
 
   @impl true
   def init(log_path) do
     {set, refused, torn} = replay(log_path)
-    {:ok, %{path: log_path, io: nil, set: set, refused: refused, torn: torn, failed_appends: 0}}
+
+    {:ok,
+     %{
+       path: log_path,
+       io: nil,
+       set: set,
+       refused: refused,
+       torn: torn,
+       failed_appends: 0,
+       import_report: %{imported: 0, refused: [], skipped: 0}
+     }}
   end
 
   @impl true
@@ -80,6 +116,12 @@ defmodule Kyber.DurableStore do
   def handle_call(:replay_report, _from, state) do
     {:reply, %{refused: state.refused, torn: state.torn, failed_appends: state.failed_appends},
      state}
+  end
+
+  def handle_call(:import_report, _from, state), do: {:reply, state.import_report, state}
+
+  def handle_call({:put_import_report, report}, _from, state) do
+    {:reply, :ok, %{state | import_report: report}}
   end
 
   @impl true
