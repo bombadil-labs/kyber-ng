@@ -6,38 +6,46 @@ success criteria. Hermes owns updating this file; the coding agent does not over
 
 ---
 
-## 0. Next Ralph Loop: The Operational Harness — kyber becomes something you can run and live in (the daemon)
+## 0. Next Ralph Loop: The agent actually lives in it — an LLM handler on the Gather (the harness eats a real model)
 
-**Objective (user direction 2026-08-06: "I don't see the kyber aspects yet — get an
-operational harness sooner than later that you can invoke and test against"):** T1–T9
-built the claims substrate (door, store, wire, events, federation, migration, vault,
-CLI, peers). The kyber aspect is the RUNTIME LOOP: event in → signed claim → action →
-memory, with an agent actually operating it. T10 makes kyber runnable: a `kyber daemon`
-(long-lived; boots the app; watches the log for new claims via a send_after ticker —
-NEVER Process.sleep; dispatches each claim to registered handlers; blocks in a
-receive-forever) + `Kyber.Gather` (the provisional harness-side subscription registry,
-spec/04 §6 — handlers register for claim shapes by role/pointer target) + the agent
-loop proven at RUNTIME (a built-in handler pair: `message.received` in → response →
-`message.sent` out). THE acceptance test is operational: I (Hermes, the delegated
-primary user) BOOT the daemon on a tmp store, ingest a real event through the CLI, and
-watch the claim land, the handler fire, and the vault grow — the loop closing
-end-to-end, live, not in a unit test. The Discord transport later plugs in as just
-another handler (the deployment, unblocked without the substrate L4 reactor).
+**Objective (T10's own closing line + the Prime Intellect thesis the user surfaced 2026-08-06: the
+harness elevates the baseline reasoning of *any* model plugged into it):** T10 landed the
+operational harness — `kyber daemon` (ticker, pid-lock, SIGTERM-clean), `Kyber.Gather` (container
+subscriptions), the persisted cursor (re-boot idempotent by construction), the admission knob, the
+vault, and the DETERMINISTIC built-in loop (`message.received` → `ack <id>`). The harness is real;
+the agent is a stub. T11 swaps the stub: a REAL model — Moonshot Kimi K3 (provider wiring already
+proven: `moonshotai/kimi-k3`, `MOONSHOT_API_KEY`) — becomes a gather handler, so an actual LLM
+lives in the loop: event in → signed claim → model action → response claim → memory (the claims
+substrate IS the memory). The Discord transport later plugs in as just another handler.
 
-**Requirements (contract: .adlc/specs/T10.md):**
-1. `Kyber.Gather` — a subscription registry: `subscribe(handler, matcher)` /
-   `notify(claim)`; handlers match claims by role/pointer shape; the daemon's tailer
-   routes each new claim through the registry.
-2. `kyber daemon` — the long-lived loop: boot (T8 discipline), tail the store log
-   (send_after ticks; never a sleep), dispatch claims to matching handlers, block
-   forever; clean shutdown on SIGTERM.
-3. The built-in agent-loop handlers: `message.received` → a response handler emits a
-   `message.sent` claim (the T4 harness loop at runtime); the response is
-   deterministic (pinned response text) so the operational test is byte-exact.
-4. The operational test (THE gate): boot the daemon on a fresh tmp store → CLI ingest
-   of a fixture source → assert the received claim lands → assert the sent claim lands
-   (the handler fired) → assert the vault renders both → stop the daemon → re-boot →
-   the loop continues (replay-idempotent: the already-handled claim is not re-fired).
+**Requirements (contract: .adlc/specs/T11.md):**
+1. `Kyber.Agent.LlmHandler` — an OpenAI-compatible streaming client (Moonshot base
+   `https://api.moonshot.ai/v1`, key from env `MOONSHOT_API_KEY`, model `kimi-k3`, zero new deps —
+   stdlib `:httpc`/`:ssl` like the rest of the repo; NO external HTTP lib) that implements the
+   gather handler contract `(delta[]) -> delta[]` with REAL (non-deterministic) content.
+2. The handler claims the received claim's timestamp (T10's determinism pin, relaxed exactly as the
+   T10 amendment reserved: "a future LLM handler should claim `now`") — content-derived identity
+   keeps re-boot idempotence: re-fires produce byte-identical requests; the sink's content-address
+   dedup drops replayed outputs.
+3. The operational run (THE gate, Hermes-executed): boot the daemon on a tmp store/keyring; CLI
+   ingest a `message.received` claim whose content is a real question; the LLM handler fires, the
+   model's answer persists as `message.sent` (agent-signed, non-deterministic); the vault renders
+   the exchange; SIGTERM; re-boot; the exchange does NOT duplicate; the answer claim is still in
+   the store. Bounded explicit polling, never `Process.sleep`.
+4. A memory affordance proves itself: the handler's SECOND invocation is grounded in the FIRST
+   exchange — the model sees its own prior `message.sent` claims (the store as memory) and answers
+   a follow-up that REQUIRES that memory ("what did I just say?"). verify: the second answer
+   references the first exchange's content.
+5. No `Process.sleep`; rails (deps/, spec/, SPEC.md, mix.exs, config/) frozen; the real `~/.kyber`
+   never touched; format clean; warnings-as-errors clean. verify: the T9/T10 gate suite.
+6. Determinism harness: with the LLM path disabled (or a canned stub handler), the T10 deterministic
+   ack loop still works — the built-in loop is the fallback, not a casualty. verify: the T10
+   daemon/agent_loop tests stay green unchanged.
+
+**Success criteria (exact, testable):** (a) `mix test` green including new handler/smoke tests; (b)
+the AC7-style operational run above passes with a REAL Moonshot call (recorded as the loop's
+acceptance evidence); (c) the memory-grounding follow-up exchange passes; (d) re-boot idempotence
+holds with the LLM handler (no duplicate exchange); (e) the T10 deterministic tests untouched.
 
 **The architectural model (user design, 2026-08-06 — the harness as a closed loop;
 refined the same day: deltas AS the events — one kind of thing in motion):** every
