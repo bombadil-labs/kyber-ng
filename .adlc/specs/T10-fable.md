@@ -140,3 +140,75 @@ smoke`) exercises AC1/AC3/AC4/AC5 against a tmp store and leaves zero leaked
 processes (the os_pid kill idiom — Port.close does not terminate
 spawn_executable children); **and the AC7 operational run** (Hermes boots and
 operates the harness for real — the loop's gate).
+
+## Rev 2 amendments (contradictions found during the build, folded — not papered over)
+
+- **"Role `message`, flavor `received`/`sent`" has no carrier at the atom (AC2/AC4).**
+  The atom has no kind field: a claim's event kind is its template's FIRST pointer
+  role, and template order is part of the content address (SPEC-1 §2). Folded: the
+  gather's subscription key IS the first-pointer role — `message.received` routes as
+  `"received"`, the ack routes as `"sent"`, `daemon.checkpoint` as `"checkpoint"`.
+  This also makes AC2's no-self-loop structural rather than policed: a handler's
+  output kind differs from its subscribed kind by template, so a handler cannot be
+  its own subscriber without changing the vocabulary.
+
+- **AC1's `kyber daemon --log <path>` contradicts the T8 pinned grammar.** T8 pinned
+  `--log` as a GLOBAL PREFIX ONLY (`kyber [--log <path>] <command>`; a post-command
+  `--log` is a usage error, machine-checked in cli_test AC2). AC1 spells the flag
+  after the command. Folded: for the `daemon` command alone, `--log` is admitted in
+  either position — it remains the same BOOT flag (main/1's load → put_env → start
+  override), merely spelled where AC1 pins it; both positions at once is ambiguous
+  (usage, exit 2). Every other command keeps the T8 prefix-only rule. Two further
+  pins fall out: `--log` is REQUIRED for `daemon` (there is no implicit
+  default-store daemon), and `Kyber.Daemon` refuses to init when no `:log_path` is
+  configured — "the daemon never touches the real `~/.kyber` store" is enforced
+  structurally, not by convention.
+
+- **The persist-everything spine contradicts D5's absolute.** SPEC.md's hard limit
+  D5 says ephemeral events NEVER reach the delta layer, while this contract's spine
+  says persisted-vs-pulse is admission policy with a persist-everything default and
+  "no shape is dropped by default". Left unfolded, the daemon's own `watcher.tick`
+  heartbeat would either flood the store (persist default) or violate "no shape
+  dropped by default" (a shipped down-tuning). Folded: **admission policy is carried
+  by the channel choice at the sink, never by the object** (one type: a signed,
+  door-verified delta — AC5's requirement holds on both channels). The log channel
+  and handler outputs are memory by default (persist-everything, nothing dropped);
+  the pulse channel (`Gather.notify/1`, plus the daemon's own per-tick
+  `watcher.tick` heartbeat) is ephemeral by construction — D5's mechanism pulses
+  ride it and never reach the delta layer. The knob (`--pulse-only <role>`) tunes
+  sink shapes DOWN onto the pulse channel; AC5's "pulses are ephemeral unless a
+  policy says otherwise" names a possible up-tuning that is deliberately NOT
+  shipped — the spine's "tune shapes DOWN, never up" wins.
+
+- **AC4's determinism outranks clock honesty.** A response claiming `now` would make
+  every re-fire a NEW claim (content-derived identity), so the AC3 crash window
+  (killed between the ack persisting and the checkpoint landing) would duplicate the
+  ack. Folded: the built-in response claims the RECEIVED claim's timestamp and
+  derives its outgoing id (`message:ack:<received-id>`), making the handler a pure
+  function of its view — a crash-window re-fire produces the byte-identical delta
+  and the sink skips it by content address. The pinned reply text: exactly
+  `ack <received-id>`, `<received-id>` = the received claim's id hex. A future LLM
+  handler should claim `now`; the built-in ack trades that for idempotence.
+
+- **AC6's "smoke test" runs stronger than smoke.** The knob proof (persist default /
+  pulse-only tuning / unsigned refused on both paths) is an ALWAYS-RUN in-VM test
+  (test/daemon_test.exs, AC6 trio) rather than an env-gated smoke; the escript
+  smoke (test/daemon_smoke_test.exs) carries AC5's never-persists half against the
+  live ticker (no `tick`-kind claim in the store after real ticking). Coverage is
+  split, not reduced.
+
+- **Cursor mechanics, pinned as built (the recommended shape adopted).** The cursor
+  counts consumed log lines; after any tick that dispatched a non-checkpoint claim
+  the daemon emits `daemon.checkpoint` (`checkpoint`/`position` pointers, position
+  as float per D14). Checkpoint-only ticks write no checkpoint — the mechanism
+  converges (two checkpoints per exchange) instead of checkpointing its own
+  checkpoints forever. A torn line at the log TAIL is held for the next tick (it
+  may be a concurrent `kyber ingest` still writing), while a torn mid-log line is
+  reported and skipped — the replay classification, applied live.
+
+- **AC7 friction note (the operational recipe).** `kyber ingest` signs with the
+  HUMAN key and T8 pinned that no seed-import CLI command exists, so the tmp
+  keyring for the gate run is seeded once with:
+  `mix run --no-start -e 'Kyber.Keys.import_human_seed(String.duplicate("cd", 32), "/tmp/t10-keyring") |> IO.inspect()'`
+  (`--no-start` — nothing boots, the real store is untouched). The daemon needs no
+  such step: a missing agent seed is minted on first boot (first boot IS the mint).

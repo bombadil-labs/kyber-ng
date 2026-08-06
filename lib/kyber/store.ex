@@ -84,6 +84,20 @@ defmodule Kyber.Store do
     end
   end
 
+  @doc """
+  The pure door as a verifier (T10): admit the wire against the empty set and
+  hand back the single verified delta as `{:ok, %{id: id_hex, claims: claims}}`.
+  This is the SAME verification path replay and append use — pulses and the
+  daemon's dispatch go through the one door, never a second one.
+  """
+  @spec verify(map()) :: {:ok, %{id: String.t(), claims: Delta.claims()}} | {:error, term()}
+  def verify(wire) do
+    with {:ok, set} <- admit(wire, DeltaSet.new()) do
+      [{id_hex, {claims, _sig}}] = Map.to_list(set)
+      {:ok, %{id: id_hex, claims: claims}}
+    end
+  end
+
   # ---------------------------------------------------------------- the door
 
   # the envelope is closed, exactly like the witness's closed profile: unknown

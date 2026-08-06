@@ -34,7 +34,11 @@ defmodule Kyber.Application do
             restart: :permanent
           }
         ],
-        strategy: :one_for_one
+        strategy: :one_for_one,
+        # named (T10) so `Kyber.Daemon.boot/1` can join the tree dynamically —
+        # only a supervised daemon gets a graceful terminate (lock release) on
+        # SIGTERM's init:stop
+        name: Kyber.Supervisor
       )
     end
   end
