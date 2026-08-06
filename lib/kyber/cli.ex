@@ -31,12 +31,15 @@ defmodule Kyber.CLI do
   never a crash.
   """
 
-  alias Kyber.{DurableStore, Federation, Harness, Migration, Peer, Vault}
+  alias Kyber.{Daemon, DurableStore, Federation, Harness, Migration, Peer, Vault}
 
   @usage """
   kyber [--log <path>] <command> [args]
     view                                   sorted claims, one per line; exit 0
     ingest <source.json> --keyring <dir>   the source map -> Harness.ingest; prints the claim id; exit 0
+    daemon --log <path> --keyring <dir> [--tick-ms <n>] [--pulse-only <role>]
+                                           run the agent daemon on <path>; prints "daemon running on <path>"; then blocks;
+                                           a second daemon on the same log exits 1
     render <vault_dir>                     Vault.render; prints the report; exit 0
     refresh <vault_dir>                    Vault.refresh; prints the report; exit 0
     export                                 Federation.export; prints the wire text verbatim + "\\n"; exit 0
@@ -93,7 +96,18 @@ defmodule Kyber.CLI do
   # check. [] and ["help"] -> usage, exit 0; ["help" | _] -> usage, exit 2;
   # a stray/bare --log -> usage, exit 2. Usage shapes NEVER boot (a
   # `kyber --log view` must not create ./view). Only a real command boots.
+  # The daemon command is FULLY pre-flighted (T10 AC8): every malformed
+  # daemon argv is a usage error before any boot — the daemon's --log is a
+  # boot flag, so its validation cannot wait for run/1.
   defp preflight(argv) do
+    case parse_daemon(argv) do
+      {:ok, opts} -> {:ok, argv, opts.log}
+      {:error, :usage} -> {:usage, 2}
+      :not_daemon -> preflight_command(argv)
+    end
+  end
+
+  defp preflight_command(argv) do
     case strip_log_prefix(argv) do
       {:error, :usage} ->
         {:usage, 2}
@@ -157,6 +171,14 @@ defmodule Kyber.CLI do
     block_forever()
   end
 
+  # daemon (T10): same shape as serve — print the marker, then block; the
+  # daemon lives in the supervision tree, and SIGTERM's init:stop unwinds it
+  # cleanly (the lock releases; exit 0)
+  defp print_and_halt({:ok, {:daemon, line, _pid}}) do
+    IO.puts(line)
+    block_forever()
+  end
+
   defp print_and_halt({:ok, message}) do
     print(message)
     System.halt(0)
@@ -200,6 +222,17 @@ defmodule Kyber.CLI do
   @spec run([String.t()]) ::
           {:ok, String.t() | map()} | {:error, String.t()} | {:error, :usage, String.t()}
   def run(argv) do
+    # daemon first (T10): its `--log` is admitted AFTER the command (AC1's
+    # pinned spelling — see the rev 2 grammar note in .adlc/specs/T10-fable.md),
+    # so it must not reach the stray---log rejection below
+    case parse_daemon(argv) do
+      {:ok, opts} -> cmd_daemon(opts)
+      {:error, :usage} -> {:error, :usage, @usage}
+      :not_daemon -> run_command(argv)
+    end
+  end
+
+  defp run_command(argv) do
     case strip_log_prefix(argv) do
       # serve returns its marker/error UNCHANGED — run/1 stays pure (no
       # print, no block): main/1's wrapper is the only place that blocks
@@ -242,6 +275,63 @@ defmodule Kyber.CLI do
   defp dispatch(["send", host, port_str]), do: cmd_send(host, port_str)
 
   defp dispatch(_other), do: {:error, :usage, @usage}
+
+  # ----------------------------------------------------------------- daemon
+
+  # `kyber daemon` (T10): --log is REQUIRED (no implicit default-store
+  # daemon — the real ~/.kyber is structurally out of reach) and is accepted
+  # either as the T8 global prefix or after the command (AC1's spelling);
+  # both at once is ambiguous. --keyring is required; --tick-ms (positive
+  # integer) and --pulse-only (repeatable, the AC6 knob) are optional.
+  defp parse_daemon(["--log", path, "daemon" | rest]),
+    do: daemon_opts(rest, %{log: path, keyring: nil, tick_ms: nil, pulse_only: []})
+
+  defp parse_daemon(["daemon" | rest]),
+    do: daemon_opts(rest, %{log: nil, keyring: nil, tick_ms: nil, pulse_only: []})
+
+  defp parse_daemon(_argv), do: :not_daemon
+
+  defp daemon_opts([], %{log: log, keyring: keyring} = opts)
+       when is_binary(log) and is_binary(keyring),
+       do: {:ok, opts}
+
+  defp daemon_opts([], _incomplete), do: {:error, :usage}
+
+  defp daemon_opts(["--log", path | rest], %{log: nil} = opts),
+    do: daemon_opts(rest, %{opts | log: path})
+
+  defp daemon_opts(["--keyring", dir | rest], %{keyring: nil} = opts),
+    do: daemon_opts(rest, %{opts | keyring: dir})
+
+  defp daemon_opts(["--tick-ms", text | rest], %{tick_ms: nil} = opts) do
+    case Integer.parse(text) do
+      {ms, ""} when ms > 0 -> daemon_opts(rest, %{opts | tick_ms: ms})
+      _ -> {:error, :usage}
+    end
+  end
+
+  defp daemon_opts(["--pulse-only", role | rest], opts) when role != "",
+    do: daemon_opts(rest, %{opts | pulse_only: opts.pulse_only ++ [role]})
+
+  defp daemon_opts(_other, _opts), do: {:error, :usage}
+
+  # boot the daemon into the supervision tree and hand main/1 the blocking
+  # marker; the printed path comes from the daemon's own status (the store it
+  # actually watches), not the argv
+  defp cmd_daemon(opts) do
+    boot_opts =
+      [keyring_dir: opts.keyring, pulse_only: opts.pulse_only, narrate: true] ++
+        if(opts.tick_ms, do: [tick_ms: opts.tick_ms], else: [])
+
+    case Daemon.boot(boot_opts) do
+      {:ok, pid} ->
+        %{log_path: log_path} = Daemon.status()
+        {:ok, {:daemon, "daemon running on #{log_path}", pid}}
+
+      {:error, reason} ->
+        {:error, format_error(reason)}
+    end
+  end
 
   # ------------------------------------------------------------------ serve
 
@@ -409,6 +499,7 @@ defmodule Kyber.CLI do
   # total coverage should Federation's contract ever route :malformed_text
   # through this call.
   defp format_error(:malformed_text), do: "malformed wire"
+  defp format_error({:already_running, path}), do: "daemon already running on #{path}"
   defp format_error({:peer_unreachable, host, port}), do: "peer unreachable: #{host} #{port}"
   defp format_error({:peer_timeout, host, port}), do: "peer timeout: #{host} #{port}"
   defp format_error({:peer_closed, host, port}), do: "peer closed: #{host} #{port}"

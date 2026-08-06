@@ -362,6 +362,69 @@ defmodule Kyber.CLITest do
     assert :ok = Kyber.Peer.stop(pid)
   end
 
+  # ------------------------------------------- T10 daemon (AC1/AC8)
+
+  test "T10 AC8: daemon argv shapes — usage errors, never a boot" do
+    assert {:error, :usage, _} = CLI.run(["daemon"])
+    assert {:error, :usage, _} = CLI.run(["daemon", "--log", "/tmp/x"])
+    assert {:error, :usage, _} = CLI.run(["daemon", "--keyring", "/tmp/k"])
+
+    assert {:error, :usage, _} =
+             CLI.run(["daemon", "--log", "/tmp/x", "--keyring", "/tmp/k", "--tick-ms", "abc"])
+
+    assert {:error, :usage, _} =
+             CLI.run(["daemon", "--log", "/tmp/x", "--keyring", "/tmp/k", "--tick-ms", "0"])
+
+    assert {:error, :usage, _} =
+             CLI.run(["daemon", "--log", "/tmp/x", "--keyring", "/tmp/k", "--bogus"])
+
+    # a global --log prefix AND a daemon --log option is ambiguous
+    assert {:error, :usage, _} =
+             CLI.run(["--log", "/tmp/a", "daemon", "--log", "/tmp/b", "--keyring", "/tmp/k"])
+  end
+
+  test "T10 AC1: the daemon boots via the CLI (marker tuple) and a second boot is the pinned one-liner",
+       %{keyring_dir: keyring_dir, log_path: log_path} do
+    on_exit(fn -> Kyber.Daemon.stop() end)
+
+    assert {:ok, {:daemon, line, pid}} =
+             CLI.run([
+               "daemon",
+               "--log",
+               log_path,
+               "--keyring",
+               keyring_dir,
+               "--tick-ms",
+               "60000"
+             ])
+
+    assert is_pid(pid)
+    assert line == "daemon running on #{log_path}"
+
+    assert {:error, message} = CLI.run(["daemon", "--log", log_path, "--keyring", keyring_dir])
+    assert message == "daemon already running on #{log_path}"
+
+    assert :ok = Kyber.Daemon.stop()
+  end
+
+  test "T10 AC1: the global --log prefix form boots the daemon too",
+       %{keyring_dir: keyring_dir, log_path: log_path} do
+    on_exit(fn -> Kyber.Daemon.stop() end)
+
+    assert {:ok, {:daemon, _line, _pid}} =
+             CLI.run([
+               "--log",
+               log_path,
+               "daemon",
+               "--keyring",
+               keyring_dir,
+               "--tick-ms",
+               "60000"
+             ])
+
+    assert :ok = Kyber.Daemon.stop()
+  end
+
   # ------------------------------------------------------------------ AC8
 
   # (AC8 is a repo-wide grep for the sleep primitive across test/ — no

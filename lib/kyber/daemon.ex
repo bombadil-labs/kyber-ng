@@ -1,0 +1,526 @@
+defmodule Kyber.Daemon do
+  @moduledoc """
+  The long-lived process (T10): an agent actually living in the claims
+  substrate. The daemon boots against the app-configured store, watches the
+  log for claims newer than its dispatch cursor (a `send_after` TICKER —
+  never `Process.sleep`), routes new deltas into `Kyber.Gather`, applies the
+  admission policy to everything the handlers produce, and shuts down
+  cleanly on SIGTERM.
+
+  **Two channels, one object type (AC5).** Deltas ARE the events; persisted
+  vs pulse is admission policy at the sink, never a type:
+
+    * the LOG channel — claims already persisted (CLI ingest, federation,
+      the daemon's own appends) are dispatched once, in log order, and the
+      cursor advances;
+    * the PULSE channel — ephemeral signed deltas (`Kyber.Gather.notify/1`,
+      plus the daemon's own `watcher.tick` heartbeat each tick) are door-
+      verified, routed immediately, and never persisted. Ephemeral-by-channel
+      is how D5 survives the persist-everything default: mechanism heartbeats
+      ride the pulse channel, so they never reach the delta layer.
+
+  **The sink (AC6).** Handler outputs and the daemon's own mechanism claims
+  go through one admission point: persist-everything by default; the
+  `:pulse_only` knob (a list of kind-marker roles, `--pulse-only` on the
+  CLI) tunes specific shapes DOWN to the pulse channel. The knob never
+  weakens the door — pulsed shapes are verified by the same
+  `Kyber.Store.verify/1` as everything else, and an unsigned delta is
+  refused, not pulsed. An output whose id is already in the store is skipped
+  (the deterministic ack re-fired in a crash window dedupes by content
+  address). Pulse-fired outputs recurse through the sink with a depth cap —
+  a handler cycle is refused (`:pulse_depth`), never an infinite loop.
+
+  **The cursor persists as data (AC3).** After a tick that dispatched any
+  non-checkpoint claim, the daemon emits a `daemon.checkpoint` claim carrying
+  its line position — state as data, an ordinary signed claim in the store.
+  On boot the cursor is derived from the highest checkpoint in the replayed
+  set (a derived reading, never a source of truth), so a re-boot resumes
+  exactly where the previous run stopped and never re-fires. Checkpoint-only
+  ticks write no further checkpoint, so the mechanism converges instead of
+  checkpointing its own checkpoints.
+
+  **The lock (AC1).** `<log>.lock` beside the log carries the OS pid, acquired
+  with an atomic O_EXCL create (no TOCTOU between racing daemons). A
+  live foreign pid refuses the second daemon (`{:already_running, path}`); a
+  dead, unreadable, or own-pid lock is stale and is retaken — a killed
+  daemon must never brick re-boot. The daemon joins the app supervision tree
+  (`boot/1`), which is what makes SIGTERM clean: `init:stop` terminates the
+  tree, `terminate/2` runs, the lock releases, exit 0.
+
+  A torn line at the log's tail is held, not consumed — it may be a
+  concurrent writer's append still in flight; it is retried next tick and
+  only counted torn once a later line lands behind it (mid-log torn lines
+  are reported and skipped, never repaired — the replay classification).
+  """
+
+  use GenServer
+
+  alias Kyber.{AgentLoop, DeltaSet, DurableStore, Gather, Keys, Log, Store, Wire}
+  alias Rhizomatic.Delta
+
+  @default_tick_ms 250
+  @max_pulse_depth 8
+  @lock_attempts 3
+
+  @type status :: %{
+          cursor: non_neg_integer(),
+          author: String.t(),
+          log_path: Path.t(),
+          fired: non_neg_integer(),
+          persisted: non_neg_integer(),
+          pulsed: non_neg_integer(),
+          skipped: non_neg_integer()
+        }
+
+  # ------------------------------------------------------------------ boot
+
+  @doc """
+  Start the daemon under the app supervisor — the only placement that gives
+  it a graceful terminate (lock release) when SIGTERM's `init:stop` unwinds
+  the tree. Options: `:keyring_dir` (required; a missing agent seed is
+  minted — first boot IS the mint), `:tick_ms` (positive integer or
+  `:manual`, default #{@default_tick_ms}), `:pulse_only` (list of kind-marker
+  roles, default `[]` — persist-everything), `:narrate` (boolean, default
+  false — one line per dispatch/fire/persist for the operator).
+  """
+  @spec boot(keyword()) :: {:ok, pid()} | {:error, term()}
+  def boot(opts) do
+    if Process.whereis(Kyber.Supervisor) do
+      case Supervisor.start_child(Kyber.Supervisor, spec(opts)) do
+        {:ok, pid} -> {:ok, pid}
+        {:error, :already_present} -> replace_child(opts)
+        {:error, reason} -> {:error, boot_reason(reason)}
+      end
+    else
+      {:error, :store_not_running}
+    end
+  end
+
+  @doc "Stop the daemon and drop its child spec. Idempotent."
+  @spec stop() :: :ok
+  def stop do
+    if Process.whereis(Kyber.Supervisor) do
+      Supervisor.terminate_child(Kyber.Supervisor, __MODULE__)
+      Supervisor.delete_child(Kyber.Supervisor, __MODULE__)
+    end
+
+    :ok
+  end
+
+  @doc false
+  @spec start_link(keyword()) :: GenServer.on_start()
+  def start_link(opts) do
+    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+  end
+
+  # ------------------------------------------------------------------- api
+
+  @doc "Run one dispatch cycle synchronously (the tests' no-sleep drive)."
+  @spec tick() :: {:ok, status()}
+  def tick, do: GenServer.call(__MODULE__, :tick)
+
+  @doc "The operational shape: cursor, author, log path, counters."
+  @spec status() :: status()
+  def status, do: GenServer.call(__MODULE__, :status)
+
+  @doc """
+  The sink, public (AC6): admit one wire through the daemon's admission
+  policy — persisted by default, pulse-only when its kind-marker role is
+  tuned down, skipped when its content address is already in the store,
+  refused by the door when invalid.
+  """
+  @spec emit(map()) :: {:ok, :persisted | :pulsed | :skipped} | {:error, term()}
+  def emit(wire), do: GenServer.call(__MODULE__, {:emit, wire})
+
+  # -------------------------------------------------------------- callbacks
+
+  @impl true
+  def init(opts) do
+    log_path = Application.get_env(:kyber, :log_path)
+    keyring_dir = Keyword.fetch!(opts, :keyring_dir)
+
+    with :ok <- guard_store(),
+         :ok <- guard_log(log_path),
+         {:ok, seed} <- ensure_agent_seed(keyring_dir),
+         :ok <- take_lock(log_path) do
+      Process.flag(:trap_exit, true)
+      {:ok, gather} = start_gather()
+      {:ok, _ref} = Gather.subscribe("received", AgentLoop.handler(seed))
+
+      state = %{
+        log_path: log_path,
+        lock: lock_path(log_path),
+        seed: seed,
+        author: Keys.author_for_seed(seed),
+        gather: gather,
+        cursor: checkpoint_cursor(DurableStore.set()),
+        tick_ms: Keyword.get(opts, :tick_ms, @default_tick_ms),
+        pulse_only: Keyword.get(opts, :pulse_only, []),
+        narrate: Keyword.get(opts, :narrate, false),
+        fired: 0,
+        persisted: 0,
+        pulsed: 0,
+        skipped: 0
+      }
+
+      schedule(state)
+      {:ok, state}
+    else
+      {:error, reason} -> {:stop, reason}
+    end
+  end
+
+  @impl true
+  def handle_call(:tick, _from, state) do
+    state = do_tick(state)
+    {:reply, {:ok, status_map(state)}, state}
+  end
+
+  def handle_call(:status, _from, state), do: {:reply, status_map(state), state}
+
+  def handle_call({:emit, wire}, _from, state) do
+    {result, state} = sink(wire, state, 0)
+    {:reply, result, state}
+  end
+
+  @impl true
+  def handle_info(:tick, state) do
+    state = do_tick(state)
+    schedule(state)
+    {:noreply, state}
+  end
+
+  # the gather is link-coupled: if it dies abnormally the daemon stops with
+  # it (the supervisor's :transient restart re-inits both)
+  def handle_info({:EXIT, pid, reason}, %{gather: pid} = state), do: {:stop, reason, state}
+  def handle_info({:EXIT, _pid, _reason}, state), do: {:noreply, state}
+
+  @impl true
+  def terminate(_reason, state) do
+    File.rm(state.lock)
+    :ok
+  end
+
+  # ----------------------------------------------------------------- ticks
+
+  defp schedule(%{tick_ms: :manual}), do: :ok
+  defp schedule(%{tick_ms: ms}), do: Process.send_after(self(), :tick, ms)
+
+  defp do_tick(state) do
+    {consumed, deltas} = collect(state)
+    state = %{state | cursor: state.cursor + consumed}
+    {outputs, state} = dispatch(deltas, state)
+    state = Enum.reduce(outputs, state, fn wire, s -> sink(wire, s, 0) |> elem(1) end)
+    state = maybe_checkpoint(deltas, state)
+    heartbeat(state)
+  end
+
+  # the log-channel intake: everything past the cursor, classified exactly
+  # like replay (blank consumed; torn mid-log consumed and skipped; torn at
+  # the tail HELD for the next tick; door-refused consumed and reported;
+  # door-verified handed on)
+  defp collect(state) do
+    pending = state.log_path |> Log.stream() |> Enum.drop(state.cursor)
+    last = length(pending) - 1
+
+    {consumed, deltas} =
+      pending
+      |> Enum.with_index()
+      |> Enum.reduce_while({0, []}, fn {line, i}, {n, acc} ->
+        classify_line(line, i == last, {n, acc}, state)
+      end)
+
+    {consumed, Enum.reverse(deltas)}
+  end
+
+  defp classify_line(line, at_tail?, {n, acc}, state) do
+    if String.trim(line) == "" do
+      {:cont, {n + 1, acc}}
+    else
+      case JSON.decode(line) do
+        {:error, _} when at_tail? ->
+          {:halt, {n, acc}}
+
+        {:error, _} ->
+          narrate(state, "torn line skipped")
+          {:cont, {n + 1, acc}}
+
+        {:ok, term} ->
+          case Store.verify(term) do
+            {:ok, delta} ->
+              {:cont, {n + 1, [delta | acc]}}
+
+            {:error, reason} ->
+              narrate(state, "refused #{inspect(reason)}")
+              {:cont, {n + 1, acc}}
+          end
+      end
+    end
+  end
+
+  defp dispatch(deltas, state) do
+    Enum.map_reduce(deltas, state, fn delta, s ->
+      narrate(s, "dispatched #{kind(delta)} #{short(delta.id)}")
+      {:ok, report} = Gather.route(delta)
+      Enum.each(report.errors, &narrate(s, "handler error #{inspect(&1)}"))
+      if report.fired > 0, do: narrate(s, "fired #{kind(delta)} +#{length(report.outputs)}")
+      {report.outputs, %{s | fired: s.fired + report.fired}}
+    end)
+    |> then(fn {outputs, s} -> {List.flatten(outputs), s} end)
+  end
+
+  # ------------------------------------------------------------------ sink
+
+  defp sink(_wire, state, depth) when depth > @max_pulse_depth,
+    do: {{:error, :pulse_depth}, state}
+
+  defp sink(wire, state, depth) do
+    if wire_role(wire) in state.pulse_only do
+      pulse(wire, state, depth)
+    else
+      persist(wire, state)
+    end
+  end
+
+  defp persist(wire, state) do
+    id = wire["id"]
+
+    if is_binary(id) and DeltaSet.member?(DurableStore.set(), id) do
+      narrate(state, "skipped #{short(id)}")
+      {{:ok, :skipped}, %{state | skipped: state.skipped + 1}}
+    else
+      case DurableStore.append(wire) do
+        :ok ->
+          narrate(state, "persisted #{wire_role(wire)} #{short(id)}")
+          {{:ok, :persisted}, %{state | persisted: state.persisted + 1}}
+
+        {:error, reason} ->
+          narrate(state, "refused #{inspect(reason)}")
+          {{:error, reason}, state}
+      end
+    end
+  end
+
+  # the pulse channel: the same door, then route-and-drop; outputs recurse
+  # through the sink (a pulse may fire a handler whose output IS memory)
+  defp pulse(wire, state, depth) do
+    case Store.verify(wire) do
+      {:ok, delta} ->
+        {:ok, report} = Gather.route(delta)
+        if report.fired > 0, do: narrate(state, "pulse #{kind(delta)} fired +#{report.fired}")
+
+        state =
+          Enum.reduce(report.outputs, %{state | pulsed: state.pulsed + 1}, fn w, s ->
+            sink(w, s, depth + 1) |> elem(1)
+          end)
+
+        {{:ok, :pulsed}, state}
+
+      {:error, reason} ->
+        {{:error, reason}, state}
+    end
+  end
+
+  # -------------------------------------------------------- mechanism claims
+
+  # checkpoint only when this tick dispatched something worth remembering —
+  # a checkpoint-only tick writes nothing, so the cursor converges
+  defp maybe_checkpoint(deltas, state) do
+    if Enum.any?(deltas, &(kind(&1) != "checkpoint")) do
+      {_result, state} = sink(checkpoint_wire(state), state, 0)
+      narrate(state, "checkpoint #{state.cursor}")
+      state
+    else
+      state
+    end
+  end
+
+  # the heartbeat is ephemeral BY CHANNEL (D5): straight to the pulse path,
+  # never through the knob — a signed delta by shape, memory never
+  defp heartbeat(state) do
+    {_result, state} = pulse(tick_wire(state), state, 0)
+    state
+  end
+
+  defp checkpoint_wire(state) do
+    build_signed(state, [
+      %{role: "checkpoint", target: {:entity, "daemon:kyber", "checkpoints"}},
+      %{role: "position", target: {:number, state.cursor * 1.0}}
+    ])
+  end
+
+  defp tick_wire(state) do
+    build_signed(state, [%{role: "tick", target: {:entity, "cron:daemon-ticker", "fired"}}])
+  end
+
+  defp build_signed(state, pointers) do
+    raw = %{
+      timestamp: 1.0 * System.system_time(:millisecond),
+      author: state.author,
+      pointers: pointers
+    }
+
+    {:ok, claims} = Delta.validate(raw)
+    {:ok, sig} = Keys.sign(claims, state.seed)
+    Wire.envelope({claims, sig})
+  end
+
+  # the cursor is derived, never a source of truth: the highest checkpoint
+  # position in the replayed set
+  defp checkpoint_cursor(set) do
+    set
+    |> Enum.flat_map(fn {_id, {claims, _sig}} -> checkpoint_position(claims) end)
+    |> case do
+      [] -> 0
+      positions -> positions |> Enum.max() |> trunc()
+    end
+  end
+
+  defp checkpoint_position(claims) do
+    with [%{role: "checkpoint"} | _rest] <- claims.pointers,
+         %{target: {:number, n}} <- Enum.find(claims.pointers, &(&1.role == "position")) do
+      [n]
+    else
+      _ -> []
+    end
+  end
+
+  # ------------------------------------------------------------------ init
+
+  defp guard_store do
+    if Process.whereis(DurableStore), do: :ok, else: {:error, :store_not_running}
+  end
+
+  # the daemon never runs on an implicit default store: with no configured
+  # :log_path (the real-~/.kyber fallback) it refuses — structural enforcement
+  # of "the daemon never touches the real store"
+  defp guard_log(nil), do: {:error, :no_log_path}
+  defp guard_log(path) when is_binary(path), do: :ok
+
+  defp ensure_agent_seed(keyring_dir) do
+    case Keys.load_agent_seed(keyring_dir) do
+      {:ok, seed} -> {:ok, seed}
+      {:error, :no_agent_seed} -> Keys.mint_agent_seed(keyring_dir)
+      {:error, _reason} = err -> err
+    end
+  end
+
+  defp start_gather do
+    case Gather.start_link() do
+      {:ok, pid} ->
+        {:ok, pid}
+
+      {:error, {:already_started, pid}} ->
+        Process.link(pid)
+        {:ok, pid}
+    end
+  end
+
+  # ------------------------------------------------------------------ lock
+
+  defp lock_path(log_path), do: log_path <> ".lock"
+
+  defp take_lock(log_path) do
+    do_take_lock(lock_path(log_path), @lock_attempts)
+  end
+
+  defp do_take_lock(_lock, 0), do: {:error, {:lock_failed, :contended}}
+
+  # O_EXCL create: the exists-check and the create are ONE atomic operation —
+  # no TOCTOU between two racing daemons (the sibling review's finding, folded
+  # in post-verdict). A held lock is reclaimed only when its pid is provably
+  # dead; a killed daemon must never brick re-boot.
+  defp do_take_lock(lock, attempts) do
+    case File.open(lock, [:write, :exclusive, :binary]) do
+      {:ok, io} ->
+        with :ok <- IO.binwrite(io, System.pid()), :ok <- File.close(io) do
+          :ok
+        else
+          {:error, reason} -> {:error, {:lock_failed, reason}}
+        end
+
+      {:error, :eexist} ->
+        # stale, garbage, or our own pid: reclaim (dead, unreadable, or a
+        # live foreign pid must refuse, not be presumed dead)
+        if lock_held_by_live_pid?(lock) do
+          {:error, {:already_running, Path.rootname(lock, ".lock")}}
+        else
+          File.rm(lock)
+          do_take_lock(lock, attempts - 1)
+        end
+
+      {:error, reason} ->
+        {:error, {:lock_failed, reason}}
+    end
+  end
+
+  defp lock_held_by_live_pid?(lock) do
+    case File.read(lock) do
+      {:ok, content} ->
+        # our own OS pid = a crash-restart of a daemon in THIS VM (the old
+        # instance died; the lock is ours to retake) — only a FOREIGN live
+        # pid refuses the second daemon
+        pid = String.trim(content)
+        pid != System.pid() and os_pid_alive?(pid)
+
+      {:error, _unreadable} ->
+        false
+    end
+  end
+
+  # `ps -p` rather than `kill -0`: a pid we may not signal (EPERM) is still
+  # alive, and a live foreign daemon must refuse, not be presumed dead
+  defp os_pid_alive?(pid_text) do
+    case Integer.parse(pid_text) do
+      {n, ""} when n > 0 ->
+        match?({_, 0}, System.cmd("ps", ["-p", Integer.to_string(n)], stderr_to_stdout: true))
+
+      _ ->
+        false
+    end
+  end
+
+  # -------------------------------------------------------------- machinery
+
+  defp spec(opts) do
+    %{id: __MODULE__, start: {__MODULE__, :start_link, [opts]}, restart: :transient}
+  end
+
+  # a previously stopped daemon leaves its spec behind; replace it so new
+  # options (tick, knob) take effect on re-boot
+  defp replace_child(opts) do
+    Supervisor.delete_child(Kyber.Supervisor, __MODULE__)
+
+    case Supervisor.start_child(Kyber.Supervisor, spec(opts)) do
+      {:ok, pid} -> {:ok, pid}
+      {:error, reason} -> {:error, boot_reason(reason)}
+    end
+  end
+
+  defp boot_reason({:already_started, _pid}),
+    do: {:already_running, Application.get_env(:kyber, :log_path)}
+
+  # start_child wraps an init failure as {reason, child_record}
+  defp boot_reason({reason, child}) when is_tuple(child) and elem(child, 0) == :child,
+    do: boot_reason(reason)
+
+  defp boot_reason(reason), do: reason
+
+  defp status_map(state) do
+    Map.take(state, [:cursor, :author, :log_path, :fired, :persisted, :pulsed, :skipped])
+  end
+
+  defp kind(%{claims: %{pointers: [%{role: role} | _rest]}}), do: role
+
+  defp wire_role(%{"claims" => %{"pointers" => [%{"role" => role} | _rest]}})
+       when is_binary(role),
+       do: role
+
+  defp wire_role(_wire), do: nil
+
+  defp short(id) when is_binary(id), do: String.slice(id, 0, 8)
+  defp short(_id), do: "?"
+
+  defp narrate(%{narrate: true}, message), do: IO.puts(message)
+  defp narrate(_state, _message), do: :ok
+end

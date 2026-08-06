@@ -169,7 +169,7 @@ defmodule Kyber.PeerTest do
 
     # the drain is async (handler exit -> DOWN -> decrement), so poll with a
     # bounded no-sleep retry — each attempt is a real connect round-trip
-    # (the pinned explicit-state-polling idiom; never Process.sleep)
+    # (the pinned explicit-state-polling idiom; never the sleep primitive)
     deadline = System.monotonic_time(:millisecond) + 10_000
 
     result =
