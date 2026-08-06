@@ -116,20 +116,19 @@ defmodule Kyber.VaultTest do
     path = claims_path(vault_dir, id)
     assert File.exists?(path)
 
-    # the golden text is built from already-trusted primitives (Delta,
-    # Keys, Wire) plus the ticket's pinned literal template — never from
-    # calling Vault's own private rendering code (that would be circular).
-    author = Keys.author_for_seed(@human_seed)
-    ts_text = :erlang.float_to_binary(@ts * 1.0, decimals: 0)
-    pointers_json = claims |> Wire.claims_json() |> Map.fetch!("pointers") |> JSON.encode!()
-
+    # P5 finding 1 fix: the ENTIRE golden is a hardcoded byte literal — the
+    # pointers JSON, the decimal timestamp, the id, and the author are all
+    # fixed constants for this fixture (same seed, ts, and inputs), so a
+    # systematic drift in Wire.claims_json / JSON.encode! / the renderer can
+    # no longer shift both sides together. Computed once (via trusted
+    # primitives) at review time and pinned here verbatim.
     golden =
       "---\n" <>
-        "id: #{id}\n" <>
-        "author: #{author}\n" <>
-        "timestamp: #{ts_text}\n" <>
+        "id: 1e2016979a92ebdbe039dbea08820a26f0820690f0bd1b9f1ea3fca4289f946fbd56\n" <>
+        "author: ed25519:fc947730f49eb01427a66e050733294d9e520e545c7a27125a780634e0860a27\n" <>
+        "timestamp: 1754512345678\n" <>
         "role: received\n" <>
-        "pointers: #{pointers_json}\n" <>
+        "pointers: [{\"role\":\"received\",\"target\":{\"context\":\"incoming\",\"id\":\"message:discord:golden:1\"}},{\"role\":\"at\",\"target\":{\"context\":\"messages\",\"id\":\"channel:discord:golden\"}},{\"role\":\"by\",\"target\":{\"context\":\"sent\",\"id\":\"human:fc947730f49eb01427a66e050733294d9e520e545c7a27125a780634e0860a27\"}},{\"role\":\"content\",\"target\":\"hello golden fixture\"},{\"role\":\"session\",\"target\":{\"context\":\"messages\",\"id\":\"session:discord:golden\"}}]\n" <>
         "---\n" <>
         "hello golden fixture\n"
 
@@ -249,6 +248,28 @@ defmodule Kyber.VaultTest do
     entity_text = File.read!(claims_path(vault_dir, id_entity))
     refute entity_text =~ "[["
     assert entity_text =~ "human:deadbeef"
+
+    # P5 finding 2: an absent delta ref renders the link — the lens shows
+    # what the store SAYS (the door admits closure/id/sig, never ref-presence);
+    # resolution is a SET property, guaranteed only for self-consistent sets.
+    # Pinned as documented behavior, never silently hidden.
+    absent_hex = String.duplicate("ee", 64)
+
+    absent_claims = %{
+      timestamp: 1_700_000_000_000.0,
+      author: Keys.author_for_seed(String.duplicate("44", 32)),
+      pointers: [
+        %{role: "content", target: {:delta, absent_hex, "kyber"}},
+        %{role: "session", target: {:string, "session:discord:vault"}}
+      ]
+    }
+
+    id_absent = append_custom!(absent_claims, String.duplicate("44", 32))
+    assert {:ok, %{files: 5}} = Vault.render(vault_dir)
+
+    absent_text = File.read!(claims_path(vault_dir, id_absent))
+    assert absent_text =~ "[[claim_#{absent_hex}]]"
+    refute File.exists?(claims_path(vault_dir, absent_hex))
   end
 
   # ------------------------------------------------------------------ AC6
@@ -282,6 +303,65 @@ defmodule Kyber.VaultTest do
     assert {:error, :store_not_running} = Vault.refresh(vault_dir)
 
     boot_on(log_path)
+    assert is_pid(Process.whereis(DurableStore))
+  end
+
+  # ------------------------------------------------------------------ P5
+
+  test "P5: a read-only claims dir yields {:write_failed, path, reason} from BOTH render and refresh (never a raise)",
+       %{keyring_dir: keyring_dir, vault_dir: vault_dir, log_path: log_path} do
+    source = %{
+      "message_id" => "message:discord:ro:1",
+      "channel_id" => "channel:discord:ro",
+      "session_id" => "session:discord:ro",
+      "content" => "hello ro"
+    }
+
+    assert {:ok, _id} = Harness.ingest(source, keyring_dir)
+
+    # stage the failure: a read-only claims dir (mkdir_p! succeeds on the dir,
+    # then File.write hits EACCES). A regular FILE at claims/ would instead
+    # pre-empt into {:vault_dir_not_dir, ...} — mkdir_p! raises on a non-dir —
+    # which is ALSO a pinned tagged tuple (the extra test below covers it).
+    claims_dir = Path.join(vault_dir, "claims")
+    File.mkdir_p!(claims_dir)
+    File.chmod!(claims_dir, 0o500)
+
+    assert {:error, {:write_failed, path, :eacces}} = Vault.render(vault_dir)
+    assert String.ends_with?(path, ".md")
+    assert Path.dirname(path) == claims_dir
+    assert {:error, {:write_failed, _, :eacces}} = Vault.refresh(vault_dir)
+
+    # restore permissions so the on_exit cleanup can rm_rf
+    File.chmod!(claims_dir, 0o700)
+    File.rm_rf(claims_dir)
+
+    # sanity: a fresh render after the obstruction is gone works
+    assert {:ok, %{files: 1}} = Vault.render(vault_dir)
+    assert is_pid(Process.whereis(DurableStore))
+  end
+
+  test "P5: a regular FILE at vault_dir/claims is {:vault_dir_not_dir, path} — never a raise",
+       %{keyring_dir: keyring_dir, vault_dir: vault_dir} do
+    source = %{
+      "message_id" => "message:discord:ro2:1",
+      "channel_id" => "channel:discord:ro2",
+      "session_id" => "session:discord:ro2",
+      "content" => "hello ro2"
+    }
+
+    assert {:ok, _id} = Harness.ingest(source, keyring_dir)
+
+    claims_dir = Path.join(vault_dir, "claims")
+    File.mkdir_p!(claims_dir)
+    File.rm_rf(claims_dir)
+    File.write!(claims_dir, "i am a file")
+
+    assert {:error, {:vault_dir_not_dir, ^claims_dir}} = Vault.render(vault_dir)
+    assert {:error, {:vault_dir_not_dir, ^claims_dir}} = Vault.refresh(vault_dir)
+
+    File.rm(claims_dir)
+    assert {:ok, %{files: 1}} = Vault.render(vault_dir)
     assert is_pid(Process.whereis(DurableStore))
   end
 
