@@ -11,3 +11,13 @@ priv/data/
 # editor
 .idea/
 .vscode/
+
+# ADLC runtime
+.adlc/*
+!.adlc/config.json
+!.adlc/tickets.json
+!.adlc/tickets/
+!.adlc/tickets/**
+!.adlc/ticket-archive/
+!.adlc/ticket-archive/**
+!.adlc/specs/

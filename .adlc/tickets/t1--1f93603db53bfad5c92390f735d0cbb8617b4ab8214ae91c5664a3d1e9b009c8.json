@@ -1,0 +1,19 @@
+{
+  "body": "# T1 — Loop 1: The Unified Event Layer\n\n## Context\n\nKyber is being rewritten on rhizomatic ground: every event is a signed, content-addressed,\nloam-compatible claim (SPEC.md, spec/00-overview.md — the unification, D1). This ticket\nimplements the event layer: the keyring, the claim templates, the delta set, and the store\ndoor — proven by ExUnit tests. The substrate (the rhizomatic Elixir witness at deps/rhizomatic)\nis FROZEN and consumed as a git dep; it is never edited from here (spec/03-substrate.md).\n\n## Requirements\n\n1. Kyber.Keys — agent seed mint/load (0600 file under a home dir option; KYBER_SEED hex\n   import), human key import, `author_for_seed/1` -> `\"ed25519:...\"`, signing via\n   Rhizomatic.Signer. File I/O confined to this module (spec/02-identity.md).\n   Verification: `mix test test/keys_test.exs`.\n2. Kyber.Events — claim builders `message_received`, `prompt_annotated`, `llm_response`,\n   `message_sent`, `tool_exec` with the exact pointer structures of spec/01-events.md §2,\n   signed with the right key: human-origin by the human key, agent-origin by the agent key.\n   Verification: `mix test test/events_test.exs`.\n3. Kyber.DeltaSet — grow-only set: `merge/2` (union), `member?/2`, `size/1`\n   (spec/04-persistence.md §1).\n   Verification: `mix test test/delta_set_test.exs`.\n4. Kyber.Store — the door (spec/04-persistence.md §3): parse wire JSON via\n   Rhizomatic.Profile, recompute the id, verify the signature strictly, then merge; reject\n   tampered ids and wrong-key signatures.\n   Verification: `mix test test/store_test.exs`.\n5. TDD throughout; no Process.sleep in tests; `mix format` clean.\n   Verification: `grep -r \"Process.sleep\" test/` finds nothing, and `mix format --check-formatted` exits 0.\n\n## Acceptance Criteria (each names its verification method)\n\n- **AC1 — The event layer compiles and the whole suite passes.**\n  Verification: `mix test` exits 0 with no skips.\n- **AC2 — Every emitted delta's id recomputes from its canonical bytes, and its signature\n  verifies.**\n  Verification: `mix test test/events_test.exs` asserts, for each Kyber.Events delta, that\n  `Rhizomatic.Hash` recomputes the same id from the canonical bytes and `Rhizomatic.Signer`\n  verifies the signature.\n- **AC3 — message_received is signed by the human's key; llm_response and message_sent are\n  signed by the agent's key.**\n  Verification: `mix test test/events_test.exs` asserts each delta's `claims.author` equals\n  the derived author of the expected seed (human vs agent).\n- **AC4 — DeltaSet.merge is commutative and idempotent on a 3-delta fixture.**\n  Verification: `mix test test/delta_set_test.exs` asserts `merge(a, b) == merge(b, a)` and\n  `merge(s, s) == s` for the fixture sets.\n- **AC5 — The door rejects a tampered id and a wrong-key signature.**\n  Verification: `mix test test/store_test.exs` asserts `Kyber.Store` returns `{:error, _}`\n  for both cases.\n- **AC6 — The wire JSON (JSON debug profile) of a signed message_received round-trips through\n  Rhizomatic.Profile to identical canonical bytes — the loam-compatibility proof.**\n  Verification: `mix test test/events_test.exs` compares canonical bytes before and after a\n  Profile parse/re-serialize round-trip.\n- **AC7 — No Process.sleep anywhere in test/.**\n  Verification: `grep -r \"Process.sleep\" test/` finds nothing.\n\n## Out of scope (later tickets)\n\nReactor/subscriptions (gated on substrate L4), Discord plugin, disk persistence, federation,\nmigration, vault-as-view. The ticket's scope list is the enforcement: only lib/ and test/ may\nbe touched.\n",
+  "edges": [],
+  "id": "T1",
+  "phase": "P1",
+  "rails": [
+    "deps/",
+    "spec/",
+    "SPEC.md",
+    "PLAN.md",
+    "mix.exs"
+  ],
+  "scope": [
+    "lib/",
+    "test/"
+  ],
+  "status": "in_review",
+  "title": "Loop 1: The Unified Event Layer — kyber events as signed rhizomatic claims"
+}
