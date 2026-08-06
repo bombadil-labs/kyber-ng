@@ -6,39 +6,39 @@ success criteria. Hermes owns updating this file; the coding agent does not over
 
 ---
 
-## 0. Next Ralph Loop: The Operator Surface — a CLI for the whole stack (escript)
+## 0. Next Ralph Loop: Federation Peers — the wire speaks to itself over the network (TCP)
 
-**Objective:** Every loop so far delivered MODULE APIs. T8 gives the harness a FACE: a
-`kyber` escript (stdlib Mix escript — zero new deps) driving the full stack:
-`view`, `ingest <source.json>`, `render <vault_dir>`, `refresh <vault_dir>`,
-`export`, `import <wire.jsonl>`, `migrate <legacy.jsonl>`. Tagged errors printed to
-stderr with pinned exit codes (0 ok / 1 operational error — never a crash stacktrace);
-store-down answers a clean message. The escript config is a ONE-TIME mix.exs stanza
-(pinned: the mix.exs diff for T8 is EXACTLY the escript stanza — the rail amendment is
-deliberate, additive, and zero-dependency). Every subcommand is exercised end-to-end
-against a tmp store in tests (the subcommand dispatch is a pure-ish function tested
-directly; the escript entrypoint is a thin wrapper).
+**Objective:** T5 made the wire portable (export/import). T8 gave the operator a CLI.
+T9 makes federation REAL: two kyber instances exchange claims over the network. A
+`Kyber.Peer` listener (stdlib `:gen_tcp` — ZERO new deps) serves the federation wire;
+a client connects, sends the export text, the peer imports it through the SAME door.
+The framing is the wire text itself + a single blank-line terminator (the T5 import
+already treats the final empty segment as the delimiter — the protocol is the format).
+The trust model IS the claims: the door verifies every signature; a peer can only ADD
+(signed, content-addressed) claims — the store only learns; garbage input is refused
+per line, never a crash. `kyber serve [--port N]` + `kyber send <host> <port>` extend
+the CLI (lib/ scope). Store-down answers a clean refusal line, never a crash.
 
-**Requirements (contract: .adlc/specs/T8.md):**
-1. `Kyber.CLI` — escript main_module: `main/1` parses argv → dispatches; each command
-   returns `{status, message}` → `IO.puts` + `System.halt(code)`; every failure path is
-   a tagged tuple printed as a clean one-liner, never a crash.
-2. Subcommands (each with pinned flags): `view` (sorted claims, one per line — the
-   harness's view), `ingest <file>` (the T4 source shape from a JSON file; keyring from
-   `--keyring <dir>`), `render <dir>` / `refresh <dir>` (the vault), `export` /
-   `import <file>` (federation), `migrate <legacy>` (the T6 archivist).
-3. `mix escript.build` produces a working `kyber` binary; the mix.exs diff is pinned to
-   the escript stanza alone.
+**Requirements (contract: .adlc/specs/T9.md):**
+1. `Kyber.Peer` — a supervised listener: `start_link(port: p)` (port 0 → ephemeral),
+   accepts connections, reads the framed wire text, `Federation.import/1`s it, replies
+   with a status line (`ok <imported>/<skipped>` or a tagged refusal); a client
+   disconnect mid-frame never crashes the listener; garbage input → refused lines.
+2. `Kyber.Peer.send_wire(host, port, text)` (or the client half) — connects, sends the
+   export text + the blank-line terminator, reads the status line.
+3. CLI: `kyber serve --port N` (foreground listener; prints the bound address) and
+   `kyber send <host> <port>` (exports + sends + prints the peer's status).
 
 **Success Criteria (the gate):**
 - `mix test` green; `! grep -r "Process.sleep" test/`; `mix format --check-formatted` exits 0.
-- `mix escript.build` + a smoke run of every subcommand against a tmp store (asserted
-  exit codes + output shapes).
-- A store-down subcommand prints the clean tagged message and exits non-zero.
+- A live exchange: peer A exports → sends to peer B (ephemeral port) → B imports →
+  both stores hold the claim; re-send → all skipped (dedup across the network).
+- The peer survives: garbage lines refused with line numbers, a dropped connection
+  mid-frame is a non-event, store-down answers the refusal line.
 
-**Out of scope (later loops):** the Discord transport (gated on substrate L4), federation
-peers (network transport), legacy semantic interpretation, sqlite/packs backends, the
-reactor/subscriptions, vault-to-store writes.
+**Out of scope (later loops):** the Discord transport (gated on substrate L4), auth/TLS
+for peers (the claims ARE the trust; transport encryption is a later concern), legacy
+semantic interpretation, sqlite/packs backends, the reactor/subscriptions.
 
 ---
 
@@ -77,9 +77,13 @@ reactor/subscriptions, vault-to-store writes.
   resolving delta wikilinks, overwritten observable; NTFS-safe filenames). 132 tests;
   P1–P7 green; hollow 4 killed; review 3/3 fixed (2 medium: golden tautology,
   absent-ref resolution).
-- **Loop 8 (T8, in flight)** — the operator surface: `kyber` escript CLI driving the
-  whole stack (view/ingest/render/refresh/export/import/migrate; pinned exit codes;
-  one-time mix.exs escript stanza).
+- **Loop 8 COMPLETE (T8, archived)** — the operator surface: `kyber` escript CLI
+  (pure run/1, boot-ownership load->put_env->start, pre-flight never-boot pins,
+  committed KYBER_SMOKE=1 smoke artifact). 142 tests; P1–P7 green; review 4/4 fixed
+  (2 medium: boot-before-validation, unpinned boot sequence).
+- **Loop 9 (T9, in flight)** — federation peers: `Kyber.Peer` TCP listener (stdlib
+  :gen_tcp) + send_wire client; the wire text + blank-line framing; `kyber serve` /
+  `kyber send`.
 
 ## 2. Active Backlog
 
