@@ -6,36 +6,37 @@ success criteria. Hermes owns updating this file; the coding agent does not over
 
 ---
 
-## 0. Next Ralph Loop: The Harness Loop — gather → translate → sign → persist → view
+## 0. Next Ralph Loop: Federation — the wire speaks to itself (export/import)
 
-**Objective:** The harness awakens. T1–T3 built the machinery (door, durable store, wire,
-supervision) but nothing yet RUNS the loop it was built for — "a Discord message in, a
-model response out" at the atom. T4 wires the loop: a source event in → a signed claim
-persisted in the durable store → a materialized view out. The transport (Discord etc.) is
-gated on the substrate L4 reactor; T4 builds the loop against an injectable SOURCE
-interface with a fake source in tests — the plugin ticket later is a thin adapter.
+**Objective:** A claim born on one kyber-ng instance survives a journey to another,
+byte-identical, re-verified by the witness on arrival. T1–T4 built the claim lifecycle
+(emit → sign → persist → view); T5 builds the exchange — and the import machinery IS the
+migration path (spec/07's legacy-log unification will reuse it). The substrate L4 reactor
+gates the Discord/plugin side, not claim exchange: two stores exchanging wire JSONL is
+testable right now with tmp paths.
 
-**Requirements (contract: .adlc/specs/T4.md):**
-1. `Kyber.Harness` — `ingest(source_event)` → `{:ok, id} | {:error, reason}`: translate the
-   source event to a `message_received` claim (author = the human key's pubkey), sign with
-   the human key, `Wire.encode`, `DurableStore.append`. Source events come through a
-   callback/adapter interface (testable fake; real Discord transport = later ticket).
-2. `Kyber.Harness.agent_event/1` (model response in → `message_sent`-family claim signed
-   by the AGENT key) — the response half of the loop, same pipeline.
-3. A VIEW: `Kyber.Harness.view/0` materializes the store's delta set as claims (the
-   vault-as-view is a later lens; this is the plain claims view).
-4. TDD; no Process.sleep; format clean. The full loop is asserted END-TO-END: ingest →
-   claim in the store → supervised restart → still there (replay) → view shows it.
+**Requirements (contract: .adlc/specs/T5.md):**
+1. `Kyber.Federation.export/0` — the store's delta set as wire JSONL text (one pinned
+   envelope per line, `Wire.encode`, deterministic order), for transport/backup.
+2. `Kyber.Federation.import/1` — wire JSONL text → stream each line through
+   `Wire.decode` → `DurableStore.append` (the door re-verifies EVERY signature; union
+   dedups; refused/torn lines are reported, never fatal — the T2 replay policy, reused).
+3. `Kyber.Federation.import_report/0` → `%{imported: n, refused: [line_nos], skipped: n}`
+   (a pinned observable, mirroring `replay_report`).
+4. Cross-instance AC: instance A ingests (T4 Harness) → export → instance B imports →
+   the claim re-verifies (door admit), is present, view-identical. Byte-identical round
+   trip: export(A) imported into B exports byte-equal to A's export (union of the same
+   claims).
 
 **Success Criteria (the gate):**
 - `mix test` green; `! grep -r "Process.sleep" test/`; `mix format --check-formatted` exits 0.
-- A fake source event ingests to a persisted, signature-verified claim; restart survives it.
-- The agent_event half signs with the agent key (author = agent pubkey) and persists.
-- The view materializes exactly the stored claims.
-- Source interface injectable: a second fake source shape flows through unchanged.
+- A cross-instance round trip proves signature re-verification + dedup (import twice → one).
+- Torn/refused lines in an import are reported, never fatal; valid lines still land.
+- import_report shapes are pinned and asserted.
 
 **Out of scope (later loops):** the Discord transport/adapter (gated on substrate L4),
-federation, migration, vault-as-view, sqlite/packs backends, the reactor/subscriptions.
+migration of the LEGACY kyber log (spec/07 — reuses import/1), the reactor/subscriptions,
+vault-as-view, sqlite/packs backends.
 
 ---
 
@@ -56,8 +57,13 @@ federation, migration, vault-as-view, sqlite/packs backends, the reactor/subscri
   decode symmetry) + `Kyber.Application` (supervision, mkdir-owned, :permanent, config/
   env overrides). 83 tests; P1–P7 green; review APPROVE + 3 lows + 1 discovered door
   crash (atom-keyed claims refused pre-parse) — all fixed.
-- **Loop 4 (T4, in flight)** — the harness loop: gather → translate → sign → persist →
-  view (`Kyber.Harness`, injectable source interface, fake source in tests).
+- **Loop 4 COMPLETE (T4, archived)** — the harness loop: `Kyber.Harness` (ingest/2
+  human-signed, agent_event/2 agent-signed, view/0 sorted claims; store-down guard +
+  closed source contract + total never-crash) + `Keys.load_human_seed` (no env fallback)
+  + keyring_dir config. 99 tests; P1–P7 green; review 3/3 lows fixed (TOCTOU, non-binary
+  pin, precedence pin).
+- **Loop 5 (T5, in flight)** — federation: `Kyber.Federation` export/import (wire JSONL
+  exchange, door re-verification, dedup, import_report observable).
 
 ## 2. Active Backlog
 
