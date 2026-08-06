@@ -175,4 +175,38 @@ defmodule Kyber.ApplicationTest do
     # baseline restored for the next test
     Application.put_env(:kyber, :log_path, config_log_path)
   end
+
+  # ------------------------------------------------------------------ P5
+
+  test "P5: the durable path refuses non-conforming envelopes at the door and writes nothing",
+       %{tmp_dir: tmp_dir, config_log_path: config_log_path} do
+    path = Path.join(tmp_dir, "log.jsonl")
+    Application.put_env(:kyber, :log_path, path)
+    assert {:ok, _} = Application.ensure_all_started(:kyber)
+
+    # hand-built maps that BYPASS Wire.encode (a caller could construct
+    # them): the door's Profile validation is the persist-time strictness
+    # line — both must be refused with nothing written (P5 low finding 3)
+    atom_keyed_claims = %{"id" => "x", "claims" => %{timestamp: 1.0}, "sig" => "y"}
+
+    malformed_target =
+      %{
+        "id" => "x",
+        "claims" => %{
+          "timestamp" => 1.0,
+          "author" => "ed25519:abc",
+          "pointers" => [%{"role" => "r", "target" => %{"bad" => 1}}]
+        },
+        "sig" => "y"
+      }
+
+    assert {:error, _} = DurableStore.append(atom_keyed_claims)
+    assert {:error, _} = DurableStore.append(malformed_target)
+
+    # nothing was persisted — the lazy-open log was never created
+    refute File.exists?(path)
+
+    :ok = stop_app()
+    Application.put_env(:kyber, :log_path, config_log_path)
+  end
 end

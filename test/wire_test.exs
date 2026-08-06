@@ -2,7 +2,7 @@ defmodule Kyber.WireTest do
   use ExUnit.Case, async: true
 
   alias Kyber.{DeltaSet, Events, Store, TestWire, Wire}
-  alias Rhizomatic.Delta
+  alias Rhizomatic.{Delta, Profile}
 
   @human_seed String.duplicate("cd", 32)
   @agent_seed String.duplicate("ab", 32)
@@ -128,6 +128,40 @@ defmodule Kyber.WireTest do
       assert {:error, {:decode, :not_a_map}} = Wire.decode("42")
       assert {:error, {:decode, :not_a_map}} = Wire.decode("\"str\"")
       assert {:error, {:decode, :not_a_map}} = Wire.decode("null")
+    end
+  end
+
+  describe "P5: parity fixtures — every target branch Wire and TestWire share" do
+    # the differential AC2 drives only Events-produced claims (:string,
+    # :entity+ctx, :delta+nil); these fixtures hand-build each REMAINING
+    # target shape so a shared transcription error in an unexercised branch
+    # of either serializer cannot ship green (P5 low finding 1)
+    @targets [
+      {:number, 1.5},
+      {:boolean, true},
+      {:bytes, "image/png", <<1, 2, 3>>},
+      {:entity, "msg:fixture", nil},
+      {:delta, "deadbeef", "ctx"}
+    ]
+
+    test "Wire == TestWire (terms and bytes) and the Profile round-trips, per target shape" do
+      for target <- @targets do
+        claims = %{
+          timestamp: @ts,
+          author: "ed25519:abc",
+          pointers: [%{role: "ref", target: target}]
+        }
+
+        assert Wire.claims_json(claims) == TestWire.claims_json(claims),
+               "claims_json diverged for target #{inspect(target)}"
+
+        assert JSON.encode!(Wire.claims_json(claims)) ==
+                 JSON.encode!(TestWire.claims_json(claims)),
+               "claims_json bytes diverged for target #{inspect(target)}"
+
+        assert {:ok, _} = Profile.parse_claims(Wire.claims_json(claims)),
+               "Profile rejected Wire's rendering of target #{inspect(target)}"
+      end
     end
   end
 end

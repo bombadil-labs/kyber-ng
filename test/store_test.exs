@@ -100,6 +100,14 @@ defmodule Kyber.StoreTest do
     assert {:error, {:unknown_key, :envelope, "nonce"}} = Store.append(wire)
     assert DeltaSet.size(Store.set()) == 0
   end
+
+  test "P5: the door refuses non-string-keyed claims BEFORE witness parsing (no crash — the witness's fuzzy key-matching raises on atom keys)" do
+    assert {:ok, signed} = human_message()
+    wire = TestWire.envelope(signed) |> Map.put("claims", %{timestamp: 1.0})
+
+    assert {:error, :claims_non_string_key} = Store.append(wire)
+    assert DeltaSet.size(Store.set()) == 0
+  end
 end
 
 defmodule Kyber.StoreNotStartedTest do

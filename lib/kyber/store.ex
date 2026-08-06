@@ -100,10 +100,38 @@ defmodule Kyber.Store do
 
   defp parse_claims(wire) do
     case Map.fetch(wire, "claims") do
-      {:ok, claims_json} -> Profile.parse_claims(claims_json)
-      :error -> {:error, {:missing_key, :envelope, "claims"}}
+      {:ok, claims} when is_map(claims) ->
+        # the witness's parse uses fuzzy key-matching (jaro_distance) for
+        # unknown-key suggestions and CRASHES (FunctionClauseError) on
+        # non-string keys — the door refuses them BEFORE parsing (P5 finding
+        # 3, discovered by the durable-refusal pin): reject, never repair
+        if deep_string_keys?(claims) do
+          Profile.parse_claims(claims)
+        else
+          {:error, :claims_non_string_key}
+        end
+
+      {:ok, _claims} ->
+        {:error, :malformed_claims}
+
+      :error ->
+        {:error, {:missing_key, :envelope, "claims"}}
     end
   end
+
+  # deep: a nested atom key inside pointers/targets would crash the same way
+  defp deep_string_keys?(map) when is_map(map) do
+    Enum.all?(map, fn
+      {key, value} when is_binary(key) -> deep_string_keys?(value)
+      _ -> false
+    end)
+  end
+
+  defp deep_string_keys?(list) when is_list(list) do
+    Enum.all?(list, &deep_string_keys?/1)
+  end
+
+  defp deep_string_keys?(_), do: true
 
   # content addressing: a delta whose id does not match its claims never lands
   defp check_id(wire, claims) do

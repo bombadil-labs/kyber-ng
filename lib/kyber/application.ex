@@ -40,6 +40,18 @@ defmodule Kyber.Application do
   end
 
   defp default_log_path do
-    Path.join(System.user_home(), ".kyber/store.jsonl")
+    # P5 low finding 2: with HOME unset System.user_home() returns "" and
+    # Path.join would yield a CWD-relative path — the real store silently
+    # landing in the working directory. Refuse loudly (config.exs guards the
+    # same case at config-load time).
+    case System.user_home() do
+      "" ->
+        raise "kyber: cannot resolve the default log_path — HOME is unset " <>
+                "(System.user_home() is empty). Set :kyber, :log_path to an " <>
+                "absolute path explicitly."
+
+      home ->
+        Path.join(home, ".kyber/store.jsonl")
+    end
   end
 end
