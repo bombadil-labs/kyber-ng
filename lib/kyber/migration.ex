@@ -95,14 +95,38 @@ defmodule Kyber.Migration do
 
   # ---------------------------------------------------------------- translate
 
+  # P5 medium finding 1: VALUE-TYPE validation, not just presence — a
+  # non-string legacy id (a corrupt or hand-edited line) must be REFUSED,
+  # never repaired: the old inspect fallback manufactured "delta:123" which
+  # Delta.validate accepts, so the archivist signed + imported a fabricated
+  # claim (a false attestation the store can never forget).
   defp check_required(legacy) do
+    with :ok <- check_presence(legacy) do
+      with {:ok, _} <- validate_id(Map.fetch!(legacy, "id")),
+           {:ok, _} <- validate_kind(Map.fetch!(legacy, "kind")) do
+        :ok
+      end
+    end
+  end
+
+  defp check_presence(legacy) do
     Enum.reduce_while(@required_keys, :ok, fn key, :ok ->
       case Map.fetch(legacy, key) do
         {:ok, _value} -> {:cont, :ok}
-        :error -> {:halt, {:error, :missing_key, key}}
+        :error -> {:halt, {:error, {:missing_key, :legacy, key}}}
       end
     end)
   end
+
+  # legacy ids are pinned 32-char hex strings (the legacy repo's generate_id)
+  defp validate_id(id) when is_binary(id) do
+    if Regex.match?(~r/^[0-9a-f]{32}$/i, id), do: {:ok, id}, else: {:error, :invalid_legacy_id}
+  end
+
+  defp validate_id(_), do: {:error, :invalid_legacy_id}
+
+  defp validate_kind(kind) when is_binary(kind), do: {:ok, kind}
+  defp validate_kind(_), do: {:error, :invalid_legacy_kind}
 
   # D14 / Events.timestamp/1's contract: the ONE coercion point, total over
   # any decoded JSON value — never a raise. An integer survives only through
@@ -157,11 +181,10 @@ defmodule Kyber.Migration do
   defp maybe_add_pointer(pointers, _role, nil, _fun), do: pointers
   defp maybe_add_pointer(pointers, role, value, fun), do: add_pointer(pointers, role, fun.(value))
 
-  # legacy id is documented as a hex string (rev 2); a defensive fallback
-  # (never a raise on an unexpected shape — Delta.validate is the refusal
-  # authority, not string concatenation)
-  defp legacy_ref(legacy_id) when is_binary(legacy_id), do: "delta:" <> legacy_id
-  defp legacy_ref(legacy_id), do: "delta:" <> inspect(legacy_id)
+  # the legacy id is pinned a 32-char hex string — validated UPSTREAM
+  # (check_required), so no fallback can ever repair an unexpected shape:
+  # reject, never repair (P5 medium finding 1)
+  defp legacy_ref(legacy_id), do: "delta:" <> legacy_id
 
   # ------------------------------------------------------------------- file
 
@@ -201,19 +224,26 @@ defmodule Kyber.Migration do
     }
   end
 
-  # CRLF parity with Kyber.Log.strip_eol/1: strip a trailing "\r" per line
-  # BEFORE decode (the T5 parity lesson). Never fatal: a bad line is
-  # collected as a legacy-refused line number, the stream continues.
+  # P5 low finding 2: blank lines are SKIPPED, never counted (classifier
+  # parity with Federation.process_line's blank=skipped — a file ending in a
+  # trailing "\n\n" must not report phantom legacy_refused). CRLF parity:
+  # String.trim_trailing(line, "\r") would be a NO-OP ("abc\r\n" ends in \n);
+  # stdlib JSON.decode's trailing-whitespace tolerance already handles "\r"
+  # (probe-verified). Never fatal: a bad line is collected as a legacy-refused
+  # line number, the stream continues.
   defp translate_stream(io, seed) do
     {wire_lines, legacy_refused} =
       io
       |> IO.stream(:line)
-      |> Stream.map(&String.trim_trailing(&1, "\r"))
       |> Stream.with_index(1)
       |> Enum.reduce({[], []}, fn {raw_line, line_no}, {wire_acc, refused_acc} ->
-        case decode_and_translate(raw_line, seed) do
-          {:ok, wire_line} -> {[wire_line | wire_acc], refused_acc}
-          :error -> {wire_acc, [line_no | refused_acc]}
+        if String.trim(raw_line) == "" do
+          {wire_acc, refused_acc}
+        else
+          case decode_and_translate(raw_line, seed) do
+            {:ok, wire_line} -> {[wire_line | wire_acc], refused_acc}
+            :error -> {wire_acc, [line_no | refused_acc]}
+          end
         end
       end)
 

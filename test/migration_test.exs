@@ -252,6 +252,52 @@ defmodule Kyber.MigrationTest do
     assert DurableStore.set() |> Map.keys() |> length() == 2
   end
 
+  test "P5: a non-binary legacy id in the FILE is legacy_refused, never imported (no fabricated attestation)",
+       %{keyring_dir: keyring_dir, fixture_dir: fixture_dir} do
+    bad = legacy_line(%{"id" => 123, "ts" => 1, "kind" => "k"})
+    good = legacy_line(legacy_map(%{"kind" => "message.received"}))
+    path = write_fixture!(fixture_dir, "deltas.jsonl", [bad, good])
+
+    assert {:ok, report} = Migration.migrate(path, keyring_dir)
+    assert report == %{imported: 1, refused: [], skipped: 0, legacy_refused: [1]}
+  end
+
+  test "P5: blank lines are skipped — a trailing \\n\\n reports NO phantom legacy_refused",
+       %{keyring_dir: keyring_dir, fixture_dir: fixture_dir} do
+    line = legacy_line(legacy_map(%{"kind" => "message.received"}))
+    path = Path.join(fixture_dir, "deltas.jsonl")
+    File.write!(path, line <> "\n\n\n")
+
+    assert {:ok, report} = Migration.migrate(path, keyring_dir)
+    assert report == %{imported: 1, refused: [], skipped: 0, legacy_refused: []}
+  end
+
+  test "P5: error paths — missing seed, missing legacy file, and precedence",
+       %{keyring_dir: keyring_dir, fixture_dir: fixture_dir} do
+    line = legacy_line(legacy_map(%{"kind" => "message.received"}))
+
+    # missing legacy path -> tagged tuple, never a crash
+    missing = Path.join(fixture_dir, "no-such-file.jsonl")
+    assert {:error, {:no_legacy_log, ^missing}} = Migration.migrate(missing, keyring_dir)
+
+    # missing agent.seed (KYBER_SEED unset) -> :no_agent_seed
+    empty_keyring = Path.join(fixture_dir, "empty-keyring")
+    path = write_fixture!(fixture_dir, "deltas.jsonl", [line])
+    assert {:error, :no_agent_seed} = Migration.migrate(path, empty_keyring)
+
+    # precedence: missing seed wins over missing file (the with-chain order)
+    assert {:error, :no_agent_seed} = Migration.migrate(missing, empty_keyring)
+  end
+
+  test "P5: store-down wins over a missing seed (guard-first precedence)",
+       %{log_path: log_path} do
+    :ok = stop_app()
+    assert {:error, :store_not_running} = Migration.migrate("/nonexistent", "/nonexistent")
+
+    boot_on(log_path)
+    assert is_list(Harness.view())
+  end
+
   # ------------------------------------------------------------------ AC5
 
   test "AC5: store-down is a tagged tuple, never a crash", %{
@@ -353,26 +399,44 @@ defmodule Kyber.MigrationTest do
     end
   end
 
-  test "AC6: Delta.validate runs before signing — a non-string kind is refused, never signed" do
+  test "AC6: refusals happen BEFORE signing — a non-string kind is refused, never signed" do
     seed = String.duplicate("55", 32)
     legacy = legacy_map(%{"kind" => 123})
-    assert {:error, {:not_a_string, :string_primitive}} = Migration.translate_line(legacy, seed)
+
+    # the value-type check refuses earlier than Delta.validate — the pin's
+    # guarantee (never sign unvalidated claims) holds either way; the tag is
+    # migration's own (P5: value-type validation)
+    assert {:error, :invalid_legacy_kind} = Migration.translate_line(legacy, seed)
   end
 
   test "AC6: refusal tags — missing required keys and non-map input" do
     seed = String.duplicate("66", 32)
 
-    assert {:error, :missing_key, "id"} =
+    assert {:error, {:missing_key, :legacy, "id"}} =
              Migration.translate_line(%{"ts" => 1, "kind" => "k"}, seed)
 
-    assert {:error, :missing_key, "ts"} =
+    assert {:error, {:missing_key, :legacy, "ts"}} =
              Migration.translate_line(%{"id" => "x", "kind" => "k"}, seed)
 
-    assert {:error, :missing_key, "kind"} =
+    assert {:error, {:missing_key, :legacy, "kind"}} =
              Migration.translate_line(%{"id" => "x", "ts" => 1}, seed)
 
     assert {:error, :malformed_legacy} = Migration.translate_line("not a map", seed)
     assert {:error, :malformed_legacy} = Migration.translate_line([1, 2, 3], seed)
     assert {:error, :malformed_legacy} = Migration.translate_line(nil, seed)
+
+    # P5 medium finding 1: value-type validation — a non-string id is REFUSED,
+    # never repaired into a fabricated entity id
+    assert {:error, :invalid_legacy_id} =
+             Migration.translate_line(%{"id" => 123, "ts" => 1, "kind" => "k"}, seed)
+
+    assert {:error, :invalid_legacy_id} =
+             Migration.translate_line(%{"id" => "not-hex", "ts" => 1, "kind" => "k"}, seed)
+
+    assert {:error, :invalid_legacy_kind} =
+             Migration.translate_line(
+               %{"id" => String.duplicate("ab", 16), "ts" => 1, "kind" => 5},
+               seed
+             )
   end
 end
