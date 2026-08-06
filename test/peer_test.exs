@@ -129,6 +129,28 @@ defmodule Kyber.PeerTest do
              Peer.send_wire("localhost", port, "")
   end
 
+  test "AC3: a TWO-CLAIM frame imports both — no phantom blank segment (rev 3 strip-then-join)",
+       %{keyring_dir: keyring_dir} do
+    # store A: two fixture claims -> a two-envelope export (no trailing newline)
+    assert {:ok, _} = Harness.ingest(source_event("22222222222222222222", 1), keyring_dir)
+    assert {:ok, _} = Harness.ingest(source_event("22222222222222222222", 2), keyring_dir)
+    assert {:ok, two_claim_text} = Federation.export()
+    assert length(String.split(String.trim_trailing(two_claim_text, "\n"), "\n")) == 2
+
+    # store B: a fresh log; a two-envelope frame must import BOTH — the strip-
+    # then-join reconstruction forbids a blank segment between claims (which
+    # import would count as a phantom skipped=1)
+    log_dir_b = fresh_dir(System.tmp_dir!(), "store-b")
+    boot_on(Path.join(log_dir_b, "store.jsonl"))
+
+    {_pid, port} = start_peer()
+
+    assert {:ok, "ok imported=2 skipped=0 refused=0"} =
+             Peer.send_wire("localhost", port, two_claim_text)
+
+    File.rm_rf(log_dir_b)
+  end
+
   test "AC3: a client that drops mid-frame is a non-event — the listener serves the next" do
     {_pid, port} = start_peer()
 

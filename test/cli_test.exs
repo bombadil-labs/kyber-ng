@@ -473,8 +473,11 @@ defmodule Kyber.CLITest do
       assert send_code == 0, "send smoke failed: #{send_out}"
       assert send_out =~ "ok imported=1", "the peer must import the seeded claim: #{send_out}"
 
-      # kill the serve; the claim was already persisted to serve_log
-      Port.close(serve_port)
+      # kill the serve — Port.close does NOT terminate spawn_executable children
+      # (the OS process survives, inherits the test's stdout pipe, and hangs the
+      # run at EOF); kill via the OS pid captured from the port
+      {:os_pid, os_pid} = Port.info(serve_port, :os_pid)
+      System.cmd("kill", [Integer.to_string(os_pid)])
 
       {serve_view, serve_view_code} =
         System.cmd(binary, ["--log", serve_log, "view"], stderr_to_stdout: true)
