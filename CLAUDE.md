@@ -4,6 +4,10 @@ Kyber is an agent harness on rhizomatic ground. The design is in [SPEC.md](SPEC.
 [`spec/`](spec/); the plan is in [PLAN.md](PLAN.md) (Section 0 = the current Ralph Loop). Read
 SPEC.md and spec/00-overview.md before writing code. This file is the **process**.
 
+Autonomous agents (claude-code, prime-agent) working this repo: **[AGENTS.md](AGENTS.md) is the
+operating doctrine** (write-first briefs, pacing, model notes) — read it before starting; it and
+this file are both binding.
+
 ## The Ralph Loop
 
 1. **Define** — PLAN.md §0 carries the requirements and exact testable success criteria for the
