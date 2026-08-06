@@ -62,6 +62,26 @@ final gate, and the vault only renders the store so mechanism noise never reache
 human. (The D5 re-read is a deliberate spec amendment, recorded when T10's contract
 is written.)
 
+**Admission default (user refinement, 2026-08-06): persist EVERYTHING first.** "Is it a
+memory or not" is a KNOB, not a policy decided upfront: we start by persisting every
+delta, and later demote shapes whose history no longer needs persisting (a
+role/shape-based admission knob at the door — tune a shape to pulse-only when its
+history stops earning its keep). The store only learns — you can always tune a shape
+down, but you can never recover what you chose not to persist, so the default is
+learning. The vault renders the store, so the human sees the full memory until the
+knob tunes.
+
+**The handler contract (user refinement, 2026-08-06): `(delta[]) -> delta[]`, not
+`(delta) -> [delta]`.** The reactor/gather takes an input SET — many deltas, or deltas
+pre-organized into a hyperview/view — and is PARTIALLY APPLIED incrementally as deltas
+accumulate; it fires only when enough deltas have accumulated that its declared input
+is SATURATED. A handler = {declared input shape, function} where the function maps an
+accumulated input view to output deltas; saturation = the declared shape's required
+slots are filled. The T10 built-in agent-loop handler is the degenerate case (a single
+`message.received` saturates it), but the contract is written for composition: the
+reactor's future {inputs, function} declaration and the gather's dispatch are the
+same shape, so the L4 upgrade is a drop-in.
+
 **Success Criteria (the gate):**
 - `mix test` green; `! grep -r "Process.sleep" test/`; `mix format --check-formatted` exits 0.
 - THE operational run (the gate's verification, executed by Hermes): the daemon boots,
