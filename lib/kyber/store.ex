@@ -26,24 +26,29 @@ defmodule Kyber.Store do
   alias Kyber.DeltaSet
   alias Rhizomatic.{Delta, Profile, Signer}
 
-  @doc "Start the door with an empty delta set (optional `name:`)."
+  @doc "Start the door with an empty delta set. Singleton (multi-store is a later ticket)."
   @spec start_link(keyword()) :: Agent.on_start()
-  def start_link(opts \\ []) do
-    name = Keyword.get(opts, :name, __MODULE__)
-    Agent.start_link(fn -> DeltaSet.new() end, name: name)
+  def start_link(_opts \\ []) do
+    Agent.start_link(fn -> DeltaSet.new() end, name: __MODULE__)
   end
 
   @doc """
   The stateful door: verify, then merge. Returns `:ok` or `{:error, reason}`.
+  Returns `{:error, :store_not_running}` when the door has not been started —
+  never crashes the caller.
   """
   @spec append(map()) :: :ok | {:error, term()}
   def append(wire) when is_map(wire) do
-    Agent.get_and_update(__MODULE__, fn set ->
-      case admit(wire, set) do
-        {:ok, new_set} -> {:ok, new_set}
-        {:error, _} = err -> {err, set}
-      end
-    end)
+    if Process.whereis(__MODULE__) do
+      Agent.get_and_update(__MODULE__, fn set ->
+        case admit(wire, set) do
+          {:ok, new_set} -> {:ok, new_set}
+          {:error, _} = err -> {err, set}
+        end
+      end)
+    else
+      {:error, :store_not_running}
+    end
   end
 
   def append(_), do: {:error, :malformed_envelope}
@@ -55,7 +60,8 @@ defmodule Kyber.Store do
   """
   @spec admit(map(), DeltaSet.t()) :: {:ok, DeltaSet.t()} | {:error, term()}
   def admit(wire, set) when is_map(wire) do
-    with {:ok, claims} <- parse_claims(wire),
+    with :ok <- check_closed(wire),
+         {:ok, claims} <- parse_claims(wire),
          :ok <- check_id(wire, claims),
          :ok <- check_signed(wire),
          :ok <- check_signature(wire, claims) do
@@ -65,11 +71,32 @@ defmodule Kyber.Store do
 
   def admit(_, _), do: {:error, :malformed_envelope}
 
-  @doc "The current delta set — explicit state polling for tests and views."
-  @spec set() :: DeltaSet.t()
-  def set, do: Agent.get(__MODULE__, & &1)
+  @doc """
+  The current delta set — explicit state polling for tests and views. Returns
+  `{:error, :store_not_running}` when the door has not been started.
+  """
+  @spec set() :: DeltaSet.t() | {:error, :store_not_running}
+  def set do
+    if Process.whereis(__MODULE__) do
+      Agent.get(__MODULE__, & &1)
+    else
+      {:error, :store_not_running}
+    end
+  end
 
   # ---------------------------------------------------------------- the door
+
+  # the envelope is closed, exactly like the witness's closed profile: unknown
+  # wire keys are refused, not ignored — asymmetric admission at the trust
+  # boundary is how loam-compatible doors drift apart
+  @envelope_keys ~w(id claims sig)
+
+  defp check_closed(wire) do
+    case Map.keys(wire) -- @envelope_keys do
+      [] -> :ok
+      [unknown | _] -> {:error, {:unknown_key, :envelope, unknown}}
+    end
+  end
 
   defp parse_claims(wire) do
     case Map.fetch(wire, "claims") do

@@ -92,4 +92,25 @@ defmodule Kyber.StoreTest do
     assert {:error, :unsigned} = Store.append(wire)
     assert DeltaSet.size(Store.set()) == 0
   end
+
+  test "P5: the door rejects an envelope with unknown keys (closedness, like the witness profile)" do
+    assert {:ok, signed} = human_message()
+    wire = TestWire.envelope(signed) |> Map.put("nonce", "x")
+
+    assert {:error, {:unknown_key, :envelope, "nonce"}} = Store.append(wire)
+    assert DeltaSet.size(Store.set()) == 0
+  end
+end
+
+defmodule Kyber.StoreNotStartedTest do
+  use ExUnit.Case, async: false
+
+  alias Kyber.Store
+
+  test "append/1 and set/0 return {:error, :store_not_running} before the door is started" do
+    assert {:error, :store_not_running} =
+             Store.append(%{"id" => "x", "claims" => %{}, "sig" => "y"})
+
+    assert {:error, :store_not_running} = Store.set()
+  end
 end

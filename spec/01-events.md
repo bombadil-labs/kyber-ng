@@ -50,6 +50,10 @@ Author: the **human's key** (§2) — sovereignty: the claim is theirs.
 `content` is a string primitive for text. For rich payloads (embeds, attachments, images) use a
 `Bytes` target (`{ "role": "attachment", "target": { "mime": "image/png", "value": "…" } }`).
 
+> **The `by` pointer's entity id is derived from the signing key** — `human:<pubkey hex>` (D2:
+> kyber never mints identity). The `human:myk` spelling in the template above is illustrative;
+> the key-derived convention is what the harness emits and what lenses key on. Pinned by T1 AC8.
+
 ### 2.2 `prompt.annotated` — the annotator has saturated the prompt (Input Saturation)
 
 Author: the **agent's key** (the annotator is the agent acting as a derived author).

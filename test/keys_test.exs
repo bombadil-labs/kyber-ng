@@ -67,6 +67,13 @@ defmodule Kyber.KeysTest do
       System.delete_env("KYBER_SEED")
       assert {:error, :no_agent_seed} = Keys.load_agent_seed(home)
     end
+
+    test "trims a trailing newline from KYBER_SEED (dotenv files)", %{home: home} do
+      System.put_env("KYBER_SEED", @seed_hex <> "\n")
+      assert {:ok, @seed_hex} = Keys.load_agent_seed(home)
+    after
+      System.delete_env("KYBER_SEED")
+    end
   end
 
   describe "import_human_seed/2" do

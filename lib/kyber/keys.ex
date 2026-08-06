@@ -17,18 +17,18 @@ defmodule Kyber.Keys do
 
   @doc """
   Mint a fresh agent seed: create the home dir and write `agent.seed` (0600,
-  hex). Refuses to clobber an existing seed (the agent's identity is not
-  silently replaced; nothing is deleted). Never prints.
+  hex). Refuses to clobber an existing seed atomically (O_EXCL — no
+  check-then-write race; the agent's identity is not silently replaced).
+  Never prints.
   """
   @spec mint_agent_seed(Path.t()) :: {:ok, String.t()} | {:error, term()}
   def mint_agent_seed(home_dir) do
     file = agent_seed_path(home_dir)
 
-    with :ok <- ensure_home(home_dir),
-         :ok <- refuse_existing(file) do
+    with :ok <- ensure_home(home_dir) do
       seed_hex = random_seed_hex()
 
-      with :ok <- write_secret(file, seed_hex) do
+      with :ok <- write_secret_exclusive(file, seed_hex) do
         {:ok, seed_hex}
       end
     end
@@ -52,9 +52,9 @@ defmodule Kyber.Keys do
             {:error, :no_agent_seed}
 
           env_seed ->
-            with {:ok, seed_hex} <- validate_seed_hex(env_seed),
+            with {:ok, seed_hex} <- validate_seed_hex(String.trim(env_seed)),
                  :ok <- ensure_home(home_dir),
-                 :ok <- write_secret(file, seed_hex) do
+                 :ok <- write_secret_overwrite(file, seed_hex) do
               {:ok, seed_hex}
             end
         end
@@ -73,7 +73,7 @@ defmodule Kyber.Keys do
   def import_human_seed(seed_hex, home_dir) do
     with {:ok, seed_hex} <- validate_seed_hex(seed_hex),
          :ok <- ensure_home(home_dir),
-         :ok <- write_secret(human_seed_path(home_dir), seed_hex) do
+         :ok <- write_secret_overwrite(human_seed_path(home_dir), seed_hex) do
       :ok
     end
   end
@@ -104,24 +104,40 @@ defmodule Kyber.Keys do
     end
   end
 
-  defp refuse_existing(file) do
-    case File.exists?(file) do
-      true -> {:error, :already_exists}
-      false -> :ok
-    end
-  end
-
   defp random_seed_hex do
     Base.encode16(:crypto.strong_rand_bytes(@seed_byte_size), case: :lower)
   end
 
-  # write then chmod: the chmod wins regardless of umask
-  defp write_secret(file, content) do
-    with :ok <- File.write(file, content),
-         :ok <- File.chmod(file, 0o600) do
+  # mint path: create atomically (O_EXCL — the exists-check and create are one
+  # operation, no TOCTOU), chmod BEFORE any bytes are written so the file is
+  # 0600 from birth (no world-readable window), and delete on any failure so no
+  # broken state can block a re-mint
+  defp write_secret_exclusive(file, content) do
+    case File.open(file, [:write, :exclusive, :binary]) do
+      {:ok, io} -> write_with_mode(io, file, content)
+      {:error, :eexist} -> {:error, :already_exists}
+      {:error, reason} -> {:error, {:write_failed, reason}}
+    end
+  end
+
+  # import path: an explicit operator action — overwrite is rotation
+  defp write_secret_overwrite(file, content) do
+    case File.open(file, [:write, :binary]) do
+      {:ok, io} -> write_with_mode(io, file, content)
+      {:error, reason} -> {:error, {:write_failed, reason}}
+    end
+  end
+
+  defp write_with_mode(io, file, content) do
+    with :ok <- :file.change_mode(file, 0o600),
+         :ok <- IO.binwrite(io, content) do
+      File.close(io)
       :ok
     else
-      {:error, reason} -> {:error, {:write_failed, reason}}
+      {:error, reason} ->
+        File.close(io)
+        File.rm(file)
+        {:error, {:write_failed, reason}}
     end
   end
 

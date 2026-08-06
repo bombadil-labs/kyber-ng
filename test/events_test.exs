@@ -23,6 +23,10 @@ defmodule Kyber.EventsTest do
   defp assert_pointers(claims, expected) do
     assert MapSet.equal?(MapSet.new(claims.pointers), MapSet.new(expected))
     assert length(claims.pointers) == length(expected)
+    # MapSet + length cannot see a duplicated role with distinct targets (an
+    # extra pointer AC8 forbids) — assert role uniqueness explicitly
+    roles = Enum.map(claims.pointers, & &1.role)
+    assert MapSet.size(MapSet.new(roles)) == length(roles)
   end
 
   describe "AC2 + AC3: id recomputes, signature verifies, right author for every emitted delta" do
@@ -195,6 +199,11 @@ defmodule Kyber.EventsTest do
                )
 
       wire = TestWire.envelope(signed)
+
+      # the loam-compatibility proof must exercise the real JSON-text path —
+      # float formatting and escaping included — not just the in-memory map
+      # shape (P5 finding 7)
+      wire = wire |> JSON.encode!() |> JSON.decode!()
 
       assert {:ok, reparsed} = Profile.parse_claims(wire["claims"])
       assert Delta.canonical_bytes(reparsed) == Delta.canonical_bytes(claims)
