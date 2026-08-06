@@ -282,6 +282,13 @@ defmodule Kyber.CLI do
         with {:ok, text} <- Federation.export() do
           case Peer.send_wire(host, port, text) do
             {:ok, status} -> {:ok, status}
+            # P5 finding 4: the error taxonomy is NOT collapsed — a connect
+            # failure is 'peer unreachable' (the host is down), but a live
+            # peer that answered late or closed without replying gets its own
+            # diagnostic (the operator must not hunt for a down host while
+            # the peer is up and may have imported the claims)
+            {:error, :timeout} -> {:error, {:peer_timeout, host, port}}
+            {:error, :closed} -> {:error, {:peer_closed, host, port}}
             {:error, _reason} -> {:error, {:peer_unreachable, host, port}}
           end
         end
@@ -403,5 +410,7 @@ defmodule Kyber.CLI do
   # through this call.
   defp format_error(:malformed_text), do: "malformed wire"
   defp format_error({:peer_unreachable, host, port}), do: "peer unreachable: #{host} #{port}"
+  defp format_error({:peer_timeout, host, port}), do: "peer timeout: #{host} #{port}"
+  defp format_error({:peer_closed, host, port}), do: "peer closed: #{host} #{port}"
   defp format_error(other), do: "error: #{inspect(other)}"
 end

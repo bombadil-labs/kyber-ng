@@ -319,9 +319,30 @@ defmodule Kyber.CLITest do
     assert {:ok, pid} = Kyber.Peer.start_link(port: 0)
     free_port = Kyber.Peer.port(pid)
     assert :ok = Kyber.Peer.stop(pid)
-
     assert {:error, message} = CLI.run(["send", "localhost", Integer.to_string(free_port)])
     assert message == "peer unreachable: localhost #{free_port}"
+  end
+
+  test "T9 AC5: a silent peer -> the peer-timeout one-liner, not a misleading unreachable (P5 taxonomy)" do
+    # a FAKE listener (a real kyber peer always replies): accept, read the
+    # frame, then hold the connection open WITHOUT replying — send_wire's
+    # 5000ms recv times out -> {:error, :timeout} -> "peer timeout"
+    {:ok, listen} = :gen_tcp.listen(0, [:binary, active: false])
+    {:ok, port} = :inet.port(listen)
+    on_exit(fn -> :gen_tcp.close(listen) end)
+
+    spawn(fn ->
+      {:ok, sock} = :gen_tcp.accept(listen)
+      # read the frame, then HOLD the connection open — a second blocking recv
+      # (the poll, never a sleep); the process owning the socket must not exit,
+      # or the socket closes with it and send_wire sees :closed, not :timeout
+      {:ok, _frame} = :gen_tcp.recv(sock, 0, 15_000)
+      :gen_tcp.recv(sock, 0, 15_000)
+      :ok = :gen_tcp.close(sock)
+    end)
+
+    assert {:error, message} = CLI.run(["send", "localhost", Integer.to_string(port)])
+    assert message == "peer timeout: localhost #{port}"
   end
 
   test "T9 AC5: serve with a non-integer --port -> usage exit 2" do
@@ -457,9 +478,25 @@ defmodule Kyber.CLITest do
             :binary,
             :exit_status,
             {:line, 1024},
+            # P5 finding 3: the serve VM runs with a tmp cwd so a SIGTERM
+            # crash dump lands OUTSIDE the repo (BEAM's default SIGTERM
+            # disposition writes erl_crash.dump into the process CWD)
+            cd: fixture_dir,
             args: ["--log", serve_log, "serve", "--port", "0"]
           ]
         )
+
+      # P5 finding 2: register the kill AT Port.open time — Port.close does
+      # not terminate spawn_executable children, so an assertion failure
+      # between here and the inline kill would leak the serve process (which
+      # inherits this test's stdout pipe and hangs the run at EOF); the
+      # on_exit makes the teardown failure-atomic on ANY exit path
+      on_exit(fn ->
+        case Port.info(serve_port, :os_pid) do
+          {:os_pid, pid} -> System.cmd("kill", [Integer.to_string(pid)])
+          _ -> :ok
+        end
+      end)
 
       assert_receive {^serve_port, {:data, {:eol, listening}}}, 60_000
       assert [_, n_str] = Regex.run(~r/listening on (\d+)/, listening)

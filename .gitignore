@@ -21,3 +21,6 @@ priv/data/
 !.adlc/ticket-archive/
 !.adlc/ticket-archive/**
 !.adlc/specs/
+
+# crash artifacts (a BEAM SIGTERM writes erl_crash.dump into its CWD)
+erl_crash.dump

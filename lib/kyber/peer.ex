@@ -143,22 +143,42 @@ defmodule Kyber.Peer do
     # the accept loop is armed by start_owner/1's :accept message AFTER
     # ownership of `listen` has actually transferred to this process (else
     # the first accept would fail not_owner)
-    {:ok, %{listen: listen}}
+    {:ok, %{listen: listen, handlers: 0, refs: MapSet.new()}}
   end
 
   @impl true
-  def handle_call(:port, _from, %{listen: listen} = state) do
-    {:ok, port} = :inet.port(listen)
-    {:reply, port, state}
+  def handle_info({:armed, ref}, state) do
+    {:noreply, %{state | refs: MapSet.put(state.refs, ref)}}
   end
 
   @impl true
-  def handle_info(:accept, %{listen: listen} = state) do
+  def handle_info({:DOWN, ref, :process, _pid, _reason}, %{refs: refs} = state) do
+    # a handler died (the listener's ONLY monitors are handlers) — the
+    # in-flight count decrements so the cap re-opens
+    {:noreply, %{state | handlers: state.handlers - 1, refs: MapSet.delete(refs, ref)}}
+  end
+
+  # caps (P5 finding 1 — resource-exhaustion): the idle recv timeout alone
+  # bounds only SILENCE, not an actively-streaming client; the accumulator and
+  # the handler pool are both bounded so a broken or malicious peer cannot
+  # exhaust the serve VM's heap or process table
+  @max_frame_bytes 1_048_576
+  @max_handlers 16
+
+  @impl true
+  def handle_info(:accept, %{listen: listen, handlers: n} = state) do
     case :gen_tcp.accept(listen, @accept_timeout) do
       {:ok, socket} ->
-        hand_off(socket)
-        send(self(), :accept)
-        {:noreply, state}
+        if n >= @max_handlers do
+          # refuse beyond the cap — close immediately, no handler spawned
+          :gen_tcp.close(socket)
+          send(self(), :accept)
+          {:noreply, state}
+        else
+          hand_off(socket)
+          send(self(), :accept)
+          {:noreply, %{state | handlers: n + 1}}
+        end
 
       # the accept timeout is the yield point that lets stop/1 run
       {:error, :timeout} ->
@@ -176,19 +196,31 @@ defmodule Kyber.Peer do
   end
 
   @impl true
+  def handle_call(:port, _from, %{listen: listen} = state) do
+    {:ok, port} = :inet.port(listen)
+    {:reply, port, state}
+  end
+
+  @impl true
   def terminate(_reason, %{listen: listen}) do
     :gen_tcp.close(listen)
     :ok
   end
 
-  # spawn UNLINKED, transfer ownership, THEN hand the socket over — the
-  # handler only touches the socket after it owns it (else recv -> not_owner)
+  # spawn UNLINKED but MONITORED, transfer ownership, THEN hand the socket
+  # over — the handler only touches the socket after it owns it (else recv ->
+  # not_owner); the monitor lets the listener track the in-flight count (the
+  # P5 handler cap decrements on the DOWN)
   defp hand_off(socket) do
-    handler = spawn(fn -> await_socket() end)
+    {handler, ref} = spawn_monitor(fn -> await_socket() end)
 
     case :gen_tcp.controlling_process(socket, handler) do
-      :ok -> send(handler, {:socket, socket})
-      {:error, _reason} -> :gen_tcp.close(socket)
+      :ok ->
+        send(handler, {:socket, socket})
+        send(self(), {:armed, ref})
+
+      {:error, _reason} ->
+        :gen_tcp.close(socket)
     end
   end
 
@@ -203,9 +235,14 @@ defmodule Kyber.Peer do
   end
 
   defp serve(socket) do
-    case recv_frame(socket, []) do
+    case recv_frame(socket, [], 0) do
       {:ok, text} ->
         :gen_tcp.send(socket, status_line(text) <> "\n")
+        :gen_tcp.close(socket)
+
+      :too_large ->
+        # P5 finding 1: a frame over the cap is refused with a clean status
+        :gen_tcp.send(socket, "err frame_too_large\n")
         :gen_tcp.close(socket)
 
       :drop ->
@@ -215,14 +252,24 @@ defmodule Kyber.Peer do
 
   # accumulate NON-BLANK packets (EOL stripped) until the blank terminator;
   # the terminator packet is dropped, never joined. A recv timeout or a
-  # close mid-frame is a non-event -> :drop.
-  defp recv_frame(socket, acc) do
+  # close mid-frame is a non-event -> :drop. The accumulated BYTE COUNT is
+  # bounded (@max_frame_bytes) — a frame that exceeds the cap is refused
+  # (:too_large), so an actively-streaming client cannot grow the heap
+  # without bound (the idle timeout alone bounds only silence).
+  defp recv_frame(socket, acc, bytes) do
     case :gen_tcp.recv(socket, 0, @recv_timeout) do
       {:ok, packet} ->
         if String.trim(packet) == "" do
           {:ok, acc |> Enum.reverse() |> Enum.join("\n")}
         else
-          recv_frame(socket, [String.trim_trailing(packet, "\n") | acc])
+          stripped = String.trim_trailing(packet, "\n")
+          bytes = bytes + byte_size(stripped)
+
+          if bytes > @max_frame_bytes do
+            :too_large
+          else
+            recv_frame(socket, [stripped | acc], bytes)
+          end
         end
 
       {:error, _reason} ->

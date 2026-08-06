@@ -129,6 +129,67 @@ defmodule Kyber.PeerTest do
              Peer.send_wire("localhost", port, "")
   end
 
+  test "AC3: a frame over the size cap is refused with a clean status (P5 bound)" do
+    {_pid, port} = start_peer()
+
+    # stream 2 MiB of non-blank junk with NO terminator — the handler must
+    # refuse at the cap (:too_large) instead of accumulating without bound
+    assert {:ok, sock} =
+             :gen_tcp.connect(~c"localhost", port, [:binary, packet: :line, active: false])
+
+    chunk = String.duplicate("x", 4096) <> "\n"
+    for _ <- 1..512, do: :ok = :gen_tcp.send(sock, chunk)
+
+    assert {:ok, "err frame_too_large\n"} = :gen_tcp.recv(sock, 0, 15_000)
+    assert :ok = :gen_tcp.close(sock)
+
+    # the listener survives the refusal — the next connection is served
+    assert {:ok, "ok imported=0 skipped=0 refused=0"} =
+             Peer.send_wire("localhost", port, "")
+  end
+
+  test "AC3: concurrent connections beyond the handler cap are refused, then re-opened (P5 bound)" do
+    {_pid, port} = start_peer()
+
+    # hold exactly @max_handlers connections open (idle — each parks a handler)
+    held =
+      for _ <- 1..16 do
+        {:ok, sock} =
+          :gen_tcp.connect(~c"localhost", port, [:binary, packet: :line, active: false])
+
+        sock
+      end
+
+    # the cap is full: the next connection is REFUSED (accept -> close) —
+    # send_wire sees the close, and the listener stays alive
+    assert {:error, :closed} = Peer.send_wire("localhost", port, "")
+
+    # release the held sockets; the handler count drains via the monitors
+    for sock <- held, do: :ok = :gen_tcp.close(sock)
+
+    # the drain is async (handler exit -> DOWN -> decrement), so poll with a
+    # bounded no-sleep retry — each attempt is a real connect round-trip
+    # (the pinned explicit-state-polling idiom; never Process.sleep)
+    deadline = System.monotonic_time(:millisecond) + 10_000
+
+    result =
+      Enum.reduce_while(1..100, {:error, :closed}, fn _, _ ->
+        case Peer.send_wire("localhost", port, "") do
+          {:ok, status} ->
+            {:halt, {:ok, status}}
+
+          {:error, :closed} ->
+            if System.monotonic_time(:millisecond) > deadline do
+              {:halt, {:error, :closed}}
+            else
+              {:cont, {:error, :closed}}
+            end
+        end
+      end)
+
+    assert result == {:ok, "ok imported=0 skipped=0 refused=0"}
+  end
+
   test "AC3: a TWO-CLAIM frame imports both — no phantom blank segment (rev 3 strip-then-join)",
        %{keyring_dir: keyring_dir} do
     # store A: two fixture claims -> a two-envelope export (no trailing newline)
