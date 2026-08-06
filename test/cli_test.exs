@@ -453,7 +453,12 @@ defmodule Kyber.CLITest do
       serve_port =
         Port.open(
           {:spawn_executable, binary},
-          [:binary, :exit_status, {:line, 1024}, args: ["--log", serve_log, "serve", "--port", "0"]]
+          [
+            :binary,
+            :exit_status,
+            {:line, 1024},
+            args: ["--log", serve_log, "serve", "--port", "0"]
+          ]
         )
 
       assert_receive {^serve_port, {:data, {:eol, listening}}}, 60_000

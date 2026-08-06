@@ -151,7 +151,7 @@ defmodule Kyber.PeerTest do
              :gen_tcp.connect(~c"localhost", port, [:binary, packet: :line, active: false])
 
     # send nothing: the handler recv times out, closes the socket -> :closed
-    # here (assert_receive-style polling on the socket, never a Process.sleep)
+    # here (blocking recv on the socket is the poll, never a sleep primitive)
     assert {:error, :closed} = :gen_tcp.recv(sock, 0, 15_000)
 
     # and the listener is still alive

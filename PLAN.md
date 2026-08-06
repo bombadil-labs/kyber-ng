@@ -39,6 +39,21 @@ another handler (the deployment, unblocked without the substrate L4 reactor).
    (the handler fired) → assert the vault renders both → stop the daemon → re-boot →
    the loop continues (replay-idempotent: the already-handled claim is not re-fired).
 
+**The architectural model (user design, 2026-08-06 — the harness as a closed loop):**
+every operation in the harness generates a delta and writes it to the intake; some are
+persisted (claims — memory), some are ephemeral (pulses — side-effect carriers only,
+invoked for their effects, never stored). The intake is therefore TWO surfaces: the
+log (persisted claims — the door admits only these) and the pulse bus (ephemeral — the
+daemon consumes both). Agent behavior is handlers over the event stream: straight
+Elixir functions (the Gather — T10's provisional mechanism, spec/04 §6), a reactor on
+the store (substrate L4 — declarative functions firing when their topological inputs
+saturate), or a hybrid (gather for routing, reactor for composition). The T10 handler
+contract is a PURE FUNCTION + a DECLARED INPUT SHAPE (matching the reactor's future
+{inputs, function} declaration, so the L4 upgrade is a drop-in). The gather is a LENS
+WITH STATE: a dispatch cursor into the log (replay never re-fires; pulses fire once by
+construction). The daemon's own operations follow the line: the OUTCOME persists (the
+response claim), the MECHANISM never does (a handler run is not a claim).
+
 **Success Criteria (the gate):**
 - `mix test` green; `! grep -r "Process.sleep" test/`; `mix format --check-formatted` exits 0.
 - THE operational run (the gate's verification, executed by Hermes): the daemon boots,
