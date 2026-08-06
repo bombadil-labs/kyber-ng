@@ -6,36 +6,37 @@ success criteria. Hermes owns updating this file; the coding agent does not over
 
 ---
 
-## 0. Next Ralph Loop: Migration — the legacy log becomes claims (spec/07)
+## 0. Next Ralph Loop: The Vault-as-View — claims become a human-navigable memory (the lens)
 
-**Objective:** The ORIGINAL mission lands: kyber's pre-rhizomatic delta log
-(`deltas.jsonl` in the legacy repo — `%Kyber.Delta{id, ts, origin, kind, payload,
-parent_id}` per line, Jason-encoded) is unified with rhizomatic/loam deltas. T5's
-promise pays off: the legacy log is TRANSLATED to wire text (each legacy delta → a claim
-signed by the ARCHIVIST — the agent key attests "this delta existed"; the legacy identity
-lives in the claim's pointers) and fed through `Federation.import/1` — the SAME door,
-the SAME dedup (re-migration is idempotent), the SAME reporting. No fabricated
-signatures: the archivist signature is the harness vouching for its own history.
+**Objective:** The harness's human-facing memory. Legacy kyber's core value was "Memory
+isn't a database schema; it's a markdown file a human can read and edit in Obsidian."
+Kyber-ng's answer: the claims store is the truth, and the vault is a LENS over it —
+`Kyber.Vault` materializes the store's claims as an Obsidian-compatible markdown vault
+(one file per claim, `claim:<id>.md`, YAML frontmatter with author/timestamp/pointers,
+body = the content pointer), deterministically rendered, idempotently refreshed (a
+re-render never duplicates or orphans files — the cap is a lens, never a store property).
+Nothing is deleted from the store; the vault is derived state that can be rebuilt from
+claims alone (a full re-render of the same store yields byte-identical files).
 
-**Requirements (contract: .adlc/specs/T6.md):**
-1. `Kyber.Migration.migrate/2` (legacy_path, keyring_dir) — lazy-read the legacy
-   deltas.jsonl, translate each line to an archivist-signed wire envelope, import via
-   `Federation.import/1`; returns a migration_report (import_report + legacy-side
-   refusals). Store-down guard (T5 shape).
-2. `Kyber.Migration.translate_line/1` — PURE: a legacy delta map → `{claims, sig}`
-   (agent-key-signed, legacy identity in pointers); untranslatable → tagged refusal.
-3. A byte-realistic fixture (the legacy `to_map` shape) + idempotency AC (migrate twice →
-   all skipped).
+**Requirements (contract: .adlc/specs/T7.md):**
+1. `Kyber.Vault.render/1` (vault_dir) — claims → markdown files; store-down guard (T5
+   shape); deterministic (same store → byte-identical files, sorted, no timestamps in
+   content); frontmatter pinned (id, author, timestamp, pointers, role).
+2. `Kyber.Vault.refresh/1` — idempotent: re-render of the same store leaves every file
+   byte-identical (no churn, no duplicates, no orphans); a claim removed from the store
+   (impossible — the store only learns) or a foreign file in the vault dir is left
+   untouched (the lens never deletes).
+3. Obsidian compatibility: `.md` files with YAML frontmatter, `[[wikilinks]]` between
+   claims that reference each other (the entity pointers), readable by Obsidian.
 
 **Success Criteria (the gate):**
 - `mix test` green; `! grep -r "Process.sleep" test/`; `mix format --check-formatted` exits 0.
-- A fixture legacy log migrates: claims in the store, archivist-signed, door-re-verifiable,
-  idempotent on re-run.
-- Malformed legacy lines are reported with line numbers, never fatal; valid lines still land.
+- Render → refresh: byte-identical files, zero churn; the vault rebuilds identically from
+  a cold store replay.
+- The store-down case answers a tagged tuple, never a crash.
 
-**Out of scope (later loops):** legacy SEMANTIC interpretation (memory/insight kinds →
-rich claims — later loops), the Discord transport (gated on substrate L4), federation
-peers, vault-as-view, sqlite/packs backends, the reactor/subscriptions.
+**Out of scope (later loops):** the Discord transport (gated on substrate L4), federation
+peers, legacy semantic interpretation, sqlite/packs backends, the reactor/subscriptions.
 
 ---
 
@@ -65,8 +66,12 @@ peers, vault-as-view, sqlite/packs backends, the reactor/subscriptions.
   (deterministic wire JSONL, door re-verification, dedup, import_report observable;
   total never-crash — every stateful call exit-protected). 108 tests; P1–P7 green;
   review 4/4 fixed (1 medium: bare-call crash class eliminated).
-- **Loop 6 (T6, in flight)** — migration: `Kyber.Migration` legacy deltas.jsonl →
-  archivist-signed claims → `Federation.import` (the original unification mission).
+- **Loop 6 COMPLETE (T6, archived — THE ORIGINAL MISSION)** — migration: `Kyber.Migration`
+  legacy deltas.jsonl → archivist-signed claims → `Federation.import` (unified with
+  rhizomatic/loam deltas; value-type validation — no fabricated attestations). 123 tests;
+  P1–P7 green; hollow-test 12 killed (strongest of the campaign); review 3/3 fixed.
+- **Loop 7 (T7, in flight)** — the vault-as-view: `Kyber.Vault` claims → Obsidian
+  markdown (deterministic render, idempotent refresh, wikilinks; the cap is a lens).
 
 ## 2. Active Backlog
 
