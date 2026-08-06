@@ -95,14 +95,29 @@ defmodule Kyber.DurableStore do
     case ensure_open(state) do
       {:ok, io, opened_state} ->
         case Log.append(io, wire) do
-          :ok -> {:ok, %{opened_state | set: candidate_set}}
-          {:error, _reason} -> {{:error, :persist_failed}, %{opened_state | io: nil}}
+          :ok ->
+            {:ok, %{opened_state | set: candidate_set}}
+
+          {:error, _reason} ->
+            # best-effort close BEFORE dropping the handle: a live-device error
+            # (ENOSPC/EIO) leaves the io-server alive, and an unclosed device
+            # leaks an fd per failed append (P5 medium finding). A dead device
+            # (closed behind our back) is skipped by the alive? guard.
+            close_device(io)
+            {{:error, :persist_failed}, %{opened_state | io: nil}}
         end
 
       {:error, _reason} ->
         {{:error, :persist_failed}, state}
     end
   end
+
+  defp close_device(io) when is_pid(io) do
+    if Process.alive?(io), do: File.close(io)
+    :ok
+  end
+
+  defp close_device(_), do: :ok
 
   # lazy open: the log is created on the first append, never at boot (AC11)
   defp ensure_open(%{io: nil, path: path} = state) do

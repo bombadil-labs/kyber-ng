@@ -114,6 +114,22 @@ defmodule Kyber.LogTest do
 
       assert File.read!(path) == before
     end
+
+    test "P5: refuses maps with non-string keys (stdlib coerces them — reject, never repair)", %{
+      tmp_dir: tmp_dir
+    } do
+      path = Path.join(tmp_dir, "log.jsonl")
+      {:ok, io} = Log.open(path)
+
+      assert :ok = Log.append(io, wire())
+      before = File.read!(path)
+
+      assert {:error, {:encode, :non_string_key}} = Log.append(io, %{1 => "a", "b" => 2})
+      assert {:error, {:encode, :non_string_key}} = Log.append(io, %{atom_key: "a"})
+      File.close(io)
+
+      assert File.read!(path) == before
+    end
   end
 
   describe "stream/1" do

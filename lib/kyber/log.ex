@@ -23,15 +23,22 @@ defmodule Kyber.Log do
   end
 
   @doc """
-  Append one wire envelope as a single JSON line. Refuses non-map input and
-  input `JSON` cannot encode — refusal never touches the file, since the
-  whole line is encoded in memory before any write is attempted.
+  Append one wire envelope as a single JSON line. Refuses non-map input,
+  maps with non-string keys, and input `JSON` cannot encode — refusal never
+  touches the file, since the whole line is encoded in memory before any
+  write is attempted. (Non-string keys are refused, not coerced: the stdlib
+  encoder silently stringifies them, which would break AC10's term-identical
+  round-trip — reject, never repair.)
   """
   @spec append(File.io_device(), map()) :: :ok | {:error, term()}
   def append(io, wire) when is_map(wire) do
-    case encode(wire) do
-      {:ok, json} -> write(io, json)
-      {:error, reason} -> {:error, {:encode, reason}}
+    if Enum.all?(Map.keys(wire), &is_binary/1) do
+      case encode(wire) do
+        {:ok, json} -> write(io, json)
+        {:error, reason} -> {:error, {:encode, reason}}
+      end
+    else
+      {:error, {:encode, :non_string_key}}
     end
   end
 

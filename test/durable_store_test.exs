@@ -211,6 +211,13 @@ defmodule Kyber.DurableStoreTest do
 
     assert DurableStore.set() == before_set
     assert File.read!(path) == before_file
+
+    # P5: recovery — after a persist failure the store reopens the device and
+    # keeps working (this exercises the reopen path and the fd lifecycle)
+    w3 = wire("message:discord\n333333333333333333: 3")
+    assert :ok = DurableStore.append(w3)
+    assert DeltaSet.member?(DurableStore.set(), w3["id"])
+    assert File.read!(path) == before_file <> JSON.encode!(w3) <> "\n"
   end
 
   # ----------------------------------------------------------------- AC10
