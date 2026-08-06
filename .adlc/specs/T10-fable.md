@@ -1,6 +1,6 @@
 # T10 — The Operational Harness: kyber daemon + Gather + the runtime agent loop
 
-Rev 1 — fork of the shared T10 contract (T10-agent). Implements the SAME contract as
+Rev 1 — fork of the shared T10 contract (T10-fable). Implements the SAME contract as
 its sibling independently (the blind taste test); amendments to THIS file only.
 
 ## Why this loop exists (user direction, 2026-08-06)
