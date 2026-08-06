@@ -23,9 +23,7 @@ defmodule Kyber.MixProject do
       # addressing, strict Ed25519, packs). Frozen/normative — never edit from here
       # (spec/03-substrate.md).
       {:rhizomatic,
-       github: "bombadil-labs/rhizomatic",
-       subdir: "implementations/elixir",
-       branch: "main"}
+       github: "bombadil-labs/rhizomatic", subdir: "implementations/elixir", branch: "main"}
     ]
   end
 end

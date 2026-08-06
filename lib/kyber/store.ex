@@ -1,0 +1,110 @@
+defmodule Kyber.Store do
+  @moduledoc """
+  The door (spec/04-persistence.md §3): every delta enters through one door —
+  **verify, then merge**. Input is the pinned wire envelope map (T1 rev 2):
+
+      %{"id" => "<hex content address>",
+        "claims" => %{"timestamp" => ts, "author" => "ed25519:<hex>", "pointers" => [...]},
+        "sig" => "<hex ed25519 signature>"}
+
+  The door's sequence: parse the claims (JSON debug profile) → recompute the
+  id and refuse a mismatch with the envelope's `"id"` → refuse unsigned deltas
+  (D1 — no internal dialect) → verify the signature with the witness's strict
+  `Rhizomatic.Signer` (boolean; the door turns `false` into
+  `{:error, :bad_signature}`) → merge into the in-memory delta set.
+
+  The store only learns: a rejected delta leaves the set untouched; a
+  duplicate is a no-op (union).
+
+  Lifecycle: start the door with `start_link/1` (it holds the set in an
+  Agent); `append/1` is the stateful entry, `admit/2` is the pure door for
+  replay and tests.
+  """
+
+  use Agent
+
+  alias Kyber.DeltaSet
+  alias Rhizomatic.{Delta, Profile, Signer}
+
+  @doc "Start the door with an empty delta set (optional `name:`)."
+  @spec start_link(keyword()) :: Agent.on_start()
+  def start_link(opts \\ []) do
+    name = Keyword.get(opts, :name, __MODULE__)
+    Agent.start_link(fn -> DeltaSet.new() end, name: name)
+  end
+
+  @doc """
+  The stateful door: verify, then merge. Returns `:ok` or `{:error, reason}`.
+  """
+  @spec append(map()) :: :ok | {:error, term()}
+  def append(wire) when is_map(wire) do
+    Agent.get_and_update(__MODULE__, fn set ->
+      case admit(wire, set) do
+        {:ok, new_set} -> {:ok, new_set}
+        {:error, _} = err -> {err, set}
+      end
+    end)
+  end
+
+  def append(_), do: {:error, :malformed_envelope}
+
+  @doc """
+  The pure door: verify, then merge into `set`. Returns `{:ok, set}` or
+  `{:error, reason}` — the machinery `append/1` delegates to, and the shape
+  replay will use (re-verify + re-merge, spec/04-persistence.md §2).
+  """
+  @spec admit(map(), DeltaSet.t()) :: {:ok, DeltaSet.t()} | {:error, term()}
+  def admit(wire, set) when is_map(wire) do
+    with {:ok, claims} <- parse_claims(wire),
+         :ok <- check_id(wire, claims),
+         :ok <- check_signed(wire),
+         :ok <- check_signature(wire, claims) do
+      {:ok, DeltaSet.merge(set, %{Delta.id_hex(claims) => {claims, wire["sig"]}})}
+    end
+  end
+
+  def admit(_, _), do: {:error, :malformed_envelope}
+
+  @doc "The current delta set — explicit state polling for tests and views."
+  @spec set() :: DeltaSet.t()
+  def set, do: Agent.get(__MODULE__, & &1)
+
+  # ---------------------------------------------------------------- the door
+
+  defp parse_claims(wire) do
+    case Map.fetch(wire, "claims") do
+      {:ok, claims_json} -> Profile.parse_claims(claims_json)
+      :error -> {:error, {:missing_key, :envelope, "claims"}}
+    end
+  end
+
+  # content addressing: a delta whose id does not match its claims never lands
+  defp check_id(wire, claims) do
+    case Map.fetch(wire, "id") do
+      {:ok, id} when is_binary(id) ->
+        if Delta.id_hex(claims) == id, do: :ok, else: {:error, :id_mismatch}
+
+      _ ->
+        {:error, :missing_id}
+    end
+  end
+
+  # D1: unsigned deltas are refused at the door; an empty/garbage sig fails
+  # the signature check, not the presence check
+  defp check_signed(wire) do
+    case Map.fetch(wire, "sig") do
+      {:ok, sig} when is_binary(sig) -> :ok
+      _ -> {:error, :unsigned}
+    end
+  end
+
+  defp check_signature(wire, claims) do
+    id_hex = Delta.id_hex(claims)
+
+    if Signer.verify(claims, wire["sig"], id_hex) do
+      :ok
+    else
+      {:error, :bad_signature}
+    end
+  end
+end
