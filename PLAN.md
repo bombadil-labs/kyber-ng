@@ -6,36 +6,36 @@ success criteria. Hermes owns updating this file; the coding agent does not over
 
 ---
 
-## 0. Next Ralph Loop: The Harness Core — production wire + supervision tree
+## 0. Next Ralph Loop: The Harness Loop — gather → translate → sign → persist → view
 
-**Objective:** The running harness gets a real wire and a started door. T1 built the door,
-T2 made it durable — but the only envelope serializer lives in test/support (TestWire) and
-nothing boots the store at app start (mix.exs has no `mod:`). T3 closes both gaps; every
-downstream loop (plugins, federation, migration) stands on it.
+**Objective:** The harness awakens. T1–T3 built the machinery (door, durable store, wire,
+supervision) but nothing yet RUNS the loop it was built for — "a Discord message in, a
+model response out" at the atom. T4 wires the loop: a source event in → a signed claim
+persisted in the durable store → a materialized view out. The transport (Discord etc.) is
+gated on the substrate L4 reactor; T4 builds the loop against an injectable SOURCE
+interface with a fake source in tests — the plugin ticket later is a thin adapter.
 
-**Requirements (contract: .adlc/specs/T3.md):**
-1. `Kyber.Wire` — the production envelope serializer (stdlib JSON; the witness has none):
-   `envelope/1`, `encode/1` (tagged errors; non-string keys refused; NaN/Infinity
-   unrepresentable — finiteness holds), `decode/1`, `claims_json/1`. Round-trip AC:
-   encode→decode term-identical; envelope re-admits through `Kyber.Store.admit/2`.
-2. `Kyber.Application` — the OTP app: Supervisor starting `Kyber.DurableStore` with
-   `Application.get_env(:kyber, :log_path)` (default `~/.kyber/store.jsonl`, runtime
-   artifact). mix.exs gains `mod:` (a deliberate scoped amendment — mix.exs leaves this
-   ticket's rails; deps/ + spec/ + SPEC.md + PLAN.md stay frozen). `Kyber.Store`'s T1
-   Agent is NOT started — DurableStore is THE running store (T2 topology pin).
-3. TDD; no Process.sleep; format clean.
+**Requirements (contract: .adlc/specs/T4.md):**
+1. `Kyber.Harness` — `ingest(source_event)` → `{:ok, id} | {:error, reason}`: translate the
+   source event to a `message_received` claim (author = the human key's pubkey), sign with
+   the human key, `Wire.encode`, `DurableStore.append`. Source events come through a
+   callback/adapter interface (testable fake; real Discord transport = later ticket).
+2. `Kyber.Harness.agent_event/1` (model response in → `message_sent`-family claim signed
+   by the AGENT key) — the response half of the loop, same pipeline.
+3. A VIEW: `Kyber.Harness.view/0` materializes the store's delta set as claims (the
+   vault-as-view is a later lens; this is the plain claims view).
+4. TDD; no Process.sleep; format clean. The full loop is asserted END-TO-END: ingest →
+   claim in the store → supervised restart → still there (replay) → view shows it.
 
 **Success Criteria (the gate):**
 - `mix test` green; `! grep -r "Process.sleep" test/`; `mix format --check-formatted` exits 0.
-- Wire round-trip: encode/decode of a signed `message_received` envelope is term-identical
-  and re-admits via the door (AC2).
-- The app boots a registered `Kyber.DurableStore` at the configured log path; an append
-  persists and replays across a supervised restart (AC4).
-- `Process.whereis(Kyber.Store)` is nil after boot — exactly one running store (AC5).
-- `git diff main -- mix.exs` shows only the `mod:` addition; deps/ and spec/ untouched (AC6).
+- A fake source event ingests to a persisted, signature-verified claim; restart survives it.
+- The agent_event half signs with the agent key (author = agent pubkey) and persists.
+- The view materializes exactly the stored claims.
+- Source interface injectable: a second fake source shape flows through unchanged.
 
-**Out of scope (later loops):** the Discord plugin, the reactor/subscriptions (gated on
-substrate L4), federation, migration, vault-as-view, sqlite/packs backends.
+**Out of scope (later loops):** the Discord transport/adapter (gated on substrate L4),
+federation, migration, vault-as-view, sqlite/packs backends, the reactor/subscriptions.
 
 ---
 
@@ -51,8 +51,13 @@ substrate L4), federation, migration, vault-as-view, sqlite/packs backends.
   store: boot replay through the door with exhaustive per-line classification,
   write-ahead verify→persist→merge, `replay_report/0` with live `failed_appends`,
   lazy-open first boot). 66 tests; P1–P7 green; review 4/4 findings fixed.
-- **Loop 3 (T3, in flight)** — the harness core: `Kyber.Wire` (production serializer) +
-  `Kyber.Application` (supervision tree, mix.exs `mod:`, DurableStore at app start).
+- **Loop 3 COMPLETE (T3, archived)** — the harness core: `Kyber.Wire` (production
+  serializer, TestWire-oracle byte-parity across all 7 target shapes, deep key refusal,
+  decode symmetry) + `Kyber.Application` (supervision, mkdir-owned, :permanent, config/
+  env overrides). 83 tests; P1–P7 green; review APPROVE + 3 lows + 1 discovered door
+  crash (atom-keyed claims refused pre-parse) — all fixed.
+- **Loop 4 (T4, in flight)** — the harness loop: gather → translate → sign → persist →
+  view (`Kyber.Harness`, injectable source interface, fake source in tests).
 
 ## 2. Active Backlog
 
