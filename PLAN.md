@@ -18,6 +18,13 @@ proven: `moonshotai/kimi-k3`, `MOONSHOT_API_KEY`) — becomes a gather handler, 
 lives in the loop: event in → signed claim → model action → response claim → memory (the claims
 substrate IS the memory). The Discord transport later plugs in as just another handler.
 
+**Sequencing (decomposition decided 2026-08-06 — the umbrella spec stays the architecture; the
+tickets own AC slices):** T11a the schema layer (AC2/AC7 — the vocabulary first, everything else
+writes against it) → T11b the inference chain (AC1/AC3/AC4/AC5/AC8/AC9 — the operational run with a
+real model call is its gate; the context builder takes a MemoryPort seam, not a concrete memory
+container) → T11c the memory store (AC6 — the expected-to-iterate piece gets its own lifecycle and
+slots into the seam; A/B-swappable by design).
+
 **Requirements (contract: .adlc/specs/T11.md — the full architecture: deltas-as-events,
 entities-as-resolutions, primitives-ride/composites-point, actors-bound-to-containers, schemas-as-deltas,
 memory-reified-to-markdown):**

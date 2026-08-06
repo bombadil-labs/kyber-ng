@@ -1,0 +1,17 @@
+{
+  "body": "T11c — the memory store, third slice of the T11 umbrella (architecture contract: .adlc/specs/T11.md; spine pins 10-11: memory as entities reified to markdown, canon is a resolution, L0/L1/L2 tiers, provenance authority). Owns AC6 (the markdown round-trip: a MemoryEntity resolves -> projects to a vault markdown file; a HUMAN edit to that file is observed by the watcher -> an attested MemoryEdited delta (source: :human_edit, old+new) -> the entity's canon re-resolves to the edited content; the edited memory carries provenance: human and the retriever ranks it above auto-derived memory) plus the AC10 gates. Deliverables: Kyber.Agent.Memory (the memory container actor — MemoryEntity resolution, projector deltas->markdown vault, watcher vault-edits->diff->MemoryEdited, tierer L0 abstract + L1 overview derived claims regenerated on edit, retriever L0->L1->L2 walk with recorded trajectory), slotting into the MemoryPort seam T11b left (the A/B boundary: a second memory container can serve the same queries against the same substrate). OpenViking's viking:// shape is the reference; ours derives from the delta substrate — no sidecar store. Gate: the AC6 round-trip test (write vault file, edit out-of-band, tick the watcher, assert edit delta + re-resolved canon + provenance role); the port seam accepts the container; mix test green; rails-guard clean; no Process.sleep.",
+  "id": "T11c",
+  "rails": [
+    "deps/",
+    "spec/",
+    "SPEC.md",
+    "mix.exs",
+    "config/"
+  ],
+  "scope": [
+    "lib/kyber/agent/memory.ex",
+    "lib/kyber/agent/memory/",
+    "test/memory_test.exs"
+  ],
+  "title": "T11c: the memory store — entities reified to markdown, the projector/watcher/tierer/retriever (the A/B-swappable container)"
+}
