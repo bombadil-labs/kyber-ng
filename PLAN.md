@@ -6,49 +6,53 @@ success criteria. Hermes owns updating this file; the coding agent does not over
 
 ---
 
-## 0. Next Ralph Loop: The Durable Store
+## 0. Next Ralph Loop: The Harness Core — production wire + supervision tree
 
-**Objective:** The store only learns — and it remembers across restarts. An append-only
-JSONL wire log (the pinned envelope, one JSON text per line) behind the door: every append
-verifies then merges AND persists; boot replays the log through the door (re-verify +
-re-merge, the `admit/2` shape) so a reopened store is provably the same ground.
+**Objective:** The running harness gets a real wire and a started door. T1 built the door,
+T2 made it durable — but the only envelope serializer lives in test/support (TestWire) and
+nothing boots the store at app start (mix.exs has no `mod:`). T3 closes both gaps; every
+downstream loop (plugins, federation, migration) stands on it.
 
-**Requirements:**
-1. `Kyber.Log` — the append-only file: `open/1`, `append/1` (one wire-envelope JSON text per
-   line), `stream/1` (lazy lines for replay). Torn-write tolerant: a partial final line is
-   reported, never fatal. Nothing is ever rewritten or deleted (spec/04-persistence.md §2).
-2. `Kyber.DurableStore` — the door on disk: `start_link(log_path)` replays the log through
-   `Kyber.Store.admit/2` (re-verify every signature, re-merge by union) into the in-memory
-   set; `append/1` = door + log write (verify → merge → persist, in that order); `set/0`
-   for reads. Reuses `Kyber.Store`'s door machinery — no second verification path.
-3. Replay integrity: a tampered line mid-log is refused and reported, never silently merged;
-   a torn final line is tolerated and reported; duplicates are no-ops (union).
-4. TDD; no Process.sleep; `mix format` clean.
+**Requirements (contract: .adlc/specs/T3.md):**
+1. `Kyber.Wire` — the production envelope serializer (stdlib JSON; the witness has none):
+   `envelope/1`, `encode/1` (tagged errors; non-string keys refused; NaN/Infinity
+   unrepresentable — finiteness holds), `decode/1`, `claims_json/1`. Round-trip AC:
+   encode→decode term-identical; envelope re-admits through `Kyber.Store.admit/2`.
+2. `Kyber.Application` — the OTP app: Supervisor starting `Kyber.DurableStore` with
+   `Application.get_env(:kyber, :log_path)` (default `~/.kyber/store.jsonl`, runtime
+   artifact). mix.exs gains `mod:` (a deliberate scoped amendment — mix.exs leaves this
+   ticket's rails; deps/ + spec/ + SPEC.md + PLAN.md stay frozen). `Kyber.Store`'s T1
+   Agent is NOT started — DurableStore is THE running store (T2 topology pin).
+3. TDD; no Process.sleep; format clean.
 
 **Success Criteria (the gate):**
 - `mix test` green; `! grep -r "Process.sleep" test/`; `mix format --check-formatted` exits 0.
-- A delta survives a restart: open → append → stop → reopen → the delta is present and its
-  signature re-verifies (replay is re-verify + re-merge, AC-proven).
-- A torn final line (simulated truncated write) is tolerated: earlier lines replay, the torn
-  line is reported, the store serves.
-- A tampered line mid-log is refused and reported; the store serves the honest remainder.
-- Replay is order-independent: the same log lines in shuffled order converge to the same set
-  (union — the CRDT stays honest on disk).
+- Wire round-trip: encode/decode of a signed `message_received` envelope is term-identical
+  and re-admits via the door (AC2).
+- The app boots a registered `Kyber.DurableStore` at the configured log path; an append
+  persists and replays across a supervised restart (AC4).
+- `Process.whereis(Kyber.Store)` is nil after boot — exactly one running store (AC5).
+- `git diff main -- mix.exs` shows only the `mod:` addition; deps/ and spec/ untouched (AC6).
 
-**Out of scope (later loops):** sqlite/packs backends, federation, the reactor, the Discord
-plugin, migration, vault-as-view.
+**Out of scope (later loops):** the Discord plugin, the reactor/subscriptions (gated on
+substrate L4), federation, migration, vault-as-view, sqlite/packs backends.
 
 ---
 
 ## 1. Current State (What Works)
 
 - Founding spec landed (SPEC.md + spec/00–07); repo runs ADLC (`.adlc/` contract).
-- **Loop 1 COMPLETE (T1, archived)** — the unified event layer: `Kyber.Keys` (0600 atomic
-  keyring, KYBER_SEED import), `Kyber.Events` (five claim templates, exact §2 vocabulary,
-  D14 float timestamps), `Kyber.DeltaSet` (grow-only union), `Kyber.Store` (the door:
-  closed envelope → Profile parse → id recompute → D1 unsigned refusal → strict Ed25519 →
-  union). 41 tests, 0 failures; loam-compat proof byte-identical through real JSON text;
-  P1–P7 gates green, adversarial review 8/8 findings fixed.
+- **Loop 1 COMPLETE (T1, archived)** — the unified event layer: `Kyber.Keys`, `Kyber.Events`
+  (five claim templates, exact §2 vocabulary, D14 float timestamps), `Kyber.DeltaSet`
+  (grow-only union), `Kyber.Store` (the door: closed envelope → Profile parse → id recompute
+  → D1 unsigned refusal → strict Ed25519 → union). P1–P7 green; review 8/8 findings fixed.
+- **Loop 2 COMPLETE (T2, archived)** — the durable store: `Kyber.Log` (append-only JSONL
+  wire log, dumb serializer, non-string keys refused) + `Kyber.DurableStore` (THE running
+  store: boot replay through the door with exhaustive per-line classification,
+  write-ahead verify→persist→merge, `replay_report/0` with live `failed_appends`,
+  lazy-open first boot). 66 tests; P1–P7 green; review 4/4 findings fixed.
+- **Loop 3 (T3, in flight)** — the harness core: `Kyber.Wire` (production serializer) +
+  `Kyber.Application` (supervision tree, mix.exs `mod:`, DurableStore at app start).
 
 ## 2. Active Backlog
 
