@@ -18,34 +18,62 @@ proven: `moonshotai/kimi-k3`, `MOONSHOT_API_KEY`) — becomes a gather handler, 
 lives in the loop: event in → signed claim → model action → response claim → memory (the claims
 substrate IS the memory). The Discord transport later plugs in as just another handler.
 
-**Requirements (contract: .adlc/specs/T11.md):**
-1. `Kyber.Agent.LlmHandler` — an OpenAI-compatible streaming client (Moonshot base
+**Requirements (contract: .adlc/specs/T11.md — the full architecture: deltas-as-events,
+entities-as-resolutions, primitives-ride/composites-point, actors-bound-to-containers, schemas-as-deltas,
+memory-reified-to-markdown):**
+1. `Kyber.Agent.LlmHandler` — an OpenAI-compatible client (Moonshot base
    `https://api.moonshot.ai/v1`, key from env `MOONSHOT_API_KEY`, model `kimi-k3`, zero new deps —
    stdlib `:httpc`/`:ssl` like the rest of the repo; NO external HTTP lib) that implements the
    gather handler contract `(delta[]) -> delta[]` with REAL (non-deterministic) content.
-2. The handler claims the received claim's timestamp (T10's determinism pin, relaxed exactly as the
-   T10 amendment reserved: "a future LLM handler should claim `now`") — content-derived identity
-   keeps re-boot idempotence: re-fires produce byte-identical requests; the sink's content-address
-   dedup drops replayed outputs.
-3. The operational run (THE gate, Hermes-executed): boot the daemon on a tmp store/keyring; CLI
-   ingest a `message.received` claim whose content is a real question; the LLM handler fires, the
-   model's answer persists as `message.sent` (agent-signed, non-deterministic); the vault renders
-   the exchange; SIGTERM; re-boot; the exchange does NOT duplicate; the answer claim is still in
-   the store. Bounded explicit polling, never `Process.sleep`.
-4. A memory affordance proves itself: the handler's SECOND invocation is grounded in the FIRST
+2. The delta vocabulary (all pinned in the genesis schema set): `SubmittedPrompt` embeds
+   primitives (author-by-signature, timestamp, channel, prompt_text) + `sessionId`;
+   `InferenceRequested` embeds primitives and POINTS to `conversationRef` + `memoryPointers[]`
+   + `promptRef`; `ResponseDelta` points back to its request + the memory it used. No delta
+   embeds the conversation history (composites point). Crash-window safety is the pointer
+   guarantee: the store is immutable, so frozen pointers resolve identically on re-fire →
+   content-address dedup drops replays (the T10 lesson, reapplied).
+3. The intake takes DELTAS only — never resolved views. Entities (Prompt, Session, Memory)
+   exist by being referenced; resolution = gather hyperview → hyperschema → schema, time-versioned.
+4. Actors bound to containers: `Kyber.Agent.ContextBuilder` (session hyperview + window lens +
+   memory injection → emits one thin `InferenceRequested` per prompt), `Kyber.Agent.Engine`
+   (stateful: fires on requests, walks pointers, calls the model, emits `ResponseDelta` /
+   `ToolCall` mid-turn; in-flight turn state rehydrates from the chain), `Kyber.Agent.Memory`
+   (MemoryEntity resolution + markdown projector + edit watcher + L0/L1 tierer + trajectory
+   retriever), `Kyber.Schema` (schema container actor + genesis schema deltas; validate at
+   admission; codegen is derived convenience, never authority).
+5. The memory store round-trips through markdown (an Obsidian vault = the L2 tier, human-editable):
+   system memories derive from response deltas; HUMAN edits are observed by the watcher →
+   diff → attested `MemoryEdited` delta (`source: :human_edit`, old+new) → canon re-resolves.
+   Canon is a RESOLUTION, never a store; `provenance` (model|human|derived) weights retrieval
+   (human-canon authoritative, never auto-consolidated). The memory container is swappable
+   behind the same substrate (the A/B property). OpenViking's L0/L1/L2 tiering + filesystem-as-
+   projection (viking://) is the reference shape; ours derives from the delta substrate, not a
+   sidecar store.
+6. Tool chains are cascades of linked deltas (Prompt → ToolCall → ToolResult → … → Response),
+   emitted as they happen; rendering/visibility is a lens, not data.
+7. The operational run (THE gate, Hermes-executed): boot the daemon on a tmp store/keyring with
+   the LLM handler live; CLI ingest a `message.received` whose content is a real question; the
+   context builder fires, the model answers, the answer persists as `message.sent` (agent-signed,
+   non-deterministic); the vault renders the exchange; SIGTERM; re-boot; the exchange does NOT
+   duplicate; the answer claim is still in the store. Bounded explicit polling, never
+   `Process.sleep`.
+8. A memory affordance proves itself: the handler's SECOND invocation is grounded in the FIRST
    exchange — the model sees its own prior `message.sent` claims (the store as memory) and answers
    a follow-up that REQUIRES that memory ("what did I just say?"). verify: the second answer
    references the first exchange's content.
-5. No `Process.sleep`; rails (deps/, spec/, SPEC.md, mix.exs, config/) frozen; the real `~/.kyber`
+9. No `Process.sleep`; rails (deps/, spec/, SPEC.md, mix.exs, config/) frozen; the real `~/.kyber`
    never touched; format clean; warnings-as-errors clean. verify: the T9/T10 gate suite.
-6. Determinism harness: with the LLM path disabled (or a canned stub handler), the T10 deterministic
-   ack loop still works — the built-in loop is the fallback, not a casualty. verify: the T10
-   daemon/agent_loop tests stay green unchanged.
+10. Determinism harness: with the LLM path disabled (or a canned stub handler), the T10
+    deterministic ack loop still works — the built-in loop is the fallback, not a casualty.
+    verify: the T10 daemon/agent_loop tests stay green unchanged.
 
-**Success criteria (exact, testable):** (a) `mix test` green including new handler/smoke tests; (b)
-the AC7-style operational run above passes with a REAL Moonshot call (recorded as the loop's
+**Success criteria (exact, testable):** (a) `mix test` green including handler/engine/memory/schema
+tests; (b) the operational run (AC4) passes with a REAL Moonshot call (recorded as the loop's
 acceptance evidence); (c) the memory-grounding follow-up exchange passes; (d) re-boot idempotence
-holds with the LLM handler (no duplicate exchange); (e) the T10 deterministic tests untouched.
+holds with the LLM handler (no duplicate exchange, crash-window test included); (e) the memory
+store round-trips: system memory → markdown → human edit → `MemoryEdited` delta → re-resolved
+canon with `provenance: human`; (f) schema validation at admission (well-formed admitted,
+malformed refused, unknown admitted raw); (g) the T10 deterministic tests untouched.
 
 **The architectural model (user design, 2026-08-06 — the harness as a closed loop;
 refined the same day: deltas AS the events — one kind of thing in motion):** every
