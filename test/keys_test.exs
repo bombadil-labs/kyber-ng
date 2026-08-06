@@ -89,6 +89,54 @@ defmodule Kyber.KeysTest do
     end
   end
 
+  describe "load_human_seed/1" do
+    test "reads back the imported seed", %{home: home} do
+      assert :ok = Keys.import_human_seed(@seed_hex, home)
+      assert {:ok, @seed_hex} = Keys.load_human_seed(home)
+    end
+
+    test "trims a trailing newline from the file", %{home: home} do
+      assert :ok = Keys.import_human_seed(@seed_hex, home)
+      File.write!(Path.join(home, "human.seed"), @seed_hex <> "\n")
+      assert {:ok, @seed_hex} = Keys.load_human_seed(home)
+    end
+
+    test "missing dir -> {:keyring_dir_missing, path}; dir present but no seed -> :no_human_seed",
+         %{home: home} do
+      missing = Path.join(home, "no-such-dir")
+      assert {:error, {:keyring_dir_missing, ^missing}} = Keys.load_human_seed(missing)
+
+      empty = Path.join(home, "empty")
+      File.mkdir_p!(empty)
+      assert {:error, :no_human_seed} = Keys.load_human_seed(empty)
+    end
+
+    test "rejects a malformed seed file", %{home: home} do
+      File.mkdir_p!(home)
+      File.write!(Path.join(home, "human.seed"), "not-hex")
+      assert {:error, :invalid_seed} = Keys.load_human_seed(home)
+    end
+
+    test "NO env fallback and NO write-on-load (rev 2: import_human_seed/2 is the only path)",
+         %{home: home} do
+      System.put_env("KYBER_SEED", @seed_hex)
+      on_exit(fn -> System.delete_env("KYBER_SEED") end)
+
+      File.mkdir_p!(home)
+      file = Path.join(home, "human.seed")
+      refute File.exists?(file)
+
+      # KYBER_SEED must NOT import and the file must NOT be written on load
+      assert {:error, :no_human_seed} = Keys.load_human_seed(home)
+      refute File.exists?(file)
+
+      # a successful load is read-only too: the file content is untouched
+      assert :ok = Keys.import_human_seed(@other_seed_hex, home)
+      assert {:ok, @other_seed_hex} = Keys.load_human_seed(home)
+      assert File.read!(file) == @other_seed_hex
+    end
+  end
+
   describe "author_for_seed/1" do
     test "derives the ed25519 author id from the seed" do
       seed = Base.decode16!(@seed_hex, case: :mixed)

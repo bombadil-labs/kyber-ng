@@ -78,6 +78,27 @@ defmodule Kyber.Keys do
     end
   end
 
+  @doc """
+  Load the human seed: read `home_dir/human.seed` (0600). Read-only — NO env
+  fallback and NO write-on-load (rev 2, identity-confusion hazard): unlike
+  `load_agent_seed/1` it never consults `KYBER_SEED`, and
+  `import_human_seed/2` is the ONLY import path for the human identity.
+  Missing keyring dir -> `{:error, {:keyring_dir_missing, home_dir}}`;
+  dir present but seed absent -> `{:error, :no_human_seed}` (distinct, AC6).
+  """
+  @spec load_human_seed(Path.t()) :: {:ok, String.t()} | {:error, term()}
+  def load_human_seed(home_dir) do
+    if File.dir?(home_dir) do
+      case read_secret(human_seed_path(home_dir)) do
+        {:ok, _seed} = ok -> ok
+        {:error, :enoent} -> {:error, :no_human_seed}
+        {:error, _reason} = err -> err
+      end
+    else
+      {:error, {:keyring_dir_missing, home_dir}}
+    end
+  end
+
   @doc "Derive the author id `ed25519:<hex>` from a seed (pure, via `Rhizomatic.Ed25519`)."
   @spec author_for_seed(String.t()) :: String.t()
   def author_for_seed(seed_hex) do

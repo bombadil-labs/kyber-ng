@@ -3,8 +3,11 @@ import Config
 # The durable store's default log path (T3): on a fresh account the parent
 # dir does not exist yet — Kyber.Application mkdir_p's it at boot, so the
 # first append lands instead of returning {:error, :persist_failed} (AC8).
-# config/test.exs overrides this to a tmp dir so the suite never touches the
-# user's real store.
+# The keyring dir (T4) defaults to the same home (.kyber) — the harness has
+# NO runtime keyring default; the caller's arg is the only source (the
+# config value is for App env, overridden to a tmp dir in test.exs).
+# config/test.exs overrides both to tmp dirs so the suite never touches the
+# user's real store or keyring.
 # P5 guard (low finding 2): System.user_home() returns "" when HOME is unset —
 # Path.join("", ".kyber/store.jsonl") would be a CWD-relative path, silently
 # placing the real store in the working directory. Refuse loudly instead.
@@ -16,7 +19,9 @@ if home == "" do
           "absolute path explicitly."
 end
 
-config :kyber, log_path: Path.join(home, ".kyber/store.jsonl")
+config :kyber,
+  log_path: Path.join(home, ".kyber/store.jsonl"),
+  keyring_dir: Path.join(home, ".kyber")
 
 # env-specific config (test.exs overrides log_path to a tmp dir). Imported only
 # for :test so dev/prod runs need no extra config files (T3 touches config/
