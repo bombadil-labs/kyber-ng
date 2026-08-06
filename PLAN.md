@@ -6,37 +6,36 @@ success criteria. Hermes owns updating this file; the coding agent does not over
 
 ---
 
-## 0. Next Ralph Loop: Federation — the wire speaks to itself (export/import)
+## 0. Next Ralph Loop: Migration — the legacy log becomes claims (spec/07)
 
-**Objective:** A claim born on one kyber-ng instance survives a journey to another,
-byte-identical, re-verified by the witness on arrival. T1–T4 built the claim lifecycle
-(emit → sign → persist → view); T5 builds the exchange — and the import machinery IS the
-migration path (spec/07's legacy-log unification will reuse it). The substrate L4 reactor
-gates the Discord/plugin side, not claim exchange: two stores exchanging wire JSONL is
-testable right now with tmp paths.
+**Objective:** The ORIGINAL mission lands: kyber's pre-rhizomatic delta log
+(`deltas.jsonl` in the legacy repo — `%Kyber.Delta{id, ts, origin, kind, payload,
+parent_id}` per line, Jason-encoded) is unified with rhizomatic/loam deltas. T5's
+promise pays off: the legacy log is TRANSLATED to wire text (each legacy delta → a claim
+signed by the ARCHIVIST — the agent key attests "this delta existed"; the legacy identity
+lives in the claim's pointers) and fed through `Federation.import/1` — the SAME door,
+the SAME dedup (re-migration is idempotent), the SAME reporting. No fabricated
+signatures: the archivist signature is the harness vouching for its own history.
 
-**Requirements (contract: .adlc/specs/T5.md):**
-1. `Kyber.Federation.export/0` — the store's delta set as wire JSONL text (one pinned
-   envelope per line, `Wire.encode`, deterministic order), for transport/backup.
-2. `Kyber.Federation.import/1` — wire JSONL text → stream each line through
-   `Wire.decode` → `DurableStore.append` (the door re-verifies EVERY signature; union
-   dedups; refused/torn lines are reported, never fatal — the T2 replay policy, reused).
-3. `Kyber.Federation.import_report/0` → `%{imported: n, refused: [line_nos], skipped: n}`
-   (a pinned observable, mirroring `replay_report`).
-4. Cross-instance AC: instance A ingests (T4 Harness) → export → instance B imports →
-   the claim re-verifies (door admit), is present, view-identical. Byte-identical round
-   trip: export(A) imported into B exports byte-equal to A's export (union of the same
-   claims).
+**Requirements (contract: .adlc/specs/T6.md):**
+1. `Kyber.Migration.migrate/2` (legacy_path, keyring_dir) — lazy-read the legacy
+   deltas.jsonl, translate each line to an archivist-signed wire envelope, import via
+   `Federation.import/1`; returns a migration_report (import_report + legacy-side
+   refusals). Store-down guard (T5 shape).
+2. `Kyber.Migration.translate_line/1` — PURE: a legacy delta map → `{claims, sig}`
+   (agent-key-signed, legacy identity in pointers); untranslatable → tagged refusal.
+3. A byte-realistic fixture (the legacy `to_map` shape) + idempotency AC (migrate twice →
+   all skipped).
 
 **Success Criteria (the gate):**
 - `mix test` green; `! grep -r "Process.sleep" test/`; `mix format --check-formatted` exits 0.
-- A cross-instance round trip proves signature re-verification + dedup (import twice → one).
-- Torn/refused lines in an import are reported, never fatal; valid lines still land.
-- import_report shapes are pinned and asserted.
+- A fixture legacy log migrates: claims in the store, archivist-signed, door-re-verifiable,
+  idempotent on re-run.
+- Malformed legacy lines are reported with line numbers, never fatal; valid lines still land.
 
-**Out of scope (later loops):** the Discord transport/adapter (gated on substrate L4),
-migration of the LEGACY kyber log (spec/07 — reuses import/1), the reactor/subscriptions,
-vault-as-view, sqlite/packs backends.
+**Out of scope (later loops):** legacy SEMANTIC interpretation (memory/insight kinds →
+rich claims — later loops), the Discord transport (gated on substrate L4), federation
+peers, vault-as-view, sqlite/packs backends, the reactor/subscriptions.
 
 ---
 
@@ -62,8 +61,12 @@ vault-as-view, sqlite/packs backends.
   closed source contract + total never-crash) + `Keys.load_human_seed` (no env fallback)
   + keyring_dir config. 99 tests; P1–P7 green; review 3/3 lows fixed (TOCTOU, non-binary
   pin, precedence pin).
-- **Loop 5 (T5, in flight)** — federation: `Kyber.Federation` export/import (wire JSONL
-  exchange, door re-verification, dedup, import_report observable).
+- **Loop 5 COMPLETE (T5, archived)** — federation: `Kyber.Federation` export/import
+  (deterministic wire JSONL, door re-verification, dedup, import_report observable;
+  total never-crash — every stateful call exit-protected). 108 tests; P1–P7 green;
+  review 4/4 fixed (1 medium: bare-call crash class eliminated).
+- **Loop 6 (T6, in flight)** — migration: `Kyber.Migration` legacy deltas.jsonl →
+  archivist-signed claims → `Federation.import` (the original unification mission).
 
 ## 2. Active Backlog
 
