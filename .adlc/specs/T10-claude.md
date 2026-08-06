@@ -68,7 +68,7 @@ re-boots to prove idempotence.
   handler's own outputs are routed like any claim but a handler cannot be its own
   subscriber... the agent loop's `message.sent` output is a claim the 
   `message.received` handler does NOT match — role-based routing makes this
-  structural). Verification: a test ingests a claim, asserts the handler fired and
+  structural). verify: a test ingests a claim, asserts the handler fired and
   the cursor advanced, then ingests a second claim the daemon itself wrote and
   asserts it did NOT re-fire the producing handler.
 - **AC3 — The dispatch cursor persists (re-boot idempotence):** after a kill +
@@ -103,7 +103,7 @@ re-boots to prove idempotence.
   store by default (persist-everything). A shape can be tuned to pulse-only (the
   knob is a daemon option or config — one mechanism shape tuned in the smoke to
   prove the knob turns). The knob never weakens the door: a malformed/unsigned
-  claim is refused, not pulsed. Verification: a smoke test boots the daemon with
+  claim is refused, not pulsed. verify: a smoke test boots the daemon with
   one mechanism shape tuned to pulse-only, pushes that shape, and asserts the
   handler fired while no claim of that shape landed in the store; an unsigned
   claim is refused by the door and never pulses.
@@ -113,7 +113,7 @@ re-boots to prove idempotence.
   sleep): the claim lands, the handler fires, a `message.sent` response persists,
   the vault renders the conversation (view/grow); SIGTERM; re-boot; two ticks; no
   re-fire; the vault still shows exactly one exchange. This run is recorded as the
-  loop's acceptance evidence (the operational-run gate record), not just prose. Verification: the AC7 run IS the
+  loop's acceptance evidence (the operational-run gate record), not just prose. verify: the AC7 run IS the
   verification — the recorded operational run (bounded explicit polling, never
   sleep), executed by Hermes against a tmp store/keyring, with the assertions
   above (land → fire → persist → vault → kill → re-boot → no re-fire).
