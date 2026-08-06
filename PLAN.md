@@ -39,20 +39,28 @@ another handler (the deployment, unblocked without the substrate L4 reactor).
    (the handler fired) → assert the vault renders both → stop the daemon → re-boot →
    the loop continues (replay-idempotent: the already-handled claim is not re-fired).
 
-**The architectural model (user design, 2026-08-06 — the harness as a closed loop):**
-every operation in the harness generates a delta and writes it to the intake; some are
-persisted (claims — memory), some are ephemeral (pulses — side-effect carriers only,
-invoked for their effects, never stored). The intake is therefore TWO surfaces: the
-log (persisted claims — the door admits only these) and the pulse bus (ephemeral — the
-daemon consumes both). Agent behavior is handlers over the event stream: straight
-Elixir functions (the Gather — T10's provisional mechanism, spec/04 §6), a reactor on
-the store (substrate L4 — declarative functions firing when their topological inputs
-saturate), or a hybrid (gather for routing, reactor for composition). The T10 handler
-contract is a PURE FUNCTION + a DECLARED INPUT SHAPE (matching the reactor's future
-{inputs, function} declaration, so the L4 upgrade is a drop-in). The gather is a LENS
-WITH STATE: a dispatch cursor into the log (replay never re-fires; pulses fire once by
-construction). The daemon's own operations follow the line: the OUTCOME persists (the
-response claim), the MECHANISM never does (a handler run is not a claim).
+**The architectural model (user design, 2026-08-06 — the harness as a closed loop;
+refined the same day: deltas AS the events — one kind of thing in motion):** every
+operation in the harness generates a delta and writes it to the intake. The
+persisted/ephemeral split is NOT a type distinction — it is a property of REDUCTION:
+deltas are the events that pass through the pulse, and whether a delta is memory
+(admitted to the log — the vault, the store, the peer exchange) or a pulse
+(side-effect carrier — fires handlers, dropped by default) is decided by ADMISSION
+POLICY at each sink, never baked into the object. One object everywhere: the wire,
+the intake, the pulse, the log, the vault, the peer exchange all speak the same
+signed-delta language; a handler receives a delta whether it arrived live, was
+replayed, or came over TCP (promotion of a pulse to memory is free — same object,
+admission is a policy decision; the reject-never-repair door applies to the ephemeral
+channel too). The pulse IS the log in motion; the log IS the pulse at rest — replay
+and live delivery are the same mechanism, so the gather's dispatch cursor prevents
+re-running side effects (handlers are pure functions of their inputs — re-delivery is
+harmless by construction), never "re-firing events." D5 is re-read accordingly:
+pulses are delta-SHAPED; "pulses never reach the delta layer" holds by admission
+policy (role-based: memory-ish roles admit — message.*, session, insight; mechanism
+roles pulse-and-drop — watcher.*, cron.*, handler.*), the door's verification is the
+final gate, and the vault only renders the store so mechanism noise never reaches the
+human. (The D5 re-read is a deliberate spec amendment, recorded when T10's contract
+is written.)
 
 **Success Criteria (the gate):**
 - `mix test` green; `! grep -r "Process.sleep" test/`; `mix format --check-formatted` exits 0.
