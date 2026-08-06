@@ -6,37 +6,39 @@ success criteria. Hermes owns updating this file; the coding agent does not over
 
 ---
 
-## 0. Next Ralph Loop: The Vault-as-View — claims become a human-navigable memory (the lens)
+## 0. Next Ralph Loop: The Operator Surface — a CLI for the whole stack (escript)
 
-**Objective:** The harness's human-facing memory. Legacy kyber's core value was "Memory
-isn't a database schema; it's a markdown file a human can read and edit in Obsidian."
-Kyber-ng's answer: the claims store is the truth, and the vault is a LENS over it —
-`Kyber.Vault` materializes the store's claims as an Obsidian-compatible markdown vault
-(one file per claim, `claim:<id>.md`, YAML frontmatter with author/timestamp/pointers,
-body = the content pointer), deterministically rendered, idempotently refreshed (a
-re-render never duplicates or orphans files — the cap is a lens, never a store property).
-Nothing is deleted from the store; the vault is derived state that can be rebuilt from
-claims alone (a full re-render of the same store yields byte-identical files).
+**Objective:** Every loop so far delivered MODULE APIs. T8 gives the harness a FACE: a
+`kyber` escript (stdlib Mix escript — zero new deps) driving the full stack:
+`view`, `ingest <source.json>`, `render <vault_dir>`, `refresh <vault_dir>`,
+`export`, `import <wire.jsonl>`, `migrate <legacy.jsonl>`. Tagged errors printed to
+stderr with pinned exit codes (0 ok / 1 operational error — never a crash stacktrace);
+store-down answers a clean message. The escript config is a ONE-TIME mix.exs stanza
+(pinned: the mix.exs diff for T8 is EXACTLY the escript stanza — the rail amendment is
+deliberate, additive, and zero-dependency). Every subcommand is exercised end-to-end
+against a tmp store in tests (the subcommand dispatch is a pure-ish function tested
+directly; the escript entrypoint is a thin wrapper).
 
-**Requirements (contract: .adlc/specs/T7.md):**
-1. `Kyber.Vault.render/1` (vault_dir) — claims → markdown files; store-down guard (T5
-   shape); deterministic (same store → byte-identical files, sorted, no timestamps in
-   content); frontmatter pinned (id, author, timestamp, pointers, role).
-2. `Kyber.Vault.refresh/1` — idempotent: re-render of the same store leaves every file
-   byte-identical (no churn, no duplicates, no orphans); a claim removed from the store
-   (impossible — the store only learns) or a foreign file in the vault dir is left
-   untouched (the lens never deletes).
-3. Obsidian compatibility: `.md` files with YAML frontmatter, `[[wikilinks]]` between
-   claims that reference each other (the entity pointers), readable by Obsidian.
+**Requirements (contract: .adlc/specs/T8.md):**
+1. `Kyber.CLI` — escript main_module: `main/1` parses argv → dispatches; each command
+   returns `{status, message}` → `IO.puts` + `System.halt(code)`; every failure path is
+   a tagged tuple printed as a clean one-liner, never a crash.
+2. Subcommands (each with pinned flags): `view` (sorted claims, one per line — the
+   harness's view), `ingest <file>` (the T4 source shape from a JSON file; keyring from
+   `--keyring <dir>`), `render <dir>` / `refresh <dir>` (the vault), `export` /
+   `import <file>` (federation), `migrate <legacy>` (the T6 archivist).
+3. `mix escript.build` produces a working `kyber` binary; the mix.exs diff is pinned to
+   the escript stanza alone.
 
 **Success Criteria (the gate):**
 - `mix test` green; `! grep -r "Process.sleep" test/`; `mix format --check-formatted` exits 0.
-- Render → refresh: byte-identical files, zero churn; the vault rebuilds identically from
-  a cold store replay.
-- The store-down case answers a tagged tuple, never a crash.
+- `mix escript.build` + a smoke run of every subcommand against a tmp store (asserted
+  exit codes + output shapes).
+- A store-down subcommand prints the clean tagged message and exits non-zero.
 
 **Out of scope (later loops):** the Discord transport (gated on substrate L4), federation
-peers, legacy semantic interpretation, sqlite/packs backends, the reactor/subscriptions.
+peers (network transport), legacy semantic interpretation, sqlite/packs backends, the
+reactor/subscriptions, vault-to-store writes.
 
 ---
 
@@ -70,8 +72,14 @@ peers, legacy semantic interpretation, sqlite/packs backends, the reactor/subscr
   legacy deltas.jsonl → archivist-signed claims → `Federation.import` (unified with
   rhizomatic/loam deltas; value-type validation — no fabricated attestations). 123 tests;
   P1–P7 green; hollow-test 12 killed (strongest of the campaign); review 3/3 fixed.
-- **Loop 7 (T7, in flight)** — the vault-as-view: `Kyber.Vault` claims → Obsidian
-  markdown (deterministic render, idempotent refresh, wikilinks; the cap is a lens).
+- **Loop 7 COMPLETE (T7, archived)** — the vault-as-view: `Kyber.Vault` claims →
+  Obsidian markdown (byte-exact golden literal, compare-then-write zero churn,
+  resolving delta wikilinks, overwritten observable; NTFS-safe filenames). 132 tests;
+  P1–P7 green; hollow 4 killed; review 3/3 fixed (2 medium: golden tautology,
+  absent-ref resolution).
+- **Loop 8 (T8, in flight)** — the operator surface: `kyber` escript CLI driving the
+  whole stack (view/ingest/render/refresh/export/import/migrate; pinned exit codes;
+  one-time mix.exs escript stanza).
 
 ## 2. Active Backlog
 
