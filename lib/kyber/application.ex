@@ -34,7 +34,11 @@ defmodule Kyber.Application do
             restart: :permanent
           }
         ],
-        strategy: :one_for_one
+        strategy: :one_for_one,
+        # named so a CLI-started `Kyber.Daemon` can link to the app's top
+        # supervisor: SIGTERM's init:stop takes the supervisor down, and the
+        # link turns that into the daemon's clean shutdown (lock release)
+        name: Kyber.Supervisor
       )
     end
   end

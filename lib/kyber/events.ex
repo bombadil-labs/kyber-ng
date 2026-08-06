@@ -139,6 +139,31 @@ defmodule Kyber.Events do
     end
   end
 
+  @doc """
+  `daemon.checkpoint` — the dispatch cursor as data (T10, AC3). Author: the
+  daemon's agent key. Pointers: checkpoint (the daemon's cursor entity) /
+  cursor (the numeric position). The store is the cursor's only home — a
+  re-boot resumes from the latest checkpoint, never from memory alone.
+  """
+  @spec daemon_checkpoint(String.t(), number(), String.t(), non_neg_integer()) ::
+          {:ok, signed()} | {:error, term()}
+  def daemon_checkpoint(agent_seed_hex, ts, daemon_id, cursor)
+      when is_integer(cursor) and cursor >= 0 do
+    with {:ok, ts} <- timestamp(ts),
+         {:ok, author} <- author_for(agent_seed_hex) do
+      claims = %{
+        timestamp: ts,
+        author: author,
+        pointers: [
+          %{role: "checkpoint", target: {:entity, daemon_id, "cursor"}},
+          %{role: "cursor", target: {:number, cursor * 1.0}}
+        ]
+      }
+
+      signed(claims, agent_seed_hex)
+    end
+  end
+
   # ---------------------------------------------------------------- helpers
 
   # validate at the boundary, then sign: reject, never repair

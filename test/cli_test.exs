@@ -362,6 +362,87 @@ defmodule Kyber.CLITest do
     assert :ok = Kyber.Peer.stop(pid)
   end
 
+  # ------------------------------------------------------------ T10 daemon
+
+  test "T10 AC8: daemon usage errors are exit-2 shapes (never a boot side effect)" do
+    assert {:error, :usage, usage} = CLI.run(["daemon"])
+    assert usage =~ "daemon"
+    assert {:error, :usage, _usage} = CLI.run(["daemon", "--keyring"])
+    assert {:error, :usage, _usage} = CLI.run(["daemon", "--bogus", "x"])
+    assert {:error, :usage, _usage} = CLI.run(["daemon", "--keyring", "a", "extra"])
+  end
+
+  test "T10 AC8: daemon boots on the app's log, refuses a second instance, stops cleanly",
+       %{keyring_dir: keyring_dir, log_path: log_path} do
+    assert {:ok, {:block, line, pid}} = CLI.run(["daemon", "--keyring", keyring_dir])
+    assert line == "daemon running on #{log_path}"
+    assert Process.alive?(pid)
+    assert File.exists?(log_path <> ".daemon")
+
+    # a second invocation on the SAME log -> the clean one-liner (exit 1 shape)
+    assert {:error, message} = CLI.run(["daemon", "--keyring", keyring_dir])
+    assert message == "daemon already running on #{log_path}"
+
+    assert :ok = GenServer.stop(pid)
+    refute File.exists?(log_path <> ".daemon")
+  end
+
+  test "T10 AC8: the CLI-started daemon closes the loop — ingest lands, ack persists",
+       %{keyring_dir: keyring_dir, log_path: log_path, fixture_dir: fixture_dir} do
+    assert {:ok, {:block, _line, pid}} = CLI.run(["daemon", "--keyring", keyring_dir])
+
+    source = write_source!(fixture_dir, "daemon-source.json", %{"message_id" => "m-cli-daemon"})
+
+    assert {:ok, received_id} = CLI.run(["ingest", source, "--keyring", keyring_dir])
+
+    # bounded explicit polling: the ack lands
+    deadline = System.monotonic_time(:millisecond) + 2_000
+
+    ack =
+      Enum.reduce_while(1..200, nil, fn _, _acc ->
+        found =
+          Kyber.Harness.view()
+          |> Enum.find(fn claims ->
+            Enum.any?(claims.pointers, fn
+              %{role: "content", target: {:string, s}} -> s == "ack " <> received_id
+              _pointer -> false
+            end)
+          end)
+
+        cond do
+          found != nil ->
+            {:halt, found}
+
+          System.monotonic_time(:millisecond) > deadline ->
+            {:halt, nil}
+
+          true ->
+            receive do
+            after
+              10 -> {:cont, nil}
+            end
+        end
+      end)
+
+    assert ack != nil, "the daemon never answered the ingested message"
+
+    assert Enum.any?(ack.pointers, fn
+             %{role: "caused_by", target: {:delta, hex, _ctx}} -> hex == received_id
+             _pointer -> false
+           end)
+
+    assert :ok = GenServer.stop(pid)
+  end
+
+  test "T10 AC8: daemon with a keyring missing the agent seed -> operational one-liner",
+       %{fixture_dir: fixture_dir} do
+    empty_keyring = Path.join(fixture_dir, "seedless-keyring")
+    File.mkdir_p!(empty_keyring)
+
+    assert {:error, message} = CLI.run(["daemon", "--keyring", empty_keyring])
+    assert message == "no agent seed"
+  end
+
   # ------------------------------------------------------------------ AC8
 
   # (AC8 is a repo-wide grep for the sleep primitive across test/ — no

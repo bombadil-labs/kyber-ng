@@ -138,7 +138,15 @@ defmodule Kyber.PeerTest do
              :gen_tcp.connect(~c"localhost", port, [:binary, packet: :line, active: false])
 
     chunk = String.duplicate("x", 4096) <> "\n"
-    for _ <- 1..512, do: :ok = :gen_tcp.send(sock, chunk)
+
+    # the peer closes the socket the moment the cap trips — a send failing
+    # with :closed mid-loop IS the refusal in motion, not a test error
+    Enum.reduce_while(1..512, :ok, fn _, _acc ->
+      case :gen_tcp.send(sock, chunk) do
+        :ok -> {:cont, :ok}
+        {:error, :closed} -> {:halt, :closed}
+      end
+    end)
 
     assert {:ok, "err frame_too_large\n"} = :gen_tcp.recv(sock, 0, 15_000)
     assert :ok = :gen_tcp.close(sock)

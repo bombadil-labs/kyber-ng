@@ -44,6 +44,9 @@ defmodule Kyber.CLI do
     migrate <legacy.jsonl> --keyring <dir> Migration.migrate; prints the migration report; exit 0
     serve --port <N>                       start a federation peer; prints "listening on <port>"; then blocks
     send <host> <port>                     Federation.export -> the peer; prints its status line; exit 0
+    daemon --keyring <dir>                 the operational harness: watch the log, close the loop;
+                                           prints "daemon running on <log>"; then blocks (SIGTERM stops).
+                                           REQUIRES --log (the daemon never touches the real ~/.kyber)
     help | (no args)                       this text; exit 0
     <unknown> | help <extra>               this text; exit 2
   """
@@ -100,15 +103,31 @@ defmodule Kyber.CLI do
 
       {:ok, rest} ->
         case check_command(rest) do
-          {:usage, exit_code} -> {:usage, exit_code}
-          :run -> {:ok, rest, extract_log_path(argv)}
+          {:usage, exit_code} ->
+            {:usage, exit_code}
+
+          :run ->
+            log_path = extract_log_path(argv)
+
+            if daemon_without_log?(rest, log_path) do
+              {:usage, 2}
+            else
+              {:ok, rest, log_path}
+            end
         end
     end
   end
 
   defp check_command([]), do: {:usage, 0}
   defp check_command(["help"]), do: {:usage, 0}
-  defp check_command(["help" | _rest]), do: {:error, :usage}
+  # rev-2 shipped this as {:error, :usage}, which CRASHED preflight's case
+  # (a CaseClauseError on `kyber help extra`) — the pinned shape is {:usage, 2}
+  defp check_command(["help" | _rest]), do: {:usage, 2}
+  # the daemon's argv shape is validated PRE-BOOT (AC8: a usage-error path
+  # never boots); and it REQUIRES --log — without one the boot would land on
+  # the baked-in default, the real ~/.kyber store the daemon must never touch
+  defp check_command(["daemon", "--keyring", dir]) when is_binary(dir), do: :run
+  defp check_command(["daemon" | _malformed]), do: {:usage, 2}
   defp check_command(_command), do: :run
 
   defp boot_and_run(command_argv, log_path) do
@@ -143,6 +162,9 @@ defmodule Kyber.CLI do
     end
   end
 
+  defp daemon_without_log?(["daemon" | _rest], nil), do: true
+  defp daemon_without_log?(_command, _log_path), do: false
+
   # a bare "--log <path>" PREFIX is the only shape main/1 reads for the boot
   # side effect; anything else (missing value, --log elsewhere) is left for
   # run/1's own parsing to reject as a usage error — single source of truth
@@ -155,6 +177,14 @@ defmodule Kyber.CLI do
   defp print_and_halt({:ok, {:serve, line, _pid}}) do
     IO.puts(line)
     block_forever()
+  end
+
+  # the daemon's block shape (T10): print the marker, then block on SIGTERM
+  # — see block_until_sigterm/1 for why the escript cannot use the VM's
+  # default signal handling here
+  defp print_and_halt({:ok, {:block, line, pid}}) do
+    IO.puts(line)
+    block_until_sigterm(pid)
   end
 
   defp print_and_halt({:ok, message}) do
@@ -175,6 +205,35 @@ defmodule Kyber.CLI do
   defp block_forever do
     receive do
       :never -> :ok
+    end
+  end
+
+  # SIGTERM discipline for `kyber daemon` (AC1): the escript's OWN shutdown
+  # path (Kernel.CLI.at_exit -> elixir_config) races the VM's init:stop and
+  # exits 127 when main is still blocked at the end (observed, not
+  # theoretical); and :os.set_signal(:sigterm, :handle) does NOT reroute the
+  # signal under the Elixir runtime (the default handler still fires —
+  # verified empirically on OTP 27). So main MONITORS the daemon instead:
+  # SIGTERM -> init:stop -> the app stops -> the supervisor link turns that
+  # into the daemon's clean terminate (the lock releases BEFORE the process
+  # exits) -> the DOWN lands here -> System.halt(0) exits cleanly no matter
+  # how far init:stop has gotten (System.halt(0) after :elixir has stopped
+  # still exits 0 — verified empirically). A daemon that dies on its own
+  # (crash) exits 1 — an operational failure, never a stacktrace.
+  # trap, so a non-normal daemon exit arrives as a message instead of
+  # killing main mid-shutdown (the daemon maps app-shutdown stops to
+  # :normal, so on SIGTERM this is the clean path); the monitor is the
+  # backstop for a daemon we are somehow no longer linked to
+  defp block_until_sigterm(daemon_pid) do
+    Process.flag(:trap_exit, true)
+    ref = Process.monitor(daemon_pid)
+
+    receive do
+      {:EXIT, ^daemon_pid, reason} ->
+        System.halt(if reason == :normal, do: 0, else: 1)
+
+      {:DOWN, ^ref, :process, ^daemon_pid, reason} ->
+        System.halt(if reason in [:normal, :shutdown], do: 0, else: 1)
     end
   end
 
@@ -240,6 +299,8 @@ defmodule Kyber.CLI do
     do: Migration.migrate(legacy_path, dir)
 
   defp dispatch(["send", host, port_str]), do: cmd_send(host, port_str)
+  defp dispatch(["daemon", "--keyring", dir]), do: cmd_daemon(dir)
+  defp dispatch(["daemon" | _rest]), do: {:error, :usage, @usage}
 
   defp dispatch(_other), do: {:error, :usage, @usage}
 
@@ -267,6 +328,40 @@ defmodule Kyber.CLI do
 
       :error ->
         {:error, :usage, @usage}
+    end
+  end
+
+  # ----------------------------------------------------------------- daemon
+
+  @doc """
+  Boot the operational harness (T10, AC1/AC8) on the app's configured log
+  and return the BLOCK marker: `{:ok, {:block, "daemon running on <log>",
+  pid}}` — `main/1` prints the marker and blocks; `run/1` stays pure (no
+  print, no halt). A second daemon on the same log is the pinned one-liner
+  refusal ("daemon already running on <log>", exit 1); a keyring without an
+  agent seed is the "no agent seed" one-liner. The app must already be
+  booted (run/1's contract) — the daemon attaches to the running store.
+  """
+  @spec daemon_start(keyring: String.t()) ::
+          {:ok, {:block, String.t(), pid()}}
+          | {:error, String.t()}
+          | {:error, :usage, String.t()}
+  def daemon_start(opts) do
+    keyring = Keyword.fetch!(opts, :keyring)
+    log = Application.get_env(:kyber, :log_path)
+
+    case Kyber.Daemon.start_link(log: log, keyring: keyring) do
+      {:ok, pid} -> {:ok, {:block, "daemon running on #{log}", pid}}
+      {:error, {:already_running, path}} -> {:error, {:daemon_already_running, path}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp cmd_daemon(keyring_dir) do
+    if Process.whereis(DurableStore) do
+      daemon_start(keyring: keyring_dir)
+    else
+      {:error, :store_not_running}
     end
   end
 
@@ -409,6 +504,7 @@ defmodule Kyber.CLI do
   # total coverage should Federation's contract ever route :malformed_text
   # through this call.
   defp format_error(:malformed_text), do: "malformed wire"
+  defp format_error({:daemon_already_running, path}), do: "daemon already running on #{path}"
   defp format_error({:peer_unreachable, host, port}), do: "peer unreachable: #{host} #{port}"
   defp format_error({:peer_timeout, host, port}), do: "peer timeout: #{host} #{port}"
   defp format_error({:peer_closed, host, port}), do: "peer closed: #{host} #{port}"

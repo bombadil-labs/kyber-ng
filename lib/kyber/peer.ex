@@ -241,12 +241,30 @@ defmodule Kyber.Peer do
         :gen_tcp.close(socket)
 
       :too_large ->
-        # P5 finding 1: a frame over the cap is refused with a clean status
+        # P5 finding 1: a frame over the cap is refused with a clean status.
+        # The status must actually REACH the client: the socket's receive
+        # buffer holds the client's unread stream at this point, and a bare
+        # close(2) with unread data answers with a RST that can eat the
+        # status line in flight. shutdown(:write) flushes the status and
+        # sends FIN; the bounded drain absorbs the rest of the client's
+        # stream so the final close is a clean close, not a reset. A peer
+        # that keeps streaming past the drain timeout gets the RST it earns.
         :gen_tcp.send(socket, "err frame_too_large\n")
+        :gen_tcp.shutdown(socket, :write)
+        drain(socket)
         :gen_tcp.close(socket)
 
       :drop ->
         :gen_tcp.close(socket)
+    end
+  end
+
+  # absorb the refused client's remaining stream until it closes (or goes
+  # idle for @recv_timeout) — see the :too_large branch for why
+  defp drain(socket) do
+    case :gen_tcp.recv(socket, 0, @recv_timeout) do
+      {:ok, _packet} -> drain(socket)
+      {:error, _reason} -> :ok
     end
   end
 
