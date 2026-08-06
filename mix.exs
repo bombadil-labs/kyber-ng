@@ -7,7 +7,8 @@ defmodule Kyber.MixProject do
       version: "0.2.0",
       elixir: "~> 1.18",
       start_permanent: Mix.env() == :prod,
-      deps: deps()
+      deps: deps(),
+      escript: [main_module: Kyber.CLI, app: nil]
     ]
   end
 

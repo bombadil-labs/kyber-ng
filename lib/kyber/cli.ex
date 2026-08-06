@@ -1,0 +1,289 @@
+defmodule Kyber.CLI do
+  @moduledoc """
+  The operator surface (T8): a `kyber` escript over the whole stack. Every
+  loop so far shipped a module API; this gives the harness a FACE.
+
+  **Boot ownership (rev 2, the central fix):** `mix.exs` pins `escript:
+  [main_module: Kyber.CLI, app: nil]` — `app: nil` is REQUIRED. With the
+  default (`app: :kyber`) the escript boots the app on the baked-in dev
+  config path BEFORE `main/1` runs, making `--log` dead and store-down
+  unreachable. With `app: nil`, `main/1` is the ONLY booter — but the
+  pinned `put_env`→`ensure_all_started` order is INSUFFICIENT and is
+  corrected here (see `main/1`'s recorded spec contradiction): the actual
+  sequence is LOAD `:kyber` (baked config default lands) -> override
+  `:log_path` from `--log` -> `Application.ensure_all_started(:kyber)` ->
+  `run/1` -> print -> halt.
+
+  `run/1` is PURE dispatch: it parses argv, calls the command's function,
+  and formats every tagged error as a clean one-liner — it NEVER calls
+  `System.halt/1`, performs IO, or boots the app. It dispatches over
+  whatever app state already exists (tests arrange it directly; AC7's
+  store-down scenario stops the app first). `main/1` is the ONLY printer,
+  halter, and booter; exit codes are pinned `0` (`{:ok, _}`), `1`
+  (`{:error, _}`), `2` (`{:error, :usage, _}`).
+
+  **The view guard (rev 2 pin):** `Kyber.Harness.view/0` is the one
+  unguarded command API in the stack — a bare `Kyber.DurableStore.set()`.
+  The CLI never calls it bare: `view` re-implements the guard + the same
+  sort/format Harness.view/0 does internally, wrapped in a whereis check
+  and a `catch_exit` (the T4/T5 TOCTOU closure shape) so a store stopping
+  between the whereis and the call still answers the clean one-liner,
+  never a crash.
+  """
+
+  alias Kyber.{DurableStore, Federation, Harness, Migration, Vault}
+
+  @usage """
+  kyber [--log <path>] <command> [args]
+    view                                   sorted claims, one per line; exit 0
+    ingest <source.json> --keyring <dir>   the source map -> Harness.ingest; prints the claim id; exit 0
+    render <vault_dir>                     Vault.render; prints the report; exit 0
+    refresh <vault_dir>                    Vault.refresh; prints the report; exit 0
+    export                                 Federation.export; prints the wire text verbatim + "\\n"; exit 0
+    import <wire.jsonl>                    Federation.import; prints the import report; exit 0
+    migrate <legacy.jsonl> --keyring <dir> Migration.migrate; prints the migration report; exit 0
+    help | (no args)                       this text; exit 0
+    <unknown> | help <extra>               this text; exit 2
+  """
+
+  # -------------------------------------------------------------------- main
+
+  @doc """
+  THE ONLY printer/halter/booter. LOADS `:kyber` (so the baked config
+  default lands), THEN overrides `:log_path` from `--log`, THEN boots,
+  dispatches through `run/1`, prints the message, and halts with the
+  pinned exit code. Never returns.
+
+  **Spec contradiction (rev 2 boot-ownership, RECORDED — see moduledoc):**
+  the ticket pins `--log` `put_env` DIRECTLY before `ensure_all_started/1`
+  with NO intervening load, claiming `app: nil` alone makes the override
+  stick. It does not. With `app: nil` the escript starts `:kyber`
+  UNLOADED, so `ensure_all_started/1` triggers `:application.load/1`,
+  which re-applies the BUILD-TIME-baked `config/config.exs` default
+  (`~/.kyber/store.jsonl`) and CLOBBERS the `put_env` — the exact
+  "`--log` is dead / store-down unreachable" failure the fix claims to
+  cure, relocated from the boot into the load. The minimal correct
+  sequence is `load → put_env → start`: `load_kyber/0` applies the baked
+  default first, the override then wins, and the subsequent
+  `ensure_all_started/1` (already loaded) cannot re-clobber it. (Verified
+  empirically against the built escript, not just the in-VM test path —
+  `run/1`'s tests never reach `main/1`, and in `mix test` `:kyber` is
+  already loaded, so the pinned sequence LOOKS fine there.)
+  """
+  @spec main([String.t()]) :: no_return()
+  def main(argv) do
+    load_kyber()
+
+    case extract_log_path(argv) do
+      nil -> :ok
+      path -> Application.put_env(:kyber, :log_path, path)
+    end
+
+    case Application.ensure_all_started(:kyber) do
+      {:ok, _apps} ->
+        argv |> run() |> print_and_halt()
+
+      {:error, {:kyber, reason}} ->
+        IO.puts("store failed to start: #{inspect(reason)}")
+        System.halt(1)
+
+      {:error, reason} ->
+        IO.puts("store failed to start: #{inspect(reason)}")
+        System.halt(1)
+    end
+  end
+
+  # load (not start) FIRST so the baked config default is applied BEFORE the
+  # --log override; an already-loaded app (the mix-test path) is a no-op.
+  # This is the intervening step the pinned sequence omits (see main/1's
+  # recorded contradiction).
+  defp load_kyber do
+    case Application.load(:kyber) do
+      :ok -> :ok
+      {:error, {:already_loaded, :kyber}} -> :ok
+      {:error, _reason} -> :ok
+    end
+  end
+
+  # a bare "--log <path>" PREFIX is the only shape main/1 reads for the boot
+  # side effect; anything else (missing value, --log elsewhere) is left for
+  # run/1's own parsing to reject as a usage error — single source of truth
+  defp extract_log_path(["--log", path | _rest]), do: path
+  defp extract_log_path(_argv), do: nil
+
+  defp print_and_halt({:ok, message}) do
+    print(message)
+    System.halt(0)
+  end
+
+  defp print_and_halt({:error, :usage, message}) do
+    print(message)
+    System.halt(2)
+  end
+
+  defp print_and_halt({:error, message}) do
+    print(message)
+    System.halt(1)
+  end
+
+  # a map ok-message (render/refresh/import/migrate reports) prints as a
+  # compact IO.inspect; every other message (view text, a claim id, the
+  # wire text, the usage block) is a plain string, printed verbatim +
+  # IO.puts's own trailing newline (export's pinned "verbatim + \n")
+  defp print(message) when is_map(message), do: IO.inspect(message, limit: :infinity)
+  defp print(message) when is_binary(message), do: IO.puts(message)
+
+  # ---------------------------------------------------------------------- run
+
+  @doc """
+  PURE dispatch — no halt, no IO, no boot. Parses argv (a `--log <path>`
+  global flag BEFORE the command is accepted; `--log` anywhere else is a
+  usage error), dispatches to the command, and formats every tagged error
+  as a pinned one-liner.
+  """
+  @spec run([String.t()]) ::
+          {:ok, String.t() | map()} | {:error, String.t()} | {:error, :usage, String.t()}
+  def run(argv) do
+    case strip_log_prefix(argv) do
+      {:ok, rest} -> dispatch(rest) |> finalize()
+      {:error, :usage} -> {:error, :usage, @usage}
+    end
+  end
+
+  # strips a LEADING "--log <path>" pair; a "--log" surviving anywhere in
+  # the remainder (i.e. anywhere after the command) is a usage error — the
+  # pinned rule (rev 2's shape block)
+  defp strip_log_prefix(["--log", _path | rest]), do: reject_stray_log(rest)
+  defp strip_log_prefix(argv), do: reject_stray_log(argv)
+
+  defp reject_stray_log(argv) do
+    if Enum.member?(argv, "--log"), do: {:error, :usage}, else: {:ok, argv}
+  end
+
+  defp finalize({:ok, message}), do: {:ok, message}
+  defp finalize({:error, :usage, message}), do: {:error, :usage, message}
+  defp finalize({:error, reason}), do: {:error, format_error(reason)}
+
+  # ------------------------------------------------------------------ shape
+
+  defp dispatch([]), do: {:ok, @usage}
+  defp dispatch(["help"]), do: {:ok, @usage}
+  defp dispatch(["help" | _extra]), do: {:error, :usage, @usage}
+  defp dispatch(["view"]), do: cmd_view()
+  defp dispatch(["ingest", source, "--keyring", dir]), do: cmd_ingest(source, dir)
+  defp dispatch(["render", vault_dir]), do: Vault.render(vault_dir)
+  defp dispatch(["refresh", vault_dir]), do: Vault.refresh(vault_dir)
+  defp dispatch(["export"]), do: Federation.export()
+  defp dispatch(["import", wire_path]), do: cmd_import(wire_path)
+
+  defp dispatch(["migrate", legacy_path, "--keyring", dir]),
+    do: Migration.migrate(legacy_path, dir)
+
+  defp dispatch(_other), do: {:error, :usage, @usage}
+
+  # ----------------------------------------------------------------- view
+
+  # the guard Harness.view/0 does NOT have: whereis first, then the SAME
+  # TOCTOU catch_exit closure Kyber.Harness/Kyber.Vault use around their own
+  # DurableStore calls, so a store dying in the window still answers the
+  # clean one-liner instead of a crash
+  defp cmd_view do
+    case guarded_set() do
+      {:ok, set} -> {:ok, render_view(set)}
+      {:error, _reason} = err -> err
+    end
+  end
+
+  defp guarded_set do
+    if Process.whereis(DurableStore) do
+      try do
+        {:ok, DurableStore.set()}
+      catch
+        :exit, {:noproc, _} -> {:error, :store_not_running}
+        :exit, reason -> {:error, {:store_exit, reason}}
+      end
+    else
+      {:error, :store_not_running}
+    end
+  end
+
+  defp render_view(set) do
+    set
+    |> Enum.sort_by(fn {id_hex, _element} -> id_hex end)
+    |> Enum.map(fn {id_hex, {claims, _sig}} -> view_line(id_hex, claims) end)
+    |> Enum.join("\n")
+  end
+
+  # PINNED BYTE-EXACT (rev 2): "<id_hex> <first-pointer-role>
+  # <first-8-hex-after-ed25519:> <ts via float_to_binary decimals: 0>"
+  defp view_line(id_hex, claims) do
+    role = claims.pointers |> List.first() |> Map.fetch!(:role)
+    author8 = author_hex8(claims.author)
+    ts_text = :erlang.float_to_binary(claims.timestamp, decimals: 0)
+    Enum.join([id_hex, role, author8, ts_text], " ")
+  end
+
+  defp author_hex8("ed25519:" <> hex), do: String.slice(hex, 0, 8)
+  defp author_hex8(other), do: String.slice(other, 0, 8)
+
+  # ---------------------------------------------------------------- ingest
+
+  defp cmd_ingest(source_path, keyring_dir) do
+    with {:ok, content} <- read_file(source_path),
+         {:ok, term} <- decode_source(content) do
+      case Harness.ingest(term, keyring_dir) do
+        {:ok, id} -> {:ok, id}
+        {:error, :no_human_seed} -> {:error, {:no_human_seed, keyring_dir}}
+        {:error, _reason} = err -> err
+      end
+    end
+  end
+
+  defp decode_source(content) do
+    case JSON.decode(content) do
+      {:ok, term} when is_map(term) -> {:ok, term}
+      {:ok, _term} -> {:error, :malformed_source}
+      {:error, _reason} -> {:error, :malformed_source}
+    end
+  end
+
+  # ----------------------------------------------------------------- import
+
+  defp cmd_import(wire_path) do
+    with {:ok, content} <- read_file(wire_path) do
+      Federation.import(content)
+    end
+  end
+
+  # -------------------------------------------------------------------- file
+
+  # NON-bang: a missing/unreadable file is a tagged tuple, the pinned
+  # "no such file: <path>" one-liner — never a crash
+  defp read_file(path) do
+    case File.read(path) do
+      {:ok, content} -> {:ok, content}
+      {:error, _reason} -> {:error, {:no_such_file, path}}
+    end
+  end
+
+  # ------------------------------------------------------------------ errors
+
+  # every tag any command API can return, pinned to a clean one-liner; a
+  # tag outside the pinned set still never crashes — it falls to the
+  # `inspect` fallback (defensive completeness, the codebase's own idiom
+  # for "unreachable today, kept so a future contract drift cannot surface
+  # a crash" — see Kyber.Federation's dead branches).
+  defp format_error(:store_not_running), do: "store not running"
+  defp format_error(:no_agent_seed), do: "no agent seed"
+  defp format_error({:no_human_seed, path}), do: "no human seed: #{path}"
+  defp format_error({:keyring_dir_missing, path}), do: "keyring dir missing: #{path}"
+  defp format_error({:no_legacy_log, path}), do: "no legacy log: #{path}"
+  defp format_error({:no_such_file, path}), do: "no such file: #{path}"
+  defp format_error(:malformed_source), do: "malformed source"
+  # Federation.import/1's non-binary catch-all — structurally unreachable
+  # via cmd_import (File.read/1 always yields a binary on :ok), kept for
+  # total coverage should Federation's contract ever route :malformed_text
+  # through this call.
+  defp format_error(:malformed_text), do: "malformed wire"
+  defp format_error(other), do: "error: #{inspect(other)}"
+end
