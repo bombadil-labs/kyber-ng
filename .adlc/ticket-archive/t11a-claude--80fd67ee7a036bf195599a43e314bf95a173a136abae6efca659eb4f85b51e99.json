@@ -1,5 +1,14 @@
 {
+  "_adlcArchive": {
+    "archivedAt": "2026-08-07T00:28:30.188Z",
+    "reason": "completed",
+    "sourceRevision": null,
+    "sourceStoreHash": "5c874d4be1143b736c5bbc267b84eb87276e4137fccd12cb2e81cfa052ade0d8",
+    "ticketHash": "a574c064682ae6e121ff76395fb1323bdf8d71d2e459fe63a5c59f2ca5b5cdc6",
+    "version": 1
+  },
   "body": "T11a-claude — leg 1 of the T11a three-way blind taste test (harness-tuning rematch 2026-08-06). Contract: .adlc/specs/T11a-claude.md (fork of the shared T11a slice spec; umbrella .adlc/specs/T11.md). Vehicle: claude-code, model claude-fable-5. Owns AC2 (delta vocabulary pinned in the genesis schema set), AC7 (validation at admission), AC10 (gates). Deliverables: Kyber.Schema (schema container actor: compiled set, live schema-delta subscription, validate/1 + resolve/1 -> typed objects) + the genesis hyperschema/schema deltas (lib/kyber/schema/genesis/) + codegen-as-derived-convenience. Gate: mix test green with schema tests (vocabulary fixtures validate; malformed refused; unknown admitted raw; resolve returns typed objects); deliverables exist (test -f lib/kyber/schema.ex && test -f test/schema_test.exs); rails-guard clean; format/warnings clean; no Process.sleep.",
+  "completed": true,
   "id": "T11a-claude",
   "rails": [
     "deps/",
