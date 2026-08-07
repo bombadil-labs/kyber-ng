@@ -142,7 +142,9 @@ defmodule Kyber.Agent.LlmHandler do
     body = %{
       "model" => handler.model,
       "messages" => messages,
-      "temperature" => 0.6
+      # kimi-k3's API accepts ONLY temperature 1 — anything else is a 400
+      # (a live-API constraint no stub test can catch; verified 2026-08-06)
+      "temperature" => 1.0
     }
 
     body =
