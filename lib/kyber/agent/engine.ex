@@ -150,9 +150,19 @@ defmodule Kyber.Agent.Engine do
 
   defp dispatch(%{id: id, claims: claims}, state) do
     case {kind(claims), Schema.resolve(claims)} do
-      {"promptRef", %{type: "InferenceRequested"} = typed} -> infer(id, typed, state)
-      {"call", %{type: "ToolResult"} = typed} -> tool_result(id, typed, state)
-      _other -> state
+      {"promptRef", %{type: "InferenceRequested"} = typed} ->
+        infer(id, typed, state)
+
+      {"call", %{type: "ToolResult"} = typed} ->
+        tool_result(id, typed, state)
+
+      {"decides",
+       %{type: "GateDecision", verdict: verdict, decides: {:delta, call_id, _ctx}} = typed}
+      when verdict != :allow ->
+        refusal(call_id, typed, state)
+
+      _other ->
+        state
     end
   end
 
@@ -291,6 +301,59 @@ defmodule Kyber.Agent.Engine do
                       "role" => "tool",
                       "tool_call_id" => provider_id(call_id),
                       "content" => typed.result
+                    }
+                  ]
+          }
+
+          state = %{state | pending: Map.delete(state.pending, call_id)}
+          complete(turn, set, state)
+        end
+    end
+  end
+
+  # the refusal loop (T14 carry #1, closed pre-merge — proven live by the
+  # AC4 run: with the default deny-all gate every tool call was refused and
+  # the turn hung forever). A denied/refused GateDecision for a pending
+  # call feeds the model the SAME assistant tool_calls message plus a
+  # tool-role refusal, then re-completes the turn — the model re-plans
+  # instead of the chain waiting on a ToolResult that never comes. The
+  # executor's contract is untouched (still no ToolResult for refusals).
+  defp refusal(call_id, typed, state) do
+    case Map.get(state.pending, call_id) do
+      nil ->
+        state
+
+      %{turn: turn, tool_id: tool_id, args: args} ->
+        set = state.store.()
+
+        if answered?(set, turn.request_id) do
+          %{state | skipped: state.skipped + 1, pending: Map.delete(state.pending, call_id)}
+        else
+          reason = typed.reason || Atom.to_string(typed.verdict)
+
+          turn = %{
+            turn
+            | messages:
+                turn.messages ++
+                  [
+                    %{
+                      "role" => "assistant",
+                      "content" => nil,
+                      "tool_calls" => [
+                        %{
+                          "id" => provider_id(call_id),
+                          "type" => "function",
+                          "function" => %{
+                            "name" => ToolExecutor.tool_name(tool_id),
+                            "arguments" => args
+                          }
+                        }
+                      ]
+                    },
+                    %{
+                      "role" => "tool",
+                      "tool_call_id" => provider_id(call_id),
+                      "content" => "refused: " <> reason
                     }
                   ]
           }

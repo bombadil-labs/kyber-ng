@@ -203,6 +203,44 @@ defmodule Kyber.Agent.ToolChainTest do
     assert sent.content == "The tool said: ping-pong"
   end
 
+  test "the refusal loop: a denied call comes back to the model and the turn completes (T14 carry #1)" do
+    store = start_store()
+
+    # the two-phase stub: asks for the echo tool, then — on seeing the
+    # refusal tool message — answers with the gate's reason
+    engine =
+      start_engine(store, fn body ->
+        case Enum.find(body["messages"], &(&1["role"] == "tool")) do
+          %{"content" => "refused: " <> reason} -> "The gate said: " <> reason
+          nil -> tool_calls_message("tool_echo", "{\"args\":\"ping-pong\"}")
+        end
+      end)
+
+    ingest_prompt(store, engine, "Echo something, if the gate allows.")
+    {_call, call_delta} = sink_typed("ToolCall")
+
+    # the deny gate: a refused call emits ONLY the GateDecision — no
+    # ToolResult (the executor contract is untouched)
+    executor =
+      ToolExecutor.handler(
+        seed: @agent_seed,
+        gate: Gate.new(default: :deny),
+        store: fn -> Agent.get(store, & &1) end
+      )
+
+    assert [gate_wire] = executor.([call_delta])
+    gate_delta = put_wire(store, gate_wire)
+
+    # the engine routes the refusal back to the model; the model re-plans
+    # and answers — the turn completes instead of hanging forever
+    assert Engine.handler(engine).([gate_delta]) == []
+    {response, _} = sink_typed("ResponseDelta")
+    assert response.content =~ "The gate said:"
+
+    {sent, _} = sink_typed("MessageSent")
+    assert sent.content =~ "The gate said:"
+  end
+
   test "the executor is deterministic: a re-fired call yields the byte-identical result" do
     store = start_store()
     engine = start_engine(store, &tool_then_answer/1)

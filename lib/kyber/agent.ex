@@ -53,6 +53,10 @@ defmodule Kyber.Agent do
 
       {:ok, _ref} = Gather.subscribe("promptRef", Engine.handler(engine))
       {:ok, _ref} = Gather.subscribe("call", Engine.handler(engine))
+      # the refusal loop (T14 carry #1): GateDecision deltas route to the
+      # engine so a denied/refused call comes back to the model — without
+      # this the turn waits forever on a ToolResult that never comes
+      {:ok, _ref} = Gather.subscribe("decides", Engine.handler(engine))
 
       {:ok, _ref} =
         Gather.subscribe(
