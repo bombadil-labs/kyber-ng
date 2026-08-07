@@ -1,6 +1,15 @@
 {
+  "_adlcArchive": {
+    "archivedAt": "2026-08-07T03:42:45.403Z",
+    "reason": "completed",
+    "sourceRevision": null,
+    "sourceStoreHash": "7a6b8857f5824f34d7ec485e7d3ec354cf8460d1d35922217fdaaa0a3b2a6502",
+    "ticketHash": "5ebebf929aee62bf0e72e87af029ee1be3cd934ad739e69e391dde163e0eaf5e",
+    "version": 1
+  },
   "assignee": "claude-code (claude-fable-5), blind vehicle A",
   "body": "T11b — the inference chain, second slice of the T11 umbrella. Contract: .adlc/specs/T11b-claude.md (fork of T11b.md). Owns AC1 (real LLM handler: Moonshot kimi-k3, MOONSHOT_API_KEY, zero new deps, stdlib :httpc/:ssl, injectable HTTP client with a stub adapter for tests), AC3 (re-boot idempotence WITH the LLM handler — crash-window test asserts one request + one response + a counted skip), AC4 (operational run with a REAL Moonshot call — recorded at close-out by Hermes; the build's gate is the suite + deliverables), AC5 (store-as-memory: grounded follow-up 'what did I just say?' references the first exchange), AC8 (tool chains as cascades of linked deltas: ToolCall -> executor -> ToolResult -> Response, mid-chain restart resumes, projection is a lens), AC9 (T10 deterministic loop untouched), AC10 gates. Carried additions (binding): thread Kyber.Schema.validate/1 into admission (door/schema seam), boot-time rehydration of schema evolution, resolve answers plain maps. Deliverables: Kyber.Agent.LlmHandler, Kyber.Agent.ContextBuilder (session hyperview + window lens + memory injection via the MemoryPort seam), Kyber.Agent.Engine (stateful turn holder, pointer-walk rehydration), tool executor handler(s), Kyber.Agent.MemoryPort (retriever seam + stub), CLI 'kyber agent'. Gate: mix test && test -f lib/kyber/agent/llm_handler.ex && test -f lib/kyber/agent/context_builder.ex && test -f lib/kyber/agent/engine.ex && test -f lib/kyber/agent/memory_port.ex; T10 tests untouched; rails-guard clean; no Process.sleep.",
+  "completed": true,
   "id": "T11b-claude",
   "rails": [
     "deps/",

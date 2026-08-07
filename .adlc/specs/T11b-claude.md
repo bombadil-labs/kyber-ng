@@ -3,7 +3,6 @@
 Rev 1 — fork of the shared T11b contract for the claude leg of the three-way blind taste test (T11b rematch 2026-08-06). Same contract as its siblings; amendments to THIS file only.
 
 ## Post-verdict amendments (blind taste test, 2026-08-06 — merged winner)
-
 The three-way verdict (Fable 5 judge, anonymized A/B/C): **A (this leg) won 23–21–17** — the only
 build with NO window where a guarantee silently breaks. Its strictly-below-the-prompt
 `conversationRef` anchor (the judge's single best idea) makes the re-fired request a function of
@@ -78,7 +77,11 @@ operational run: a real question in, a real answer out, persisted, crash-safe, g
   gather contract `(delta[]) -> delta[]` with REAL non-deterministic content. The HTTP client is injectable
   (a stub adapter for tests; the real adapter for the live run) — the seam is a behaviour, not a module swap.
 - **`Kyber.Agent.ContextBuilder`** — session-container actor: maintains the conversation hyperview
-  (gather-into via `Kyber.Schema.resolve_entity/2`), applies the window lens (last N turns + summaries),
+  (gather-into via `Kyber.Schema.resolve_entity/2`), applies the window lens (last N turns + summaries,
+  N default 8, overridable at boot; the ENGINE owns the lens in `build_messages/4` — the
+  ContextBuilder's `conversation/2` stays UNWINDOWED because `conversationRef` determinism
+  depends on the full view; a "turn" = a received prompt + its ResponseDelta) [Premortem C2 fix
+  2026-08-06: lens ownership pinned — the spec previously assigned it to the ContextBuilder,
   injects memories through the **`Kyber.Agent.MemoryPort`** retriever seam (an interface: `retrieve/2` —
   a memory container behind it is T11c's job; a stub retriever serves this slice), emits one thin
   `InferenceRequested` delta per prompt (primitives ride, composites point — no conversation text).
@@ -86,7 +89,11 @@ operational run: a real question in, a real answer out, persisted, crash-safe, g
   context by pointer-walk, calls the model via the handler, emits `ResponseDelta` (or `ToolCall` deltas
   mid-turn), holds in-flight turn state in its process, resumes from the chain on restart.
 - **Tool executor handler(s)** — fire on `ToolCall`, emit `ToolResult`.
-- **`Kyber.Agent.MemoryPort`** — the retriever seam (behaviour + stub).
+- **`Kyber.Agent.MemoryPort`** — the retriever seam (behaviour + stub). **The port's contract carries
+  a determinism clause [Premortem C2 fix 2026-08-06]:** `retrieve/2` MUST be a pure function of
+  (query, state) — any time-, order-, or service-dependent retrieval (wall-clock, an embedding
+  service, mutable state) voids AC3's byte-identical re-fire; a T11c retriever that cannot
+  promise this must be swapped at a boot boundary, never into the re-fire path.
 - **CLI: `kyber agent`** — boots daemon + container actors on a configured (tmp) store/keyring;
   bounded, T8/T9 discipline.
 
@@ -110,8 +117,14 @@ operational run: a real question in, a real answer out, persisted, crash-safe, g
   run (this exact sequence) is the loop's acceptance evidence, machine-checked by the smoke.
 - **AC5 — The store is the memory (grounded follow-up):** the handler's SECOND invocation is grounded
   in the FIRST exchange — the model sees its own prior `message.sent` claims and answers a follow-up
-  that REQUIRES that memory ("what did I just say?"). verify: the second answer's content references
-  the first exchange's content (asserted in the test).
+  that REQUIRES that memory ("what did I just say?"). verify: the second REQUEST body (the
+  engine's model call) contains both sides of the prior exchange — the first prompt's received
+  content AND the first answer's sent content — asserted in the test. Answer-groundedness
+  (whether the model's answer actually cites the memory) is a LIVE-RUN observation (the AC4
+  operational run records it), never a test assertion: a real non-deterministic model cannot
+  make it mechanically assertable. [Premortem C2 fix 2026-08-06: the AC previously pinned
+  answer-content grounding as the test assertion — unassertable; the merged test asserts the
+  context property.]
 - **AC8 — Tool chains are linked deltas:** a turn with a tool call produces `ToolCall` → executor →
   `ToolResult` → final `ResponseDelta`, each persisted and pointer-linked; the engine's in-flight
   state survives a daemon restart (the chain is the state); the UI projection is a lens — the smoke
