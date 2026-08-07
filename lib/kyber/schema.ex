@@ -150,10 +150,20 @@ defmodule Kyber.Schema do
     end
   end
 
+  # "not running" includes DYING between the whereis and the call (an async
+  # test sibling's supervised container exiting mid-resolve): fall back to
+  # the genesis set, per the documented pure-path contract
   defp current do
     case Process.whereis(__MODULE__) do
-      nil -> Genesis.compiled()
-      _pid -> Agent.get(__MODULE__, & &1)
+      nil ->
+        Genesis.compiled()
+
+      _pid ->
+        try do
+          Agent.get(__MODULE__, & &1)
+        catch
+          :exit, _reason -> Genesis.compiled()
+        end
     end
   end
 end

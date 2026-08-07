@@ -31,8 +31,11 @@ defmodule Kyber.ApplicationTest do
     File.mkdir_p!(dir)
 
     # belt and braces: nothing from a previous test may leak into this one —
-    # the app is stopped and the config/test.exs log path restored
+    # the app is stopped, the config/test.exs log path restored, and the
+    # SHARED log file itself reset (any app-booting sibling test — harness,
+    # federation, peer — appends to it; AC4 asserts its exact content)
     stop_app()
+    File.rm(config_log_path)
     Application.put_env(:kyber, :log_path, config_log_path)
 
     on_exit(fn ->

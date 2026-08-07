@@ -1,0 +1,18 @@
+{
+  "acceptance": "AC1 (chain is the same chain) + AC2 (gate is the boundary) + AC3 (bounded by construction) + AC10 (gates)",
+  "gate": "mix test && test -f lib/kyber/agent/action.ex && test -f lib/kyber/agent/action/gate.ex && test -f lib/kyber/agent/action/fs.ex && test -f lib/kyber/agent/action/shell.ex && test -f lib/kyber/agent/action/http.ex",
+  "id": "T12-k3",
+  "rails": [
+    "deps/",
+    "spec/",
+    "SPEC.md",
+    "mix.exs",
+    "config/"
+  ],
+  "scope": [
+    "lib/kyber/agent/action*",
+    "lib/kyber/agent/tool_executor.ex",
+    "test/action*"
+  ],
+  "title": "T12-k3: the agent acts — prime-agent / Kimi K3 leg (blind taste-test vehicle B)"
+}

@@ -109,7 +109,7 @@ defmodule Kyber.VaultTest do
     }
 
     assert {:ok, id} = Harness.ingest(source, keyring_dir)
-    assert {claims, _sig} = Map.fetch!(DurableStore.set(), id)
+    assert {_claims, _sig} = Map.fetch!(DurableStore.set(), id)
 
     assert {:ok, %{files: 1}} = Vault.render(vault_dir)
 
@@ -311,7 +311,7 @@ defmodule Kyber.VaultTest do
   # ------------------------------------------------------------------ P5
 
   test "P5: a read-only claims dir yields {:write_failed, path, reason} from BOTH render and refresh (never a raise)",
-       %{keyring_dir: keyring_dir, vault_dir: vault_dir, log_path: log_path} do
+       %{keyring_dir: keyring_dir, vault_dir: vault_dir, log_path: _log_path} do
     source = %{
       "message_id" => "message:discord:ro:1",
       "channel_id" => "channel:discord:ro",

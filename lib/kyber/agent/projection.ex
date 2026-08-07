@@ -98,7 +98,7 @@ defmodule Kyber.Agent.Projection do
         end)
         |> case do
           [{_id, typed} | _rest] -> {typed.result, typed.status}
-          [] -> {nil, nil}
+          [] -> refusal_of(set, call_id)
         end
 
       %{tool: tool_id, args: call.args, result: result, status: status}
@@ -113,6 +113,25 @@ defmodule Kyber.Agent.Projection do
         %{type: ^type} = typed <- [Schema.resolve(claims)],
         filter.(typed),
         do: {id, typed}
+  end
+
+  # a refused call (fold from the T12 verdict, C's best attribute): the
+  # GateDecision is the refused-reason claim — the step renders with the
+  # reason and a `refused` status; an allow decision with no result yet is
+  # the ordinary in-flight chain (result nil)
+  defp refusal_of(set, call_id) do
+    case typed_where(set, "GateDecision", fn typed ->
+           match?({:delta, ^call_id, _ctx}, typed.decides)
+         end) do
+      [{_id, typed} | _rest] ->
+        case typed do
+          %{verdict: "allow"} -> {nil, nil}
+          %{verdict: _denied, reason: reason} -> {reason, "refused"}
+        end
+
+      [] ->
+        {nil, nil}
+    end
   end
 
   defp pointer(%{pointers: pointers}, role) do

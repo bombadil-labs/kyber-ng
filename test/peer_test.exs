@@ -138,7 +138,15 @@ defmodule Kyber.PeerTest do
              :gen_tcp.connect(~c"localhost", port, [:binary, packet: :line, active: false])
 
     chunk = String.duplicate("x", 4096) <> "\n"
-    for _ <- 1..512, do: :ok = :gen_tcp.send(sock, chunk)
+
+    # push past the cap; the handler's refusal close can land mid-stream —
+    # a failed send then is the refusal arriving, not the assertion target
+    Enum.reduce_while(1..512, :ok, fn _, _acc ->
+      case :gen_tcp.send(sock, chunk) do
+        :ok -> {:cont, :ok}
+        {:error, _closed} = done -> {:halt, done}
+      end
+    end)
 
     assert {:ok, "err frame_too_large\n"} = :gen_tcp.recv(sock, 0, 15_000)
     assert :ok = :gen_tcp.close(sock)

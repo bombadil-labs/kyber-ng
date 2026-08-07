@@ -44,6 +44,9 @@ defmodule Kyber.Agent.Engine do
   Start the engine. Options: `:llm` (a `Kyber.Agent.LlmHandler` struct,
   required), `:window` (last-N turn lens, default #{@default_window}),
   `:tools` (OpenAI function specs, default `ToolExecutor.tool_specs/0`),
+  `:tool_keys` (the registry-accurate model-name -> action-id map, default
+  nil — the syntactic `ToolExecutor.tool_key/1` fallback; T12 action ids
+  carry dots, so a real registry wires this map),
   `:store` (thunk answering the delta set, default the durable store),
   `:sink` (wire consumer, default `Kyber.Daemon.emit/1`), `:name` (default
   `#{inspect(__MODULE__)}`; `nil` for anonymous).
@@ -92,6 +95,7 @@ defmodule Kyber.Agent.Engine do
        llm: Keyword.fetch!(opts, :llm),
        window: Keyword.get(opts, :window, @default_window),
        tools: Keyword.get(opts, :tools, ToolExecutor.tool_specs()),
+       tool_keys: Keyword.get(opts, :tool_keys),
        store: Keyword.get(opts, :store, fn -> DurableStore.set() end),
        sink: Keyword.get(opts, :sink, &Kyber.Daemon.emit/1),
        notify: Keyword.get(opts, :notify),
@@ -185,7 +189,7 @@ defmodule Kyber.Agent.Engine do
         # delta carries the SEMANTIC args (the `args` property unwrapped from
         # the native arguments JSON — never the raw envelope)
         Enum.reduce(calls, state, fn {_provider_id, name, arguments}, state ->
-          call_tool(turn, ToolExecutor.tool_key(name), native_args(arguments), state)
+          call_tool(turn, tool_key(state, name), native_args(arguments), state)
         end)
 
       {:ok, content} ->
@@ -296,6 +300,12 @@ defmodule Kyber.Agent.Engine do
         end
     end
   end
+
+  # the registry-accurate name -> action-id map when wired (T12 action ids
+  # carry dots — the syntactic fallback would misread `fs_read` as
+  # `fs:read`); the T11b stub shape resolves syntactically either way
+  defp tool_key(%{tool_keys: nil}, name), do: ToolExecutor.tool_key(name)
+  defp tool_key(%{tool_keys: map}, name), do: Map.get(map, name, ToolExecutor.tool_key(name))
 
   # the provider tool-call id is a DETERMINISTIC function of the ToolCall
   # delta's content address — restart-stable, so a resumed chain reconstructs

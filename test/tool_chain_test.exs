@@ -10,6 +10,7 @@ defmodule Kyber.Agent.ToolChainTest do
 
   alias Kyber.{Events, Schema, Store, Wire}
   alias Kyber.Agent.{ContextBuilder, Engine, MemoryPort, Projection, ToolExecutor}
+  alias Kyber.Agent.Action.Gate
 
   @human_seed String.duplicate("a1", 32)
   @agent_seed String.duplicate("b2", 32)
@@ -137,9 +138,41 @@ defmodule Kyber.Agent.ToolChainTest do
     end
   end
 
+  # receive sink wires until the tally covers every wanted type — a
+  # lossless running count (nothing is discarded, order-agnostic)
+  defp collect_sinks(wants, tally) do
+    if Enum.all?(wants, fn {type, n} -> Map.get(tally, type, 0) >= n end) do
+      tally
+    else
+      assert_receive {:sink, wire}, 2_000
+      {:ok, delta} = Store.verify(wire)
+
+      type =
+        case Schema.resolve(delta.claims) do
+          %{type: t} -> t
+          _raw -> nil
+        end
+
+      collect_sinks(wants, Map.update(tally, type, 1, &(&1 + 1)))
+    end
+  end
+
+  # T12: every call crosses the gate before the executor runs it — this
+  # slice's posture is allow-all-by-default (the unknown-tool test needs
+  # `tool:nonexistent` to reach the executor); T12's own tests exercise
+  # deny/prompt. Both output wires persist (the decision is attested).
   defp run_executor(store, call_delta) do
-    [result_wire] = ToolExecutor.handler(seed: @agent_seed).([call_delta])
+    [gate_wire, result_wire] = executor_handler(store).([call_delta])
+    put_wire(store, gate_wire)
     {result_wire, put_wire(store, result_wire)}
+  end
+
+  defp executor_handler(store) do
+    ToolExecutor.handler(
+      seed: @agent_seed,
+      gate: Gate.new(default: :allow),
+      store: fn -> Agent.get(store, & &1) end
+    )
   end
 
   # ------------------------------------------------------------------ tests
@@ -177,7 +210,7 @@ defmodule Kyber.Agent.ToolChainTest do
     {_call, call_delta} = sink_typed("ToolCall")
 
     {wire1, _} = run_executor(store, call_delta)
-    [wire2] = ToolExecutor.handler(seed: @agent_seed).([call_delta])
+    [_gate_wire2, wire2] = executor_handler(store).([call_delta])
     assert wire1 == wire2
   end
 
@@ -242,10 +275,24 @@ defmodule Kyber.Agent.ToolChainTest do
     store = start_store()
     engine = start_engine(store, fn _body -> "the answer" end, window: 2)
 
-    for i <- 1..5, do: ingest_prompt(store, engine, "Prompt #{i}.")
+    # synchronize each turn before the next ingest (the engine answers
+    # casts in order, so turn i's snapshot then holds EXACTLY turns 1..i-1
+    # complete plus prompt i — the checkpoint's cover count is otherwise
+    # scheduler-dependent: a lagging snapshot sees the next prompt and
+    # covers more; a latent race this slice's heavier async suite exposed).
+    # The tally collector never loses a wire (unlike sink_typed/1, which
+    # discards non-matching types — the summary rides the same sink and can
+    # arrive mid-drain).
+    tally =
+      Enum.reduce(1..5, %{}, fn i, tally ->
+        ingest_prompt(store, engine, "Prompt #{i}.")
+        collect_sinks(%{"MessageSent" => i}, tally)
+      end)
 
-    # drain the per-turn sinks; the summary rides the same sink
-    for _ <- 1..5, do: sink_typed("MessageSent")
+    tally = collect_sinks(%{"ConversationSummary" => 1}, tally)
+    assert tally["MessageSent"] == 5
+
+    # the sink persists before it notifies — the store read is synchronized
     set = Agent.get(store, & &1)
 
     summaries =
@@ -255,7 +302,7 @@ defmodule Kyber.Agent.ToolChainTest do
 
     assert [summary] = summaries
     assert summary.content =~ "Summary of turns"
-    # 5 turns - window 2 = 3 elided turns covered; the checkpoint is a lens artifact
+    # the elided head covered; the checkpoint is a lens artifact
     assert length(summary.covers) == 3
   end
 
