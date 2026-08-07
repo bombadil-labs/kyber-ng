@@ -2,6 +2,37 @@
 
 Rev 1 — fork of the shared T11c contract for the claude leg of the three-way blind taste test (T11c rematch 2026-08-06). Same contract as its siblings; amendments to THIS file only.
 
+## Post-verdict amendments (blind taste test, 2026-08-06 — merged winner)
+
+The three-way verdict (Fable 5 judge, anonymized A/B/C): **A (this leg) won 24–19–18** — the
+only build with no silent guarantee-break: provenance derived from the head's attestation (a
+non-human edit stays `:auto`, pinned by test), the watcher a stateless tick returning wires for
+the caller to admit, collision-proof filenames, every failure window pinned (garbled file,
+drift-free tick, refused wire, old-content-by-pointer). Judge's per-loser attributes, folded:
+
+1. **C's single best idea — provenance is AUTHORITY, not label:** the watcher signs
+   `MemoryEdited` with the HUMAN's key; resolution derives `:human` from the head edit's SIGNER
+   (a known `human_author`), not from the `reason` string. The spoof-pin test: an agent-signed
+   edit labelled `"human_edit"` is `:auto` under a known human key — the overclaim B shipped
+   and could not test. Until boot wiring carries the operator key (`human_author == nil`), the
+   reason-string rule remains the documented fallback. API: `Memory.canon/3` +
+   `resolve_set/2`; the retriever threads `human_author` in its state.
+2. **B's best attribute — three-way A/B equality:** a second container rehydrated by replay
+   from the same store serves identical queries; container A == container B == the bare pure
+   path, asserted end-to-end, plus the determinism clause (byte-identical re-fire of the same
+   store read).
+3. **NOT folded:** B's sticky provenance (ANY edit in the chain → `:human` — silent overclaim)
+   and its failing format gate; C's stateful machinery (incremental cache + 100-hop bound where
+   a pure fold suffices), slug-only filenames (collisions silently overwrite), and its
+   trim-all-trailing-newlines normalization.
+
+**Deliverable finding (recorded, both B and C converged independently):** AC6's
+`source: :human_edit` + old+new-content slots have NO room in the closed genesis schema —
+a literal `source` role is refused at admission. The mapping: NEW content inline; OLD content
+rides the `edits` pointer (composites point — the superseded canon head's delta carries it);
+the marker rides the optional `reason` string; authority rides the SIGNATURE. The AC6 test
+asserts the delta validates strictly-typed, so the mapping is pinned, not assumed.
+
 Original Rev 1 — slice spec of the T11 umbrella contract (`.adlc/specs/T11.md`; spine pins 2, 5, 6, 7, 9, 10 —
 entities-as-resolutions, primitives-ride/composites-point, containers-are-caches-rehydrate-by-replay,
 memory-is-entities-not-deltas, the MemoryPort A/B seam). Slice of the T11 split: this ticket owns
