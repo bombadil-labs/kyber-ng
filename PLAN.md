@@ -8,6 +8,31 @@ success criteria. Hermes owns updating this file; the coding agent does not over
 
 ## 0. Next Ralph Loop: The agent actually lives in it — an LLM handler on the Gather (the harness eats a real model)
 
+**ORACLE ARC (user mandate 2026-08-06, supersedes the T11 tail when it ships):** after T11c
+merges to main (closing the T11 split), the arc continues on a PROVISIONAL BRANCH
+(`provisional/oracle`) — NOT main. T12 → T13 → T14, drafted by Hermes, each a full three-way
+campaign (fable / kimi-k3 / deepseek, blind taste test, folds, ADLC ceremony) with winners
+merged into the provisional branch as they land:
+
+- **T12 — the agent acts** (capabilities): the tool chain matures from the stub echo to a real
+  executor — action registry with typed schemas, a permission gate (allow-list / prompt /
+  deny), bounded filesystem + shell + HTTP actions, all through the existing
+  ToolCall→ToolResult delta chain with crash-window idempotence intact.
+- **T13 — the agent remembers** (memory-driven): the T11c memory store becomes the agent's
+  operational memory — tool outcomes, trajectory retrieval, provenance-weighted recall, the
+  agent writing memory entities it later reads.
+- **T14 — the agent runs** (autonomous operation, the Class 4 Oracle seed): event-driven
+  waking (prompts, watcher ticks, memory edits), the agent initiating rather than only
+  responding. All gated: permission gates, human-edit priority, the repo doctrine. NO
+  misaligned behavior — aligned capabilities only.
+
+**END STATE:** an UNMERGED PR from `provisional/oracle` into main + a comprehensive report of
+every design choice, verdict, and discovery. Hermes owns PLAN.md updates; milestones recorded
+per completed stage.
+
+---
+*T11 tail (in progress — the last slice merges to main, then the arc above forks):*
+
 **Objective (T10's own closing line + the Prime Intellect thesis the user surfaced 2026-08-06: the
 harness elevates the baseline reasoning of *any* model plugged into it):** T10 landed the
 operational harness — `kyber daemon` (ticker, pid-lock, SIGTERM-clean), `Kyber.Gather` (container
