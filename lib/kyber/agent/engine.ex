@@ -385,7 +385,7 @@ defmodule Kyber.Agent.Engine do
 
   defp build_messages(set, session_id, memory_ids, window) do
     turns = ContextBuilder.conversation(set, session_id)
-    {elided, windowed} = Enum.split(turns, max(length(turns) - window, 0))
+    {elided, windowed} = ContextBuilder.window(turns, window)
 
     memory_notes =
       for id <- memory_ids,
