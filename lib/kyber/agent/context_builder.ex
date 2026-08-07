@@ -79,13 +79,33 @@ defmodule Kyber.Agent.ContextBuilder do
     Enum.sort_by(turns, &{&1.timestamp, &1.id})
   end
 
+  @doc """
+  The window lens split (the T11b pin, N=8): `{elided, windowed}` — the
+  exact tail split the engine's `build_messages/4` applies, extracted so
+  the engine and `Assoc.Saturation` share one N and one split.
+  """
+  @spec window([map()], non_neg_integer()) :: {[map()], [map()]}
+  def window(turns, n \\ 8), do: Enum.split(turns, max(length(turns) - n, 0))
+
+  @doc """
+  Normalize a retriever answer to the associative shape (T13): the T11c
+  list gains empty channels; the associative map passes through.
+  """
+  @spec normalize({:ok, [String.t()] | map()}) :: map()
+  def normalize({:ok, memory_ids}) when is_list(memory_ids) do
+    %{memory_ids: memory_ids, associations: %{seeds: [], resonant: [], divergent: []}}
+  end
+
+  def normalize({:ok, %{memory_ids: _ids, associations: _channels} = shaped}), do: shaped
+
   # ----------------------------------------------------------------- request
 
   defp request(%{id: prompt_id, claims: claims}, seed, model, store, {retriever, mem_state}) do
     with {:entity, session_id, _ctx} <- pointer(claims, "session"),
          {:string, prompt_text} <- pointer(claims, "content"),
-         {:ok, memory_ids} <-
+         {:ok, _answer} = retrieved <-
            retriever.retrieve(%{session_id: session_id, prompt: prompt_text}, mem_state),
+         %{memory_ids: memory_ids, associations: associations} = normalize(retrieved),
          {:ok, signed} <-
            Events.inference_requested(
              seed,
@@ -94,7 +114,7 @@ defmodule Kyber.Agent.ContextBuilder do
              session_id,
              conversation_ref(store.(), session_id, claims.timestamp, prompt_id),
              prompt_id,
-             memory_ids
+             memory_pointers(memory_ids, associations)
            ) do
       [Wire.envelope(signed)]
     else
@@ -102,6 +122,14 @@ defmodule Kyber.Agent.ContextBuilder do
       # retriever) yields no request rather than an invented one
       _refused -> []
     end
+  end
+
+  # precision never truncated, seeds ride the wire, divergent last — the
+  # associative tail is ≤ 4+8+2 by construction, so the channel can never
+  # drown precision recall
+  defp memory_pointers(memory_ids, %{seeds: seeds, resonant: resonant, divergent: divergent}) do
+    memory_ids ++
+      ((seeds ++ resonant ++ divergent) |> Enum.uniq() |> Enum.reject(&(&1 in memory_ids)))
   end
 
   # the conversation head: the latest conversation delta STRICTLY BELOW the
