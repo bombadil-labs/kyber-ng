@@ -197,3 +197,37 @@ Machine-checked, both levels [P3's delta assertion + P1's body-grep]:
 Answer-groundedness = recorded live-run observation, never asserted (T11b C2).
 
 **Taste-test metric:** the two builds agree byte-for-byte on every pinned name, signature, result-map atom, constant, and fixture string above (≥ 90% of public module/function signatures identical), and each build's pinned test assertions pass unmodified against the other build — the judge finds only formatting/private-helper differences, no design-level divergence.
+
+## Post-verdict amendment (2026-08-07 — plan-fidelity pilot, two-way rematch)
+
+The rumble converged; two builds (fable, deepseek) implemented the SAME Design resolution.
+Taste-test metric measured: 15/19 public signatures byte-identical (the 4 diffs: df/2 public
+vs private, seeds/3 bound-var names — cosmetics); result-map atoms, constants, token pipeline,
+fixture strings identical everywhere.
+
+PILOT VERDICT: fable plan-faithful on every pinned item; deepseek deviated on ONE —
+`ContextBuilder.window/2` returns the bare tail list (`|> elem(1)`) instead of the pinned
+`Enum.split` tuple `{dropped, kept}` — and wrote tests encoding the deviation (a strict
+`edges_walked` inequality its cap-before-expansion walk satisfies but the plan's
+cap-after-expansion does not). Cross-build swap: fable's tests vs deepseek's lib → 1 failure
+(the window tuple pin); deepseek's tests vs fable's lib → 2 failures (both its own
+over-assertions). Fable merged; deepseek's deviation + over-assertions rejected.
+
+Pilot conclusion: the planning layer works — T12's three ARCHITECTURAL divergences (registry
+vocabulary, kill strategy, module split) collapsed to ONE return-shape deviation when both
+builds executed one converged plan.
+
+RECORDED BUILD FINDINGS (future implementers, read these):
+1. Cite-fan accumulation vs AC2 flatness: every admitted InferenceRequested/ResponseDelta
+   citing a canon head adds a `{:cite, delta_id}` feature to that entity. In a live store
+   where emitted requests re-enter the set the retriever reads, `edges_walked` grows with
+   session length — the pinned flatness assertion holds only because the AC2 driven store
+   accumulates message.received turns, not emitted requests. The groove claim as spec'd is
+   about seed-derivation boundedness, not total edge-fan; a df-style cap on `{:cite, _}`
+   fan-out is the obvious future fold.
+2. The associative pointer tail is empty by construction today: T11c precision recall
+   returns ALL resolved memories, so the dedupe (`reject(&(&1 in memory_ids))`) removes every
+   associative head from the wire tail. The channels' value currently rides the
+   `associations` map (AC2/AC4 assertions pass because heads ARE in memoryPointers via the
+   precision list). The design correctly anticipates a future bounded precision list — no
+   code change made; recorded.
