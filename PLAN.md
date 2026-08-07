@@ -20,7 +20,19 @@ merged into the provisional branch as they land:
   ToolCall→ToolResult delta chain with crash-window idempotence intact.
 - **T13 — the agent remembers** (memory-driven): the T11c memory store becomes the agent's
   operational memory — tool outcomes, trajectory retrieval, provenance-weighted recall, the
-  agent writing memory entities it later reads.
+  agent writing memory entities it later reads. **ASSOCIATIVE MEMORY (user musing 2026-08-06 —
+  design mandate for T13):** retrieval is a semantic WALK over the entity graph (RhizomeDB
+  flight-lines made concrete), not a scroll — from the query's resolved entities, follow
+  pointer edges (shared targets/roles/sessions/content-feature hashes); pure structural
+  association, NO embedding service (determinism clause — boot-boundary swap only, per the
+  T11b premortem). GROOVE = saturation: the context builder pre-fetches the association set
+  for the current window into the next request, so recall cost falls toward zero as the
+  session deepens (functions fire when saturated). SYNCHRONICITY's kernel: a bounded
+  divergent-recall channel surfacing entities with surprising shared-feature overlap despite
+  no direct link (the cross-session "meaningful coincidence"), capped so it never drowns
+  precision recall. Bounded walks (max depth/candidates, window-anchored seeds). Caution:
+  association is a retrieval POLICY, never a truth-maker — the canon stays the canon;
+  resonance-ranked recall returns real claims only.
 - **T14 — the agent runs** (autonomous operation, the Class 4 Oracle seed): event-driven
   waking (prompts, watcher ticks, memory edits), the agent initiating rather than only
   responding. All gated: permission gates, human-edit priority, the repo doctrine. NO
