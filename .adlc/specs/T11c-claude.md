@@ -80,18 +80,32 @@ _Owned by this slice (from the umbrella, verify: methods verbatim):_
 
 - **AC6 — The memory store round-trips through markdown:** a MemoryEntity resolves → projects
   to a vault markdown file; a HUMAN EDIT to that file is observed by the watcher → a
-  `MemoryEdited` delta (attested, `source: :human_edit`, old+new content) → the entity's canon
-  re-resolves to the edited content; the edited memory carries `provenance: human` and the
-  retriever ranks it above auto-derived memory. verify: a test writes a vault file, edits it
-  out-of-band, ticks the watcher, and asserts the edit delta + the re-resolved canon + the
-  provenance role.
+  `MemoryEdited` delta → the entity's canon re-resolves to the edited content; the edited
+  memory carries `provenance: human` and the retriever ranks it above auto-derived memory.
+  **Mapped shape (deliverable finding — the closed genesis refuses a literal `source` role and
+  has no old-content slot):** NEW content inline; the human marker rides the optional `reason`
+  string (`"human_edit"`); OLD content rides the `edits` pointer (composites point — the
+  superseded canon head's delta carries it); AUTHORITY rides the signature (the watcher signs
+  with the human key; provenance derives from the signer). **EOL canonicalization rule
+  (premortem C2 2026-08-06):** the watcher parses BOTH the projected canon and the file body
+  through the same normalization (trailing EOLs stripped, CRLF canonicalized to LF) before
+  comparing — a human save that only touches line endings mints NO edit; the stored content
+  never embeds `\r` bytes. **Deletion semantics (premortem C2):** a missing file is NOT an
+  edit and the next projection re-renders it (store only learns; delete-forget is a retraction
+  design, out of this slice) — pinned so the surprise is documented, not silent. verify: a
+  test writes a vault file, edits it out-of-band, ticks the watcher, and asserts the edit
+  delta + the re-resolved canon + the provenance role; a second test saves a CRLF/trailing-EOL
+  variant and asserts NO edit delta is minted.
 - **AC10 — Gates:** no `Process.sleep` in test/ (send_after/assert_receive only); rails
   (deps/, spec/, SPEC.md, mix.exs, config/) frozen — rails-guard clean; the real `~/.kyber`
   never touched (tmp store/keyring/vault everywhere); format clean; warnings-as-errors clean;
   the memory store and schema container are swappable behind the same substrate (the A/B
-  property: a second memory container can serve the same queries against the same store).
-  verify: `grep -r "Process.sleep" test/` empty; rails-guard passes; `mix format
-  --check-formatted` clean; `mix compile --force --warnings-as-errors` clean.
+  property: a second memory container can serve the same queries against the same store —
+  NORMATIVE reading: the three-way equality test — container A == container B == the bare pure
+  path, B rehydrated by replay from the same store, and identical retrieval across all three;
+  named test: `test/memory_test.exs` "AC10 A/B"). verify: `grep -r "Process.sleep" test/`
+  empty; rails-guard passes; `mix format --check-formatted` clean; `mix compile --force
+  --warnings-as-errors` clean; the three-way equality test is in the suite.
 
 ## Carried contract (binds this slice — from the T11b-claude amendment)
 

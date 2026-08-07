@@ -126,6 +126,48 @@ defmodule Kyber.Agent.MemoryTest do
     assert reprojected =~ "Myk prefers Elixir and Rust"
   end
 
+  test "EOL canonicalization: a save that only touches line endings mints NO edit" do
+    # premortem C2 fix 2026-08-06 (pinned in AC6): editors normalize
+    # trailing newlines / CRLF; the watcher compares canonicalized bodies on
+    # both sides, so a CRLF save is not a divergence and embeds no \r bytes.
+    set =
+      DeltaSet.new()
+      |> remember!(@ts, "user:myk", "Myk prefers Elixir")
+
+    vault_dir =
+      Path.join(System.tmp_dir!(), "kyber-memory-eol-#{System.unique_integer([:positive])}")
+
+    {:ok, %{files: 1}} = Projector.project(set, vault_dir)
+    path = Projector.path(vault_dir, "user:myk")
+
+    # the human's editor saves with CRLF + an extra trailing blank line
+    File.write!(path, String.replace(File.read!(path), "\n", "\r\n") <> "\r\n")
+
+    assert {:ok, []} =
+             Watcher.tick(
+               store: fn -> set end,
+               vault_dir: vault_dir,
+               seed: @agent_seed,
+               human_seed: @human_seed,
+               ts: @ts + 1
+             )
+
+    # and a REAL divergence still mints the edit (canonical body stored)
+    File.write!(path, String.replace(File.read!(path), "Elixir", "Elixir and Rust"))
+
+    assert {:ok, [wire]} =
+             Watcher.tick(
+               store: fn -> set end,
+               vault_dir: vault_dir,
+               seed: @agent_seed,
+               human_seed: @human_seed,
+               ts: @ts + 2
+             )
+
+    {:ok, %{claims: claims}} = Store.verify(wire)
+    assert Schema.resolve(claims).content == "Myk prefers Elixir and Rust"
+  end
+
   test "spoof-proof: an agent-signed edit LABELLED human_edit is :auto under a known human key" do
     # the T11c verdict fold (C's best idea): provenance is AUTHORITY. An
     # agent that writes `reason: "human_edit"` must NOT be able to launder
