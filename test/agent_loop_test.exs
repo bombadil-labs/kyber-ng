@@ -39,7 +39,11 @@ defmodule Kyber.AgentLoopTest do
                "target" => %{"id" => "channel:discord:t10", "context" => "sent"}
              },
              %{"role" => "content", "target" => "ack " <> received_id},
-             %{"role" => "caused_by", "target" => %{"delta" => received_id}}
+             %{"role" => "caused_by", "target" => %{"delta" => received_id}},
+             %{
+               "role" => "type",
+               "target" => %{"id" => "MessageSent", "context" => "instances"}
+             }
            ]
 
     # signed by the daemon's (agent) key, not the human's

@@ -10,6 +10,12 @@ defmodule Kyber.Events do
   converted by the builder itself — never coerced inside the witness. Pointer
   structures are exactly spec/01-events.md §2, emitted in template order
   (array order is part of the content address).
+
+  T11b (carried contract addition 1): every builder appends a `type`
+  declaration pointer (`{:entity, TypeName, "instances"}` — the T11a
+  convention) so its output validates TYPED at the daemon's door. The
+  declaration rides LAST: the kind marker (the template's leading role) is
+  what the gather routes on, so the leading pointer must stay the template's.
   """
 
   alias Rhizomatic.Delta
@@ -36,7 +42,8 @@ defmodule Kyber.Events do
           %{role: "at", target: {:entity, channel_id, "messages"}},
           %{role: "by", target: {:entity, human_entity_id(author), "sent"}},
           %{role: "content", target: {:string, content}},
-          %{role: "session", target: {:entity, session_id, "messages"}}
+          %{role: "session", target: {:entity, session_id, "messages"}},
+          type("MessageReceived")
         ]
       }
 
@@ -58,7 +65,8 @@ defmodule Kyber.Events do
         author: author,
         pointers: [
           %{role: "annotates", target: {:delta, annotated_delta_id, "annotated"}},
-          %{role: "notes", target: {:string, notes}}
+          %{role: "notes", target: {:string, notes}},
+          type("PromptAnnotated")
         ]
       }
 
@@ -82,7 +90,8 @@ defmodule Kyber.Events do
         pointers: [
           %{role: "responds", target: {:delta, annotated_delta_id, "answer"}},
           %{role: "content", target: {:string, content}},
-          %{role: "usage", target: {:entity, "agent:kyber", "tokens"}}
+          %{role: "usage", target: {:entity, "agent:kyber", "tokens"}},
+          type("LlmResponse")
         ]
       }
 
@@ -107,7 +116,8 @@ defmodule Kyber.Events do
           %{role: "sent", target: {:entity, out_message_id, "outgoing"}},
           %{role: "via", target: {:entity, channel_id, "sent"}},
           %{role: "content", target: {:string, content}},
-          %{role: "caused_by", target: {:delta, response_delta_id, nil}}
+          %{role: "caused_by", target: {:delta, response_delta_id, nil}},
+          type("MessageSent")
         ]
       }
 
@@ -131,7 +141,8 @@ defmodule Kyber.Events do
           %{role: "tool", target: {:entity, tool_id, "invocations"}},
           %{role: "args", target: {:string, args}},
           %{role: "result", target: {:string, result}},
-          %{role: "during", target: {:delta, during_delta_id, "tool_use"}}
+          %{role: "during", target: {:delta, during_delta_id, "tool_use"}},
+          type("ToolInvoked")
         ]
       }
 
@@ -140,6 +151,10 @@ defmodule Kyber.Events do
   end
 
   # ---------------------------------------------------------------- helpers
+
+  # the T11a type declaration (carried addition 1) — always the LAST pointer;
+  # the leading role stays the kind marker the gather routes on
+  defp type(name), do: %{role: "type", target: {:entity, name, "instances"}}
 
   # validate at the boundary, then sign: reject, never repair
   defp signed(claims, seed_hex) do

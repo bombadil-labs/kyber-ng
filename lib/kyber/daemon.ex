@@ -145,7 +145,13 @@ defmodule Kyber.Daemon do
          :ok <- take_lock(log_path) do
       Process.flag(:trap_exit, true)
       {:ok, gather} = start_gather()
-      {:ok, _ref} = Gather.subscribe("received", AgentLoop.handler(seed))
+
+      # `:loop` (T11b): `:ack` (default) subscribes the T10 deterministic ack
+      # loop — the fallback, not a casualty (AC9); `:none` leaves "received"
+      # to the LLM stack (`Kyber.Agent.attach/1` wires it post-boot)
+      if Keyword.get(opts, :loop, :ack) == :ack do
+        {:ok, _ref} = Gather.subscribe("received", AgentLoop.handler(seed))
+      end
 
       state = %{
         log_path: log_path,
@@ -289,10 +295,17 @@ defmodule Kyber.Daemon do
       narrate(state, "skipped #{short(id)}")
       {{:ok, :skipped}, %{state | skipped: state.skipped + 1}}
     else
-      case DurableStore.append(wire) do
+      case schema_door(wire) do
         :ok ->
-          narrate(state, "persisted #{wire_role(wire)} #{short(id)}")
-          {{:ok, :persisted}, %{state | persisted: state.persisted + 1}}
+          case DurableStore.append(wire) do
+            :ok ->
+              narrate(state, "persisted #{wire_role(wire)} #{short(id)}")
+              {{:ok, :persisted}, %{state | persisted: state.persisted + 1}}
+
+            {:error, reason} ->
+              narrate(state, "refused #{inspect(reason)}")
+              {{:error, reason}, state}
+          end
 
         {:error, reason} ->
           narrate(state, "refused #{inspect(reason)}")
@@ -301,11 +314,24 @@ defmodule Kyber.Daemon do
     end
   end
 
+  # the door/schema seam (T11b carried addition 1): a delta DECLARING a known
+  # lifecycle type is validated against its schema at admission — ill-shaped
+  # is refused, never repaired; undeclared/unknown is raw admission. One door
+  # for both channels.
+  defp schema_door(wire) do
+    with {:ok, delta} <- Store.verify(wire) do
+      case Kyber.Schema.validate(delta.claims) do
+        {:error, reason} -> {:error, {:schema_refused, reason}}
+        _typed_or_raw -> :ok
+      end
+    end
+  end
+
   # the pulse channel: the same door, then route-and-drop; outputs recurse
   # through the sink (a pulse may fire a handler whose output IS memory)
   defp pulse(wire, state, depth) do
-    case Store.verify(wire) do
-      {:ok, delta} ->
+    with {:ok, delta} <- Store.verify(wire),
+         :ok <- schema_door(wire) do
         {:ok, report} = Gather.route(delta)
         if report.fired > 0, do: narrate(state, "pulse #{kind(delta)} fired +#{report.fired}")
 
@@ -315,9 +341,8 @@ defmodule Kyber.Daemon do
           end)
 
         {{:ok, :pulsed}, state}
-
-      {:error, reason} ->
-        {{:error, reason}, state}
+    else
+      {:error, reason} -> {{:error, reason}, state}
     end
   end
 

@@ -122,13 +122,15 @@ defmodule Kyber.VaultTest do
     # systematic drift in Wire.claims_json / JSON.encode! / the renderer can
     # no longer shift both sides together. Computed once (via trusted
     # primitives) at review time and pinned here verbatim.
+    # Re-pinned for the T11b template (the emitters now declare their type —
+    # carried addition 1): same fixture inputs, one more pointer, new id.
     golden =
       "---\n" <>
-        "id: 1e2016979a92ebdbe039dbea08820a26f0820690f0bd1b9f1ea3fca4289f946fbd56\n" <>
+        "id: 1e209787d68ab5e53eb1d7bc73bcde9f1ebeff164e728ca0804e17c3f5fc21ff3782\n" <>
         "author: ed25519:fc947730f49eb01427a66e050733294d9e520e545c7a27125a780634e0860a27\n" <>
         "timestamp: 1754512345678\n" <>
         "role: received\n" <>
-        "pointers: [{\"role\":\"received\",\"target\":{\"context\":\"incoming\",\"id\":\"message:discord:golden:1\"}},{\"role\":\"at\",\"target\":{\"context\":\"messages\",\"id\":\"channel:discord:golden\"}},{\"role\":\"by\",\"target\":{\"context\":\"sent\",\"id\":\"human:fc947730f49eb01427a66e050733294d9e520e545c7a27125a780634e0860a27\"}},{\"role\":\"content\",\"target\":\"hello golden fixture\"},{\"role\":\"session\",\"target\":{\"context\":\"messages\",\"id\":\"session:discord:golden\"}}]\n" <>
+        "pointers: [{\"role\":\"received\",\"target\":{\"context\":\"incoming\",\"id\":\"message:discord:golden:1\"}},{\"role\":\"at\",\"target\":{\"context\":\"messages\",\"id\":\"channel:discord:golden\"}},{\"role\":\"by\",\"target\":{\"context\":\"sent\",\"id\":\"human:fc947730f49eb01427a66e050733294d9e520e545c7a27125a780634e0860a27\"}},{\"role\":\"content\",\"target\":\"hello golden fixture\"},{\"role\":\"session\",\"target\":{\"context\":\"messages\",\"id\":\"session:discord:golden\"}},{\"role\":\"type\",\"target\":{\"context\":\"instances\",\"id\":\"MessageReceived\"}}]\n" <>
         "---\n" <>
         "hello golden fixture\n"
 

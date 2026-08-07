@@ -121,7 +121,8 @@ defmodule Kyber.EventsTest do
         %{role: "at", target: {:entity, @channel_id, "messages"}},
         %{role: "by", target: {:entity, human_id(), "sent"}},
         %{role: "content", target: {:string, @content}},
-        %{role: "session", target: {:entity, @session_id, "messages"}}
+        %{role: "session", target: {:entity, @session_id, "messages"}},
+        %{role: "type", target: {:entity, "MessageReceived", "instances"}}
       ])
     end
 
@@ -132,7 +133,8 @@ defmodule Kyber.EventsTest do
 
       assert_pointers(claims, [
         %{role: "annotates", target: {:delta, @delta_ref, "annotated"}},
-        %{role: "notes", target: {:string, notes}}
+        %{role: "notes", target: {:string, notes}},
+        %{role: "type", target: {:entity, "PromptAnnotated", "instances"}}
       ])
     end
 
@@ -144,7 +146,8 @@ defmodule Kyber.EventsTest do
       assert_pointers(claims, [
         %{role: "responds", target: {:delta, @delta_ref, "answer"}},
         %{role: "content", target: {:string, content}},
-        %{role: "usage", target: {:entity, "agent:kyber", "tokens"}}
+        %{role: "usage", target: {:entity, "agent:kyber", "tokens"}},
+        %{role: "type", target: {:entity, "LlmResponse", "instances"}}
       ])
     end
 
@@ -166,7 +169,8 @@ defmodule Kyber.EventsTest do
         %{role: "sent", target: {:entity, out_message_id, "outgoing"}},
         %{role: "via", target: {:entity, @channel_id, "sent"}},
         %{role: "content", target: {:string, content}},
-        %{role: "caused_by", target: {:delta, @delta_ref, nil}}
+        %{role: "caused_by", target: {:delta, @delta_ref, nil}},
+        %{role: "type", target: {:entity, "MessageSent", "instances"}}
       ])
     end
 
@@ -181,7 +185,8 @@ defmodule Kyber.EventsTest do
         %{role: "tool", target: {:entity, "tool:exec", "invocations"}},
         %{role: "args", target: {:string, args}},
         %{role: "result", target: {:string, result}},
-        %{role: "during", target: {:delta, @delta_ref, "tool_use"}}
+        %{role: "during", target: {:delta, @delta_ref, "tool_use"}},
+        %{role: "type", target: {:entity, "ToolInvoked", "instances"}}
       ])
     end
   end

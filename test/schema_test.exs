@@ -188,9 +188,10 @@ defmodule Kyber.SchemaTest do
   # -- Drift-proofing: the real emitters against the infra schemas (B's posture)
 
   test "cross-validation: the infra schemas mirror the real emitters' roles (drift-proof)" do
-    # The T10 emitters don't declare types (role-based routing) — so the
-    # drift-proof property is: each infra schema's field set is EXACTLY the
-    # real emitter's role set, and a declared copy validates typed.
+    # T11b wired the type declaration into the emitters (carried addition 1),
+    # so the drift-proof property is: each infra schema's field set is EXACTLY
+    # the emitter's role set minus the declaration, and the emitted claims
+    # validate typed as-is.
     for {emitter, type, args} <- [
           {&Events.message_received/6, "MessageReceived",
            {@seed, @ts, "msg:1", "channel:cli", "session:1", "hello"}},
@@ -203,13 +204,14 @@ defmodule Kyber.SchemaTest do
         ] do
       {:ok, {claims, _sig}} = apply(emitter, Tuple.to_list(args))
 
-      roles = claims.pointers |> Enum.map(& &1.role) |> Enum.sort()
+      roles =
+        claims.pointers |> Enum.map(& &1.role) |> Enum.reject(&(&1 == "type")) |> Enum.sort()
+
       schema_fields = Genesis.compiled().schemas[type].fields |> Map.keys() |> Enum.sort()
       assert roles == schema_fields, "schema #{type} drifted from its emitter"
 
-      # with the type declaration (T11b's emitter wiring), it validates typed
-      declared = claims |> Map.update!(:pointers, &[ptr("type", {:entity, type, "instances"}) | &1])
-      assert {:ok, typed} = Schema.validate(declared)
+      # the emitter declares its own type (T11b) — the output validates typed
+      assert {:ok, typed} = Schema.validate(claims)
       assert typed.type == type
     end
   end
