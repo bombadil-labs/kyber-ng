@@ -1,5 +1,14 @@
 {
+  "_adlcArchive": {
+    "archivedAt": "2026-08-07T07:55:59.111Z",
+    "reason": "completed",
+    "sourceRevision": null,
+    "sourceStoreHash": "c30558e1e511e6cf56b475746be10fd69d129be5d5647adf0a35115d96cc0c64",
+    "ticketHash": "a11c433555c02f04cdb5f8bd9d86651b6d70294307fc4cfc1c21dca6fba9a114",
+    "version": 1
+  },
   "acceptance": "AC1 (walk pure and bounded) + AC2 (groove is saturation) + AC3 (synchronicity is a graph property) + AC10 (gates)",
+  "completed": true,
   "gate": "mix test && test -f lib/kyber/agent/memory/assoc.ex && test -f lib/kyber/agent/memory/assoc/index.ex && test -f lib/kyber/agent/memory/assoc/saturation.ex && test -f lib/kyber/agent/context_builder.ex",
   "id": "T13-claude",
   "rails": [
