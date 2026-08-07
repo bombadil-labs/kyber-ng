@@ -206,4 +206,6 @@ From T13's build findings (recorded, not defects):
 - PR #4 open (base main, unmerged): this arc.
 - Tickets: T1–T13 all archived, zero live. Daemons: k3 + deepseek sockets alive,
   idleEviction off, reusable for the next slice.
-- Suite: 279 tests / 0 failures on provisional/oracle.
+- Suite: 288 tests / 0 failures on provisional/oracle (hardening + refusal loop + flakes).
+- AC4 live gate: PASSED 2026-08-07 — real kimi-k3 grounded "The relay deploy is pinned to commit `9f2ac4`." in the cross-session memory via the associative channels; recording preserved.
+- Live-run discoveries (the ceremony doing its job): the T12 real-http adapter could never work under mix (code path pruned, inets/ssl unreachable — frozen rail worked around at the client); the gate-refusal-hang closed pre-merge; two flakes root-caused and fixed (daemon-lock spawn visibility, peer RST dropping the refusal status).

@@ -126,6 +126,12 @@ defmodule Kyber.Agent.MemoryAssocOperationalTest do
 
       head_a = Memory.canon(DurableStore.set(), "mem:relay:pin").head
 
+      # flush the daemon cursor past the seed deltas BEFORE attaching: the
+      # daemon booted before they were written, so the first tick would
+      # otherwise dispatch the seeds to the builder and the engine would
+      # answer a SEED request, not the question (observed live)
+      assert {:ok, _status} = Daemon.tick()
+
       # ---- the REAL model behind the recording adapter, assoc retriever
       {:ok, llm} =
         Kyber.Agent.LlmHandler.new(
@@ -145,7 +151,21 @@ defmodule Kyber.Agent.MemoryAssocOperationalTest do
       # ---- the sessB question whose answer lives in sessA's memory
       ingest.(3, @session_b, @prompt)
 
-      assert_receive {:engine, {:answered, request_id}}, 240_000
+      # the manual-tick daemon: EVERY pipeline hop (builder → engine →
+      # tool loop) needs its own tick — tick until the turn answers
+      # (bounded: 2s per hop × 120 = the 240s test budget)
+      request_id =
+        Enum.reduce_while(1..120, nil, fn _, _acc ->
+          Daemon.tick()
+
+          receive do
+            {:engine, {:answered, request_id}} -> {:halt, request_id}
+          after
+            2_000 -> {:cont, nil}
+          end
+        end)
+
+      assert is_binary(request_id)
 
       set = DurableStore.set()
 
