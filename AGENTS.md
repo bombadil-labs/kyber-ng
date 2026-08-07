@@ -25,19 +25,19 @@ here. Both claude-code and prime-agent read both files by default.*
   every 5 turns, plus once before finishing.
 - Do NOT run `mix test` after every implementation step — that is how a build stalls.
 
-## Model & harness notes (re-test in progress — 2026-08-06)
+## Model & harness notes
 
 - kimi-k3: `--provider moonshotai --model kimi-k3` (DASH form; base api.moonshot.ai/v1; env
   `MOONSHOT_API_KEY`). The `moonshotai/Kimi-K3` SLASH form routes to the HuggingFace router —
-  different endpoint, don't use it.
-- **REVISED UNDERSTANDING**: the "`--thinking max` deadlock" and "deepseek-v4-flash drowns in
-  big-build context" diagnoses from 2026-08-06 are SUSPECTED CONFOUNDED by the daemon idle-
-  eviction sweep (same signature: `message_start` fires, then 10–30 min of nothing, worker CPU
-  ~0.7% — NOT thinking). With `idleEvictionMinutes: "off"` persisted in `~/.prime/agent/
-  settings.json`, do NOT assume either failure mode — verify empirically on the current build.
-- The daemon must have `idleEvictionMinutes: "off"` and the API key in BOTH daemon and client
-  env. Verify daemons by PROCESS (`pgrep -P <wrapper>`, key in `/proc/<pid>/environ`), never by
-  socket file (stale sockets lie).
+  different endpoint, don't use it. `--thinking max` is viable; expect slower per-turn
+  cadence (heavy reasoning between tool calls is the mode working, not a hang).
+- deepseek: use the BARE model id `--model deepseek-v4-flash` — the API rejects versioned
+  ids like `deepseek-v4-flash-0731` (the settings.json defaultModel suffix; a 400 with "The
+  supported API model names are ..." is the tell). Model-id problem, not a harness problem.
+- The daemon must have `idleEvictionMinutes: "off"` (the idle-eviction sweep stalls
+  in-flight API streams) and the API key in BOTH daemon and client env. Verify daemons by
+  PROCESS (`pgrep -P <wrapper>`, key in `/proc/<pid>/environ`), never by socket file (stale
+  sockets lie).
 
 ## Hard limits (from CLAUDE.md — binding, not negotiable)
 
