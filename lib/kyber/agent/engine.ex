@@ -210,7 +210,12 @@ defmodule Kyber.Agent.Engine do
     deliver(turn, response_wire["id"], content, set, ts, state)
     notify(state, {:answered, turn.request_id})
 
-    state = %{state | answered: state.answered + 1, pending: Map.delete(state.pending, turn.request_id)}
+    state = %{
+      state
+      | answered: state.answered + 1,
+        pending: Map.delete(state.pending, turn.request_id)
+    }
+
     maybe_summarize(turn, set, ts, state)
   end
 
@@ -278,7 +283,11 @@ defmodule Kyber.Agent.Engine do
                         }
                       ]
                     },
-                    %{"role" => "tool", "tool_call_id" => provider_id(call_id), "content" => typed.result}
+                    %{
+                      "role" => "tool",
+                      "tool_call_id" => provider_id(call_id),
+                      "content" => typed.result
+                    }
                   ]
           }
 
@@ -339,7 +348,10 @@ defmodule Kyber.Agent.Engine do
     calls =
       for {id, {claims, _sig}} <- set,
           kind(claims) == "tool",
-          match?(%{type: "ToolCall", requestRef: {:delta, ^request_id, _}}, Schema.resolve(claims)),
+          match?(
+            %{type: "ToolCall", requestRef: {:delta, ^request_id, _}},
+            Schema.resolve(claims)
+          ),
           do: {id, claims}
 
     case Enum.sort_by(calls, fn {_id, claims} -> claims.timestamp end) |> List.last() do

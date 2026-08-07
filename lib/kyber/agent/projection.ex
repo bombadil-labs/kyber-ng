@@ -108,7 +108,8 @@ defmodule Kyber.Agent.Projection do
   # every delta of a declared type matching the filter, oldest first — the
   # bounded projection walk stays deterministic under map ordering
   defp typed_where(set, type, filter) do
-    for {id, {claims, _sig}} <- Enum.sort_by(set, fn {_id, {c, _s}} -> {c.timestamp, _id = 0} end),
+    for {id, {claims, _sig}} <-
+          Enum.sort_by(set, fn {_id, {c, _s}} -> {c.timestamp, _id = 0} end),
         %{type: ^type} = typed <- [Schema.resolve(claims)],
         filter.(typed),
         do: {id, typed}

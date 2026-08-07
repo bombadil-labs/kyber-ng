@@ -89,7 +89,9 @@ defmodule Kyber.Agent.EngineTest do
   end
 
   defp ingest_received(store, ts, msg_id, content) do
-    {:ok, signed} = Events.message_received(@human_seed, ts, msg_id, "chan-1", "session:s1", content)
+    {:ok, signed} =
+      Events.message_received(@human_seed, ts, msg_id, "chan-1", "session:s1", content)
+
     wire = Wire.envelope(signed)
     put_wire(store, wire)
   end

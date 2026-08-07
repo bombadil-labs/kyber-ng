@@ -129,7 +129,10 @@ defmodule Kyber.Agent.LlmHandler do
   or `{:ok, {:tool_calls, [{id, name, arguments}]}}` when the model asks
   for tools (native function calling; `arguments` is the JSON string).
   """
-  @spec chat(t(), [map()]) :: {:ok, String.t()} | {:ok, {:tool_calls, [{String.t(), String.t(), String.t()}]}} | {:error, term()}
+  @spec chat(t(), [map()]) ::
+          {:ok, String.t()}
+          | {:ok, {:tool_calls, [{String.t(), String.t(), String.t()}]}}
+          | {:error, term()}
   def chat(%__MODULE__{} = handler, messages), do: chat(handler, messages, tools: [])
 
   @spec chat(t(), [map()], keyword()) ::
@@ -156,9 +159,14 @@ defmodule Kyber.Agent.LlmHandler do
     headers = [{~c"authorization", String.to_charlist("Bearer " <> handler.api_key)}]
 
     case adapter.post(handler.base_url <> "/chat/completions", headers, JSON.encode!(body), state) do
-      {:ok, %{status: 200, body: response_body}} -> parse(response_body)
-      {:ok, %{status: status, body: response_body}} -> {:error, {:llm_http, status, response_body}}
-      {:error, reason} -> {:error, {:llm_transport, reason}}
+      {:ok, %{status: 200, body: response_body}} ->
+        parse(response_body)
+
+      {:ok, %{status: status, body: response_body}} ->
+        {:error, {:llm_http, status, response_body}}
+
+      {:error, reason} ->
+        {:error, {:llm_transport, reason}}
     end
   end
 

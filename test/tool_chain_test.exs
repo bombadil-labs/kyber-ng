@@ -103,7 +103,14 @@ defmodule Kyber.Agent.ToolChainTest do
 
   defp ingest_prompt(store, engine_or_nil, content) do
     {:ok, signed} =
-      Events.message_received(@human_seed, 1_700_000_000_000, "msg-1", "chan-1", "session:s1", content)
+      Events.message_received(
+        @human_seed,
+        1_700_000_000_000,
+        "msg-1",
+        "chan-1",
+        "session:s1",
+        content
+      )
 
     prompt = put_wire(store, Wire.envelope(signed))
 

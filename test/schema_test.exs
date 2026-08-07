@@ -95,6 +95,7 @@ defmodule Kyber.SchemaTest do
     # point kinds stay TAGGED tuples — the witness's idiom, never coerced
     assert typed.conversationRef == {:delta, id64("31"), "context_of"}
     assert typed.promptRef == {:delta, id64("77"), "requested"}
+
     assert typed.memoryPointers == [
              {:delta, id64("11"), "informed"},
              {:delta, id64("22"), "informed"}
@@ -168,7 +169,10 @@ defmodule Kyber.SchemaTest do
       "lib/kyber/schema/genesis/wire/genesis.jsonl"
       |> File.read!()
       |> String.split("\n", trim: true)
-      |> Enum.map(fn line -> {:ok, wire} = Wire.decode(line); wire end)
+      |> Enum.map(fn line ->
+        {:ok, wire} = Wire.decode(line)
+        wire
+      end)
 
     built = Genesis.deltas()
 
@@ -222,10 +226,17 @@ defmodule Kyber.SchemaTest do
     Genesis.deltas()
     |> Enum.find(fn wire ->
       {:ok, %{claims: claims}} = Store.verify(wire)
+
       match?(%{pointers: [%{target: {:entity, ^type, "schema"}} | _]}, claims) or
-        Enum.any?(claims.pointers, &match?(%{role: "rhizomatic.hyperschema.defines", target: {:entity, ^type, _}}, &1))
+        Enum.any?(
+          claims.pointers,
+          &match?(%{role: "rhizomatic.hyperschema.defines", target: {:entity, ^type, _}}, &1)
+        )
     end)
-    |> then(fn wire -> {:ok, %{id: id}} = Store.verify(wire); id end)
+    |> then(fn wire ->
+      {:ok, %{id: id}} = Store.verify(wire)
+      id
+    end)
   end
 
   # Build a v2 schema delta for a type: same envelope as genesis, one extra
@@ -278,15 +289,14 @@ defmodule Kyber.SchemaTest do
     claims = %{
       timestamp: @ts,
       author: author,
-      pointers:
-        [
-          %{role: "type", target: {:entity, "Schema", "instances"}},
-          %{role: "rhizomatic.hyperschema.name", target: {:string, type}},
-          %{role: "rhizomatic.hyperschema.defines", target: {:entity, type, "schema"}},
-          %{role: "rhizomatic.hyperschema.alg", target: {:number, 0.0}},
-          %{role: "rhizomatic.hyperschema.term", target: {:string, term_hex}},
-          %{role: "retracts", target: {:delta, retracts_id, "retracted"}}
-        ]
+      pointers: [
+        %{role: "type", target: {:entity, "Schema", "instances"}},
+        %{role: "rhizomatic.hyperschema.name", target: {:string, type}},
+        %{role: "rhizomatic.hyperschema.defines", target: {:entity, type, "schema"}},
+        %{role: "rhizomatic.hyperschema.alg", target: {:number, 0.0}},
+        %{role: "rhizomatic.hyperschema.term", target: {:string, term_hex}},
+        %{role: "retracts", target: {:delta, retracts_id, "retracted"}}
+      ]
     }
 
     {:ok, sig} = Keys.sign(claims, @seed)
@@ -341,7 +351,13 @@ defmodule Kyber.SchemaTest do
     v1 = genesis_id("SubmittedPrompt")
 
     # same delta re-observed: no-op, :ok
-    genesis_wire = Genesis.deltas() |> Enum.find(fn w -> {:ok, %{id: id}} = Store.verify(w); id == v1 end)
+    genesis_wire =
+      Genesis.deltas()
+      |> Enum.find(fn w ->
+        {:ok, %{id: id}} = Store.verify(w)
+        id == v1
+      end)
+
     assert :ok = Schema.observe(genesis_wire)
 
     # v2 supersedes v1
@@ -365,8 +381,21 @@ defmodule Kyber.SchemaTest do
   # -- Entity resolution (spine 2 bridge) ---------------------------------------
 
   test "resolve_entity: the bounded gather over a delta set, with the reading hyperschema" do
-    c1 = claims("SubmittedPrompt", [ptr("channel", {:string, "cli"}), ptr("prompt_text", {:string, "a"}), ptr("sessionId", {:entity, "session:abc", "prompts"})])
-    c2 = claims("InferenceRequested", [ptr("model", {:string, "x"}), ptr("sessionId", {:entity, "session:abc", "inferences"}), ptr("conversationRef", {:delta, id64("31"), "c"}), ptr("promptRef", {:delta, id64("77"), "r"})])
+    c1 =
+      claims("SubmittedPrompt", [
+        ptr("channel", {:string, "cli"}),
+        ptr("prompt_text", {:string, "a"}),
+        ptr("sessionId", {:entity, "session:abc", "prompts"})
+      ])
+
+    c2 =
+      claims("InferenceRequested", [
+        ptr("model", {:string, "x"}),
+        ptr("sessionId", {:entity, "session:abc", "inferences"}),
+        ptr("conversationRef", {:delta, id64("31"), "c"}),
+        ptr("promptRef", {:delta, id64("77"), "r"})
+      ])
+
     {:ok, sig1} = Keys.sign(c1, @seed)
     {:ok, sig2} = Keys.sign(c2, @seed)
 

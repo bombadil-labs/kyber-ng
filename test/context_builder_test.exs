@@ -15,7 +15,9 @@ defmodule Kyber.Agent.ContextBuilderTest do
   @agent_seed String.duplicate("b2", 32)
 
   defp received(ts, msg_id, content) do
-    {:ok, signed} = Events.message_received(@human_seed, ts, msg_id, "chan-1", "session:s1", content)
+    {:ok, signed} =
+      Events.message_received(@human_seed, ts, msg_id, "chan-1", "session:s1", content)
+
     {:ok, delta} = signed |> Wire.envelope() |> Store.verify()
     {delta, signed}
   end
@@ -71,12 +73,16 @@ defmodule Kyber.Agent.ContextBuilderTest do
     # the first prompt of a session has no prior context: it grounds on itself
     assert [first_wire] = handler(%{}, []).([first])
     assert {:ok, first_request} = Store.verify(first_wire)
-    assert Schema.resolve(first_request.claims).conversationRef == {:delta, first.id, "context_of"}
+
+    assert Schema.resolve(first_request.claims).conversationRef ==
+             {:delta, first.id, "context_of"}
   end
 
   test "a received delta without a session pointer yields nothing (reject, never repair)" do
     {delta, _signed} = received(1_700_000_000_000, "msg-1", "hello")
-    no_session = update_in(delta.claims.pointers, &Enum.reject(&1, fn p -> p.role == "session" end))
+
+    no_session =
+      update_in(delta.claims.pointers, &Enum.reject(&1, fn p -> p.role == "session" end))
 
     assert handler(%{}, []).([no_session]) == []
   end
@@ -93,7 +99,11 @@ defmodule Kyber.Agent.ContextBuilderTest do
     {delta, _signed} = received(1_700_000_000_000, "msg-1", "What is the cap?")
 
     handler =
-      ContextBuilder.handler(seed: @agent_seed, store: fn -> %{} end, memory: {OtherRetriever, nil})
+      ContextBuilder.handler(
+        seed: @agent_seed,
+        store: fn -> %{} end,
+        memory: {OtherRetriever, nil}
+      )
 
     assert [wire] = handler.([delta])
     assert {:ok, request} = Store.verify(wire)

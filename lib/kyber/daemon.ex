@@ -332,15 +332,15 @@ defmodule Kyber.Daemon do
   defp pulse(wire, state, depth) do
     with {:ok, delta} <- Store.verify(wire),
          :ok <- schema_door(wire) do
-        {:ok, report} = Gather.route(delta)
-        if report.fired > 0, do: narrate(state, "pulse #{kind(delta)} fired +#{report.fired}")
+      {:ok, report} = Gather.route(delta)
+      if report.fired > 0, do: narrate(state, "pulse #{kind(delta)} fired +#{report.fired}")
 
-        state =
-          Enum.reduce(report.outputs, %{state | pulsed: state.pulsed + 1}, fn w, s ->
-            sink(w, s, depth + 1) |> elem(1)
-          end)
+      state =
+        Enum.reduce(report.outputs, %{state | pulsed: state.pulsed + 1}, fn w, s ->
+          sink(w, s, depth + 1) |> elem(1)
+        end)
 
-        {{:ok, :pulsed}, state}
+      {{:ok, :pulsed}, state}
     else
       {:error, reason} -> {{:error, reason}, state}
     end

@@ -1,0 +1,18 @@
+{
+  "acceptance": "AC6 (memory store round-trips through markdown) + AC10 (gates incl. A/B property)",
+  "gate": "mix test && test -f lib/kyber/agent/memory.ex && test -f lib/kyber/agent/memory/projector.ex && test -f lib/kyber/agent/memory/watcher.ex && test -f lib/kyber/agent/memory/tierer.ex && test -f lib/kyber/agent/memory/retriever.ex",
+  "id": "T11c-claude",
+  "rails": [
+    "deps/",
+    "spec/",
+    "SPEC.md",
+    "mix.exs",
+    "config/"
+  ],
+  "scope": [
+    "lib/kyber/agent/memory*",
+    "lib/kyber/agent/memory_port.ex",
+    "test/memory*"
+  ],
+  "title": "T11c-claude: memory store — claude-code / Fable 5 leg (blind taste-test vehicle A)"
+}

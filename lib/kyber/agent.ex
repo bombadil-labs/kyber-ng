@@ -39,14 +39,19 @@ defmodule Kyber.Agent do
           notify: Keyword.get(opts, :notify)
         )
 
-      {:ok, _ref} = Gather.subscribe("received", ContextBuilder.handler(seed: seed, memory: memory))
+      {:ok, _ref} =
+        Gather.subscribe("received", ContextBuilder.handler(seed: seed, memory: memory))
+
       {:ok, _ref} = Gather.subscribe("promptRef", Engine.handler(engine))
       {:ok, _ref} = Gather.subscribe("call", Engine.handler(engine))
 
       {:ok, _ref} =
         Gather.subscribe(
           "tool",
-          ToolExecutor.handler(seed: seed, tools: Keyword.get(opts, :tools, ToolExecutor.stub_tools()))
+          ToolExecutor.handler(
+            seed: seed,
+            tools: Keyword.get(opts, :tools, ToolExecutor.stub_tools())
+          )
         )
 
       {:ok, engine, Engine.resume(engine)}

@@ -62,7 +62,14 @@ defmodule Kyber.Agent.LlmHandlerTest do
 
   defp received_delta(content) do
     {:ok, signed} =
-      Events.message_received(@human_seed, 1_700_000_000_000, "msg-1", "chan-1", "sess-1", content)
+      Events.message_received(
+        @human_seed,
+        1_700_000_000_000,
+        "msg-1",
+        "chan-1",
+        "sess-1",
+        content
+      )
 
     {:ok, delta} = signed |> Wire.envelope() |> Store.verify()
     delta
@@ -103,7 +110,14 @@ defmodule Kyber.Agent.LlmHandlerTest do
     first = received_delta("Remember the number 41.")
 
     {:ok, signed} =
-      Events.message_sent(@agent_seed, 1_700_000_001_000, first.id, "msg-out-1", "chan-1", "Noted: 41.")
+      Events.message_sent(
+        @agent_seed,
+        1_700_000_001_000,
+        first.id,
+        "msg-out-1",
+        "chan-1",
+        "Noted: 41."
+      )
 
     {:ok, sent} = signed |> Wire.envelope() |> Store.verify()
     followup = received_delta("What number did I just ask you to remember?")
@@ -142,6 +156,7 @@ defmodule Kyber.Agent.LlmHandlerTest do
   end
 
   test "the constructor refuses a missing api key rather than reading the environment" do
-    assert {:error, :no_api_key} = LlmHandler.new(seed: @agent_seed, api_key: nil, http: {StubHttp, %{}})
+    assert {:error, :no_api_key} =
+             LlmHandler.new(seed: @agent_seed, api_key: nil, http: {StubHttp, %{}})
   end
 end

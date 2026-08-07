@@ -11,7 +11,7 @@ defmodule Kyber.Agent.Events do
   the T11a `type` declaration rides last. Kind markers: `InferenceRequested`
   routes as `"promptRef"`, `ResponseDelta` as `"requestRef"`, `ToolCall` as
   `"tool"`, `ToolResult` as `"call"`, `ConversationSummary` as
-  `"sessionId"`, `MemoryEntity` as `"entity"`.
+  `"sessionId"`, `MemoryEntity` as `"entity"`, `MemoryEdited` as `"edits"`.
   """
 
   alias Rhizomatic.Delta
@@ -24,9 +24,17 @@ defmodule Kyber.Agent.Events do
   schema: the prompt, the conversation head, and the memories are pointers;
   the engine rehydrates content from the store.
   """
-  @spec inference_requested(String.t(), number(), String.t(), String.t(), String.t(), String.t(), [
-          String.t()
-        ]) :: {:ok, signed()} | {:error, term()}
+  @spec inference_requested(
+          String.t(),
+          number(),
+          String.t(),
+          String.t(),
+          String.t(),
+          String.t(),
+          [
+            String.t()
+          ]
+        ) :: {:ok, signed()} | {:error, term()}
   def inference_requested(seed, ts, model, session_id, conversation_ref, prompt_id, memory_ids) do
     build(seed, ts, "InferenceRequested", [
       %{role: "promptRef", target: {:delta, prompt_id, "requested"}},
@@ -90,6 +98,23 @@ defmodule Kyber.Agent.Events do
       %{role: "entity", target: {:entity, entity_id, "memories"}},
       %{role: "content", target: {:string, content}},
       Enum.map(sources, &%{role: "source", target: {:delta, &1, "remembered"}})
+    ])
+  end
+
+  @doc """
+  `MemoryEdited` — a memory's canon superseded by an edit (T11c's watcher
+  emits these for out-of-band human edits). The genesis schema is closed:
+  the OLD content rides by pointer (`edits` targets the superseded canon
+  delta — composites point), the NEW content rides inline, and the source
+  attestation (`human_edit`) rides the schema's `reason` role.
+  """
+  @spec memory_edited(String.t(), number(), String.t(), String.t(), String.t()) ::
+          {:ok, signed()} | {:error, term()}
+  def memory_edited(seed, ts, edited_id, content, reason \\ "human_edit") do
+    build(seed, ts, "MemoryEdited", [
+      %{role: "edits", target: {:delta, edited_id, "edited"}},
+      %{role: "content", target: {:string, content}},
+      %{role: "reason", target: {:string, reason}}
     ])
   end
 

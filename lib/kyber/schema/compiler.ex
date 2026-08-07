@@ -54,7 +54,11 @@ defmodule Kyber.Schema.Compiler do
           root: String.t() | nil
         }
   @type set :: %{schemas: %{String.t() => spec()}, hyperschemas: %{String.t() => hyperschema()}}
-  @type hyperview :: %{id: String.t(), props: %{optional(String.t()) => [String.t()]}, reading: String.t() | nil}
+  @type hyperview :: %{
+          id: String.t(),
+          props: %{optional(String.t()) => [String.t()]},
+          reading: String.t() | nil
+        }
 
   # ---------------------------------------------------------------- compile
 
@@ -189,7 +193,12 @@ defmodule Kyber.Schema.Compiler do
   defp unwrap({:arr, items}), do: {:ok, items}
   defp unwrap(_), do: {:error, :malformed_term_value}
 
-  defp field_from_term(%{"name" => role, "kind" => kind, "required" => required, "repeat" => repeat}) do
+  defp field_from_term(%{
+         "name" => role,
+         "kind" => kind,
+         "required" => required,
+         "repeat" => repeat
+       }) do
     arity = if required, do: :one, else: if(repeat, do: :many, else: :maybe)
 
     case Map.fetch(@kinds, kind) do
