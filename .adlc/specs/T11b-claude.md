@@ -2,6 +2,50 @@
 
 Rev 1 — fork of the shared T11b contract for the claude leg of the three-way blind taste test (T11b rematch 2026-08-06). Same contract as its siblings; amendments to THIS file only.
 
+## Post-verdict amendments (blind taste test, 2026-08-06 — merged winner)
+
+The three-way verdict (Fable 5 judge, anonymized A/B/C): **A (this leg) won 23–21–17** — the only
+build with NO window where a guarantee silently breaks. Its strictly-below-the-prompt
+`conversationRef` anchor (the judge's single best idea) makes the re-fired request a function of
+the store *beneath* the prompt, so crash-window leftovers can never shift the content address;
+its crash test drops checkpoints from the real log, re-boots with a differently-answering stub,
+and asserts the ORIGINAL answer survives with `refute_receive {:llm_request, _}`. Loser findings
+(judge): B's boot catch-up re-fires every session prompt (summaries shift `conversation_ref` →
+non-byte-identical re-fires → duplicate answers on long sessions) — NOT folded; C's re-fire
+includes its own persisted request (dedup misses) — NOT folded. Per the judge's per-loser
+attributes, two folds landed in the merged tree:
+
+1. **B's native tool protocol** (folded): `LlmHandler.chat/3` accepts OpenAI `tools` + parses
+   `message.tool_calls` (malformed entries refused, never partial); the engine emits one
+   `ToolCall` delta per model call with the SEMANTIC args unwrapped from the native arguments
+   JSON, and reconstructs the assistant `tool_calls` message on resume with provider ids
+   synthesized DETERMINISTICALLY from the ToolCall delta's content address (restart-stable —
+   the same id the API accepted). The `TOOL:<id>` text protocol is gone.
+2. **B's spine-8 checkpoint** (folded): the engine emits ONE deterministic
+   `ConversationSummary` (response-timestamped, SHA-256 digest of the elided head, covers the
+   elided turn ids) once a session's conversation exceeds twice the window — the lens artifact
+   the window lens prefers beyond its bound. The LLM-backed summarizer reactor stays T11c's.
+3. **C's delivery leg** — NOT folded: A's `message.sent` delivery already claims the response's
+   timestamp (content-address dedup), the same determinism C's leg was praised for.
+4. **B's `PointerWalk` lens** — recorded as a future refactor (elegance-only; the merged engine
+   carries the walk inline).
+
+## Post-live-run findings (AC4/AC5 operational run, 2026-08-06 — recorded)
+
+- **kimi-k3 accepts ONLY `temperature: 1`** — the handler's 0.6 drew a 400 (`invalid
+  temperature`). Fixed to 1.0. A live-API constraint NO stub test can catch — the AC4 run is
+  the only place it surfaces.
+- **`:inets`/`:ssl` bootstrap** — the app declares only `:logger` extra, so mix prunes the OTP
+  code path; live runs must add the OTP ebins back (recorded in the run script).
+- **`tool_choice: "auto"` can be declined**: kimi-k3 answered in text rather than calling the
+  tool in the probe (the native protocol path remains stub-proven; forcing `tool_choice` is a
+  policy decision for the deployed harness).
+- The operational run itself: real question in → real kimi-k3 answer (`"Paris"`) persisted as
+  `message.sent`; the AC5 grounded follow-up (`"Which city was my previous question about?"`)
+  answered `"Paris"` — the model read its own prior claim from the store; SIGTERM; re-boot;
+  resume `%{resumed: 0, waiting: 0}`; sent count unchanged — no duplicate, answer persisted.
+
+
 Original Rev 1 — slice spec of the T11 umbrella contract (`.adlc/specs/T11.md`; spine pins 1, 2, 3, 4, 5, 6, 8, 9, 10 —
 deltas-as-events, entities-as-resolutions, intake-takes-deltas, primitives-ride/composites-point, the pointer is
 the crash-window guarantee, actors bound to containers, windows-as-lenses, tool-chains-as-linked-deltas,
