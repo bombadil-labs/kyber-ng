@@ -37,8 +37,9 @@ defmodule Kyber.Agent.Memory.Assoc.Index do
   # the cite-fan ceiling (post-premortem hardening): an entity keeps at
   # most this many `{:cite, _}` features no matter how many deltas cite it —
   # otherwise edges_walked grows linearly with session length in a live
-  # store (the AC2 flatness spine). Deterministic: the fold keeps the first
-  # `@max_cite_fan` citing deltas encountered, byte-identical on re-fire.
+  # store (the AC2 flatness spine). Deterministic: the fold prepends each
+  # citing delta, so the take keeps the MOST RECENT `@max_cite_fan` cites —
+  # byte-identical on re-fire.
   @max_cite_fan 8
 
   @doc """

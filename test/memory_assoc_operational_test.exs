@@ -150,8 +150,11 @@ defmodule Kyber.Agent.MemoryAssocOperationalTest do
       # level 1 — the sessB InferenceRequested's memoryPointers includes
       # sessA's canon head VIA THE ASSOCIATION CHANNELS (post-premortem:
       # the precision path alone must not satisfy this — recompute the
-      # prefetch and require the head in the divergent channel, which is
-      # empty by construction without the associative mode)
+      # prefetch and require the head in the channels, which are empty by
+      # construction without the associative mode). Post-emit the request's
+      # OWN memoryPointers cite both heads, so the shared {:cite,_} makes
+      # the link direct — head_a lands in resonant, not divergent; the
+      # channel-union assertion is the de-placibo (assoc-only output).
       {request_claims, _sig} = Map.get(set, request_id)
       request = Schema.resolve(request_claims)
       assert {:entity, @session_b, _ctx} = request.sessionId
@@ -159,8 +162,8 @@ defmodule Kyber.Agent.MemoryAssocOperationalTest do
       assert head_a in pointer_ids
 
       prefetch = Saturation.prefetch(set, @session_b, @prompt)
-      assert head_a in prefetch.divergent
-      assert prefetch.divergent != []
+      assert head_a in (prefetch.resonant ++ prefetch.divergent)
+      assert prefetch.resonant ++ prefetch.divergent != []
 
       # level 2 — the recorded request body carries the Memory system
       # message, byte-equal

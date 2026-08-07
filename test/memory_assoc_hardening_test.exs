@@ -127,6 +127,11 @@ defmodule Kyber.Agent.MemoryAssocHardeningTest do
   test "normalize/1 refuses a third shape instead of crashing" do
     assert %{memory_ids: [], associations: %{seeds: [], resonant: [], divergent: []}} =
              ContextBuilder.normalize({:ok, %{unexpected: "shape"}})
+
+    # a half-shaped map keeps its precision ids, gains empty channels —
+    # never silently zeroed (review round 2)
+    assert %{memory_ids: ["a", "b"], associations: %{seeds: [], resonant: [], divergent: []}} =
+             ContextBuilder.normalize({:ok, %{memory_ids: ["a", "b"]}})
   end
 
   test "human_author parity: the association leg ranks human-sourced entities like the precision leg" do

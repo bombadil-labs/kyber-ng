@@ -100,6 +100,10 @@ defmodule Kyber.Agent.ContextBuilder do
 
   def normalize({:ok, %{memory_ids: _ids, associations: _channels} = shaped}), do: shaped
 
+  def normalize({:ok, %{memory_ids: ids} = shaped}) when is_list(ids) do
+    Map.put(shaped, :associations, %{seeds: [], resonant: [], divergent: []})
+  end
+
   def normalize({:ok, _other}) do
     %{memory_ids: [], associations: %{seeds: [], resonant: [], divergent: []}}
   end
