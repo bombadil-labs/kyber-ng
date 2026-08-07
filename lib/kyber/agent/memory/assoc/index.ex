@@ -34,10 +34,22 @@ defmodule Kyber.Agent.Memory.Assoc.Index do
           canons: %{String.t() => Memory.memory()}
         }
 
-  @doc "Build the index from a delta set — a pure fold, byte-identical on re-fire."
-  @spec build(DeltaSet.t()) :: t()
-  def build(set) do
-    memories = Memory.resolve_set(set)
+  # the cite-fan ceiling (post-premortem hardening): an entity keeps at
+  # most this many `{:cite, _}` features no matter how many deltas cite it —
+  # otherwise edges_walked grows linearly with session length in a live
+  # store (the AC2 flatness spine). Deterministic: the fold keeps the first
+  # `@max_cite_fan` citing deltas encountered, byte-identical on re-fire.
+  @max_cite_fan 8
+
+  @doc """
+  Build the index from a delta set — a pure fold, byte-identical on re-fire.
+  Options: `:human_author` (the human key's `ed25519:` id) — threaded into
+  `Memory.resolve_set/2` so the association legs' tier sort ranks human
+  provenance exactly like the precision leg (post-premortem parity).
+  """
+  @spec build(DeltaSet.t(), keyword()) :: t()
+  def build(set, opts \\ []) do
+    memories = Memory.resolve_set(set, Keyword.get(opts, :human_author))
     canons = Map.new(memories, &{&1.entity, &1})
     head_owner = Map.new(memories, &{&1.head, &1.entity})
 
@@ -106,8 +118,11 @@ defmodule Kyber.Agent.Memory.Assoc.Index do
       %{role: role, target: {:delta, target, _ctx}}, acc
       when role in ["memoryPointers", "memoryUsed"] ->
         case Map.fetch(head_owner, target) do
-          {:ok, entity} -> Map.update(acc, entity, [id], &[id | &1])
-          :error -> acc
+          {:ok, entity} ->
+            Map.update(acc, entity, [id], &Enum.take([id | &1], @max_cite_fan))
+
+          :error ->
+            acc
         end
 
       _pointer, acc ->

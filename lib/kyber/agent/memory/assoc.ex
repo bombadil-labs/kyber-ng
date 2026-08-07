@@ -27,6 +27,10 @@ defmodule Kyber.Agent.Memory.Assoc do
   @max_candidates 32
   @max_resonant 8
   @divergent_cap 2
+  # the ceiling on any boot override of :divergent_cap (post-premortem
+  # hardening): the tail invariant (≤ 4+8+cap, precision never drowned)
+  # holds only if the override is bounded — this clamps it
+  @max_divergent_cap 8
   @min_shared 2
   # fixed constant, never N-dependent — re-fire-stable as the store grows
   @max_df 2
@@ -87,7 +91,11 @@ defmodule Kyber.Agent.Memory.Assoc do
   @spec walk(Index.t(), [String.t()], [String.t()], keyword()) :: walk_result()
   def walk(index, seeds, query_digests, opts \\ []) do
     session_id = Keyword.get(opts, :session_id)
-    divergent_cap = Keyword.get(opts, :divergent_cap, @divergent_cap)
+
+    divergent_cap =
+      opts
+      |> Keyword.get(:divergent_cap, @divergent_cap)
+      |> min(@max_divergent_cap)
 
     pool = MapSet.new(query_digests ++ Enum.flat_map(seeds, &entity_digests(index, &1)))
     structural = fn entity -> Enum.count(seeds, &direct?(index, entity, &1, session_id)) end

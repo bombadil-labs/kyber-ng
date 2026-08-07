@@ -65,8 +65,11 @@ defmodule Kyber.Agent.Memory.Retriever do
   @spec trajectory(DeltaSet.t(), String.t()) :: [String.t()]
   def trajectory(set, entity_id), do: Memory.trajectory(set, entity_id)
 
-  defp prefetch_opts(%{divergent_cap: cap}), do: [divergent_cap: cap]
-  defp prefetch_opts(_state), do: []
+  defp prefetch_opts(state) do
+    state
+    |> Map.take([:divergent_cap, :window, :human_author])
+    |> Map.to_list()
+  end
 
   defp materialize(store) when is_function(store, 0), do: store.()
   defp materialize(store), do: store

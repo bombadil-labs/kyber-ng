@@ -89,7 +89,9 @@ defmodule Kyber.Agent.ContextBuilder do
 
   @doc """
   Normalize a retriever answer to the associative shape (T13): the T11c
-  list gains empty channels; the associative map passes through.
+  list gains empty channels; the associative map passes through. ANY other
+  shape refuses to the empty shape — a contract violation never crashes the
+  gather handler and never invents a request (reject, never repair).
   """
   @spec normalize({:ok, [String.t()] | map()}) :: map()
   def normalize({:ok, memory_ids}) when is_list(memory_ids) do
@@ -97,6 +99,10 @@ defmodule Kyber.Agent.ContextBuilder do
   end
 
   def normalize({:ok, %{memory_ids: _ids, associations: _channels} = shaped}), do: shaped
+
+  def normalize({:ok, _other}) do
+    %{memory_ids: [], associations: %{seeds: [], resonant: [], divergent: []}}
+  end
 
   # ----------------------------------------------------------------- request
 

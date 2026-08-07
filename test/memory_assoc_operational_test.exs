@@ -10,11 +10,17 @@ defmodule Kyber.Agent.MemoryAssocOperationalTest do
   sessB's "relay deploy notes". The sessB prompt — "what commit is the
   relay deploy pinned to?" — must ground in sessA's memory.
 
-  Machine-checked, both levels:
+  Machine-checked, both levels (post-premortem hardening — the original
+  assertions were satisfiable by the T11c precision path alone, so AC4
+  could not detect the associative mode being deleted):
     1. the sessB `InferenceRequested`'s memoryPointers includes sessA's
-       canon head;
+       canon head **via the ASSOCIATION channels** — `associations.divergent`
+       specifically (the cross-session rare-link channel), which is empty
+       by construction with `assoc: false`;
     2. the recorded request body carries a `Memory: <sessA canon content>`
        system message, byte-equal.
+  The recording is preserved: the store jsonl is copied to a stable path
+  before the tmp dirs are removed.
 
   Answer-groundedness is a recorded live-run observation, never asserted
   (the T11b C2 fix) — the model's answer is printed for the record.
@@ -27,6 +33,7 @@ defmodule Kyber.Agent.MemoryAssocOperationalTest do
   alias Kyber.{Daemon, DurableStore, Harness, Keys, Schema, Wire}
   alias Kyber.Agent.Events, as: AgentEvents
   alias Kyber.Agent.Memory
+  alias Kyber.Agent.Memory.Assoc.Saturation
   alias Kyber.Agent.Memory.Retriever
 
   @memory_a "relay deploy pinned to commit 9f2ac4"
@@ -76,6 +83,14 @@ defmodule Kyber.Agent.MemoryAssocOperationalTest do
         File.rm_rf(key_dir)
         File.rm_rf(log_dir)
       end)
+
+      # the recording is preserved (post-premortem): copy the store jsonl
+      # to a stable path before on_exit removes the tmp dirs
+      recording_path =
+        Path.join(
+          System.tmp_dir!(),
+          "kyber-t13-ac4-record-#{System.unique_integer([:positive])}.jsonl"
+        )
 
       {:ok, _pid} = Daemon.boot(keyring_dir: key_dir, tick_ms: :manual, loop: :none)
 
@@ -133,12 +148,19 @@ defmodule Kyber.Agent.MemoryAssocOperationalTest do
       set = DurableStore.set()
 
       # level 1 — the sessB InferenceRequested's memoryPointers includes
-      # sessA's canon head
+      # sessA's canon head VIA THE ASSOCIATION CHANNELS (post-premortem:
+      # the precision path alone must not satisfy this — recompute the
+      # prefetch and require the head in the divergent channel, which is
+      # empty by construction without the associative mode)
       {request_claims, _sig} = Map.get(set, request_id)
       request = Schema.resolve(request_claims)
       assert {:entity, @session_b, _ctx} = request.sessionId
       pointer_ids = for {:delta, id, _ctx} <- request.memoryPointers, do: id
       assert head_a in pointer_ids
+
+      prefetch = Saturation.prefetch(set, @session_b, @prompt)
+      assert head_a in prefetch.divergent
+      assert prefetch.divergent != []
 
       # level 2 — the recorded request body carries the Memory system
       # message, byte-equal
@@ -159,6 +181,10 @@ defmodule Kyber.Agent.MemoryAssocOperationalTest do
         end)
 
       IO.puts("AC4 recorded answer: #{inspect(answer)}")
+
+      # preserve the recording before on_exit cleans the tmp dirs
+      File.cp!(Path.join(log_dir, "store.jsonl"), recording_path)
+      IO.puts("AC4 recording preserved at: #{recording_path}")
     end
   end
 end

@@ -29,17 +29,20 @@ defmodule Kyber.Agent.Memory.Assoc.Saturation do
   Pre-fetch the association set for the session's current window: build the
   index, seed from the window ∪ prompt digests, walk, and map entity ids to
   canon HEAD ids (provenance rides the canon render — the T11c
-  provenance-as-authority rule). Options: `:divergent_cap`.
+  provenance-as-authority rule). Options: `:divergent_cap` (ceilinged by
+  `Assoc`), `:window` (the engine's boot override of N — one N, one split),
+  `:human_author` (parity with the precision leg's tier sort).
   """
   @spec prefetch(DeltaSet.t(), String.t(), String.t(), keyword()) :: prefetch()
   def prefetch(set, session_id, prompt, opts \\ []) do
-    index = Index.build(set)
+    window_n = Keyword.get(opts, :window, 8)
+    index = Index.build(set, Keyword.take(opts, [:human_author]))
 
     window_contents =
       set
       |> ContextBuilder.conversation(session_id)
       |> below_prompt(prompt)
-      |> ContextBuilder.window()
+      |> ContextBuilder.window(window_n)
       |> elem(1)
       |> Enum.map(& &1.content)
 
@@ -64,11 +67,17 @@ defmodule Kyber.Agent.Memory.Assoc.Saturation do
 
   # turns strictly below the prompt: the prompt delta is already in the set
   # when the retriever fires, so the walk grounds on the conversation BELOW
-  # it — a not-yet-persisted prompt (or a direct test call) sees every turn
+  # it — a not-yet-persisted prompt (or a direct test call) sees every turn.
+  # The prompt is its OWN turn's LAST occurrence in the ordered
+  # conversation (a repeated prompt re-windows below the current one, never
+  # the first — the conversation_ref discipline, post-premortem fix).
   defp below_prompt(turns, prompt) do
-    case Enum.find_index(turns, &(&1.role == "user" and &1.content == prompt)) do
+    case turns
+         |> Enum.with_index()
+         |> Enum.filter(fn {turn, _i} -> turn.role == "user" and turn.content == prompt end)
+         |> List.last() do
       nil -> turns
-      index -> Enum.take(turns, index)
+      {_turn, index} -> Enum.take(turns, index)
     end
   end
 end
