@@ -231,3 +231,41 @@ RECORDED BUILD FINDINGS (future implementers, read these):
    `associations` map (AC2/AC4 assertions pass because heads ARE in memoryPointers via the
    precision list). The design correctly anticipates a future bounded precision list — no
    code change made; recorded.
+
+## Post-premortem hardening (2026-08-07 — pre-main-merge; the P1 premortem ran post-fold and its defect-class findings were fixed BEFORE the branch merges to main)
+
+FIXED (lib + tests):
+1. AC4 de-placiboed: the machine-checked levels now assert the ASSOCIATION CHANNELS
+   (`associations.divergent` carries sessA's head) — the precision path alone can no longer
+   satisfy the gate; the recording is preserved to a stable path (was destroyed by on_exit).
+2. below_prompt windows strictly below the prompt's OWN last occurrence — the conversation_ref
+   discipline, timestamp-strict in effect; a repeated prompt re-windows below the CURRENT one
+   (was: content-equality first-occurrence truncation).
+3. normalize/1 refuses any third shape to the empty shape (never crashes, never invents).
+4. human_author threaded through `Index.build/2` — the association legs' tier sort ranks human
+   provenance exactly like the precision leg.
+5. `{:cite, _}` fan-out ceilinged at 8 per entity — edges_walked stays flat under session
+   growth (was: unbounded; the AC2 flatness spine).
+6. `:divergent_cap` boot override ceilinged at 8 — the ≤ 4+8+cap tail invariant holds under
+   any configuration.
+7. Restart determinism pinned: the wire round-trip (encode -> decode -> re-admit) yields a
+   byte-identical walk.
+8. df-saturated steady state pinned: shared digests above @max_df decay the divergent channel
+   to empty — GRACEFUL decay, documented, never a fabricated link.
+
+DOCUMENTED DECISIONS (not code — the honest state of the contract):
+- Per-turn cost in assoc mode is O(store) twice (precision leg + Index.build) — the AC2 flat
+  metric measures walk-internal edges only; the linear growth is ACCEPTED for this slice; a
+  store-side precomputed projection is T14's candidate mitigation.
+- The associative pointer tail is empty by construction today (T11c precision returns ALL
+  resolved memories; the dedupe removes the channel heads from the wire). The channels' value
+  rides the `associations` map until precision is bounded — the design anticipates it.
+- Cold start is a stated property: a session with no local entities yields empty seeds and
+  empty channels (never a crash, never a fabricated link).
+- The human tier (signer-derived) applies to MemoryEdited heads; the reason-string "human_edit"
+  fallback remains documented pending operator-key boot wiring (the T11c carry — unresolved).
+
+REMAINING CARRIES into T14 (feature-class, not defects): prompt-answer-as-delta + liveness,
+idempotence enforcement, URL policy, policy epochs + retroactive revocation, memory-read
+permission seam, attestation keys, A/B seam contract, AC1 pre-persistence re-fire window,
+fs.read output cap + concurrency bound, boundary-policy statement for shell.
