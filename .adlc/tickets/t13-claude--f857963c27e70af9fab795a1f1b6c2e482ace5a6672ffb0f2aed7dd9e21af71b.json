@@ -1,0 +1,19 @@
+{
+  "acceptance": "AC1 (walk pure and bounded) + AC2 (groove is saturation) + AC3 (synchronicity is a graph property) + AC10 (gates)",
+  "gate": "mix test && test -f lib/kyber/agent/memory/assoc.ex && test -f lib/kyber/agent/memory/assoc/index.ex && test -f lib/kyber/agent/memory/assoc/saturation.ex && test -f lib/kyber/agent/context_builder.ex",
+  "id": "T13-claude",
+  "rails": [
+    "deps/",
+    "spec/",
+    "SPEC.md",
+    "mix.exs",
+    "config/"
+  ],
+  "scope": [
+    "lib/kyber/agent/memory/assoc*",
+    "lib/kyber/agent/memory/retriever.ex",
+    "lib/kyber/agent/context_builder.ex",
+    "test/memory_assoc*"
+  ],
+  "title": "T13-claude: the agent remembers — claude leg (blind two-way build, shared converged plan)"
+}
