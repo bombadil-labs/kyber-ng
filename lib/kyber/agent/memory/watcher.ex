@@ -56,7 +56,7 @@ defmodule Kyber.Agent.Memory.Watcher do
   defp observe(memory, vault_dir, seed, ts) do
     with {:ok, raw} <- File.read(Projector.path(vault_dir, memory.entity)),
          {:ok, body} <- parse_body(raw),
-         true <- body != memory.content do
+         true <- body != canonical(memory.content) do
       with {:ok, signed} <- Events.memory_edited(seed, ts, memory.head, body, "human_edit") do
         {:ok, Wire.envelope(signed)}
       end
@@ -70,11 +70,23 @@ defmodule Kyber.Agent.Memory.Watcher do
   end
 
   # the projector's shape: frontmatter, then the body with one trailing
-  # newline — strip exactly that newline so the canon comparison is exact
+  # newline. EOL canonicalization (premortem C2 2026-08-06, pinned in AC6):
+  # BOTH the file body and the canon are normalized the same way — CRLF to
+  # LF, trailing EOLs stripped — so a human save that only touches line
+  # endings mints NO edit, and the stored content never embeds `\r` bytes.
   defp parse_body(raw) do
-    case String.split(raw, "\n---\n", parts: 2) do
-      [_frontmatter, body] -> {:ok, String.replace_suffix(body, "\n", "")}
+    # canonicalize the WHOLE file first — the frontmatter delimiter is
+    # CRLF-mangled too on a Windows save, not just the body
+    case String.split(canonical(raw), "\n---\n", parts: 2) do
+      [_frontmatter, body] -> {:ok, body}
       _ -> :malformed
     end
+  end
+
+  defp canonical(body) do
+    body
+    |> String.replace("\r\n", "\n")
+    |> String.replace("\r", "\n")
+    |> String.trim_trailing("\n")
   end
 end

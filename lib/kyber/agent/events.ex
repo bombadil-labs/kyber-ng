@@ -11,7 +11,8 @@ defmodule Kyber.Agent.Events do
   the T11a `type` declaration rides last. Kind markers: `InferenceRequested`
   routes as `"promptRef"`, `ResponseDelta` as `"requestRef"`, `ToolCall` as
   `"tool"`, `ToolResult` as `"call"`, `ConversationSummary` as
-  `"sessionId"`, `MemoryEntity` as `"entity"`, `MemoryEdited` as `"edits"`.
+  `"sessionId"`, `MemoryEntity` as `"entity"`, `MemoryEdited` as `"edits"`,
+  `GateDecision` as `"decides"`.
   """
 
   alias Rhizomatic.Delta
@@ -76,6 +77,23 @@ defmodule Kyber.Agent.Events do
       %{role: "call", target: {:delta, call_id, "result"}},
       %{role: "result", target: {:string, result}},
       if(status, do: [%{role: "status", target: {:string, status}}], else: [])
+    ])
+  end
+
+  @doc """
+  `GateDecision` — the permission gate's attested decision on a `ToolCall`
+  (T12): `allow` / `deny` / `refuse`, pointer-linked to the call it
+  decides. Every decision is a delta (auditable); a denied or refused call
+  emits NO `ToolResult` — reject, never repair.
+  """
+  @spec gate_decision(String.t(), number(), String.t(), String.t(), String.t(), String.t() | nil) ::
+          {:ok, signed()} | {:error, term()}
+  def gate_decision(seed, ts, call_id, verdict, policy, reason \\ nil) do
+    build(seed, ts, "GateDecision", [
+      %{role: "decides", target: {:delta, call_id, "decided"}},
+      %{role: "verdict", target: {:string, verdict}},
+      %{role: "policy", target: {:string, policy}},
+      if(reason, do: [%{role: "reason", target: {:string, reason}}], else: [])
     ])
   end
 

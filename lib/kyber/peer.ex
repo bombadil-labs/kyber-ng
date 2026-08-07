@@ -241,12 +241,29 @@ defmodule Kyber.Peer do
         :gen_tcp.close(socket)
 
       :too_large ->
-        # P5 finding 1: a frame over the cap is refused with a clean status
+        # P5 finding 1: a frame over the cap is refused with a clean status.
+        # The refusal must REACH the client: closing with unread client data
+        # still in the receive buffer makes the kernel RST — and RST discards
+        # the queued outgoing refusal (observed flake: the client recv'd
+        # {:error, :closed} with no line). Flush the status + FIN first, then
+        # drain the incoming stream until the client closes, then close.
         :gen_tcp.send(socket, "err frame_too_large\n")
+        :gen_tcp.shutdown(socket, :write)
+        drain(socket)
         :gen_tcp.close(socket)
 
       :drop ->
         :gen_tcp.close(socket)
+    end
+  end
+
+  # consume the client's remaining stream so the close is a clean FIN, not
+  # an RST (see :too_large); bounded by the recv timeout per read — the
+  # client closes once it sees the refusal, so the drain terminates
+  defp drain(socket) do
+    case :gen_tcp.recv(socket, 0, 1_000) do
+      {:ok, _packet} -> drain(socket)
+      _closed -> :ok
     end
   end
 

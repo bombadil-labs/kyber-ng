@@ -134,6 +134,26 @@ defmodule Kyber.DaemonTest do
     on_exit(fn -> if port in Port.list(), do: Port.close(port) end)
     {:os_pid, os_pid} = Port.info(port, :os_pid)
 
+    # the spawn's pid is assigned before the exec is VISIBLE to `ps -p` —
+    # the daemon's own liveness check (os_pid_alive?/1). Writing the lock
+    # before visibility makes the daemon read the lock as stale and boot
+    # instead of refusing (flake, observed ~1-in-5 under load). Poll with
+    # the daemon's exact check until the process is provably alive
+    # (subprocess sleep = explicit state polling, the T12 pattern).
+    alive? = fn ->
+      {_out, code} = System.cmd("ps", ["-p", Integer.to_string(os_pid)], stderr_to_stdout: true)
+      code == 0
+    end
+
+    unless alive?.() do
+      Enum.reduce_while(1..40, :pending, fn _, _ ->
+        {_, _} = System.cmd("sleep", ["0.05"])
+        if alive?.(), do: {:halt, :visible}, else: {:cont, :pending}
+      end)
+    end
+
+    assert alive?.()
+
     File.write!(ctx.log_path <> ".lock", Integer.to_string(os_pid))
 
     assert {:error, {:already_running, path}} = Daemon.boot(keyring_dir: ctx.keyring_dir)

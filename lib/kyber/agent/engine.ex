@@ -44,6 +44,9 @@ defmodule Kyber.Agent.Engine do
   Start the engine. Options: `:llm` (a `Kyber.Agent.LlmHandler` struct,
   required), `:window` (last-N turn lens, default #{@default_window}),
   `:tools` (OpenAI function specs, default `ToolExecutor.tool_specs/0`),
+  `:tool_keys` (the registry-accurate model-name -> action-id map, default
+  nil — the syntactic `ToolExecutor.tool_key/1` fallback; T12 action ids
+  carry dots, so a real registry wires this map),
   `:store` (thunk answering the delta set, default the durable store),
   `:sink` (wire consumer, default `Kyber.Daemon.emit/1`), `:name` (default
   `#{inspect(__MODULE__)}`; `nil` for anonymous).
@@ -92,6 +95,7 @@ defmodule Kyber.Agent.Engine do
        llm: Keyword.fetch!(opts, :llm),
        window: Keyword.get(opts, :window, @default_window),
        tools: Keyword.get(opts, :tools, ToolExecutor.tool_specs()),
+       tool_keys: Keyword.get(opts, :tool_keys),
        store: Keyword.get(opts, :store, fn -> DurableStore.set() end),
        sink: Keyword.get(opts, :sink, &Kyber.Daemon.emit/1),
        notify: Keyword.get(opts, :notify),
@@ -146,9 +150,19 @@ defmodule Kyber.Agent.Engine do
 
   defp dispatch(%{id: id, claims: claims}, state) do
     case {kind(claims), Schema.resolve(claims)} do
-      {"promptRef", %{type: "InferenceRequested"} = typed} -> infer(id, typed, state)
-      {"call", %{type: "ToolResult"} = typed} -> tool_result(id, typed, state)
-      _other -> state
+      {"promptRef", %{type: "InferenceRequested"} = typed} ->
+        infer(id, typed, state)
+
+      {"call", %{type: "ToolResult"} = typed} ->
+        tool_result(id, typed, state)
+
+      {"decides",
+       %{type: "GateDecision", verdict: verdict, decides: {:delta, call_id, _ctx}} = typed}
+      when verdict != :allow ->
+        refusal(call_id, typed, state)
+
+      _other ->
+        state
     end
   end
 
@@ -185,7 +199,7 @@ defmodule Kyber.Agent.Engine do
         # delta carries the SEMANTIC args (the `args` property unwrapped from
         # the native arguments JSON — never the raw envelope)
         Enum.reduce(calls, state, fn {_provider_id, name, arguments}, state ->
-          call_tool(turn, ToolExecutor.tool_key(name), native_args(arguments), state)
+          call_tool(turn, tool_key(state, name), native_args(arguments), state)
         end)
 
       {:ok, content} ->
@@ -297,6 +311,65 @@ defmodule Kyber.Agent.Engine do
     end
   end
 
+  # the refusal loop (T14 carry #1, closed pre-merge — proven live by the
+  # AC4 run: with the default deny-all gate every tool call was refused and
+  # the turn hung forever). A denied/refused GateDecision for a pending
+  # call feeds the model the SAME assistant tool_calls message plus a
+  # tool-role refusal, then re-completes the turn — the model re-plans
+  # instead of the chain waiting on a ToolResult that never comes. The
+  # executor's contract is untouched (still no ToolResult for refusals).
+  defp refusal(call_id, typed, state) do
+    case Map.get(state.pending, call_id) do
+      nil ->
+        state
+
+      %{turn: turn, tool_id: tool_id, args: args} ->
+        set = state.store.()
+
+        if answered?(set, turn.request_id) do
+          %{state | skipped: state.skipped + 1, pending: Map.delete(state.pending, call_id)}
+        else
+          reason = typed.reason || Atom.to_string(typed.verdict)
+
+          turn = %{
+            turn
+            | messages:
+                turn.messages ++
+                  [
+                    %{
+                      "role" => "assistant",
+                      "content" => nil,
+                      "tool_calls" => [
+                        %{
+                          "id" => provider_id(call_id),
+                          "type" => "function",
+                          "function" => %{
+                            "name" => ToolExecutor.tool_name(tool_id),
+                            "arguments" => args
+                          }
+                        }
+                      ]
+                    },
+                    %{
+                      "role" => "tool",
+                      "tool_call_id" => provider_id(call_id),
+                      "content" => "refused: " <> reason
+                    }
+                  ]
+          }
+
+          state = %{state | pending: Map.delete(state.pending, call_id)}
+          complete(turn, set, state)
+        end
+    end
+  end
+
+  # the registry-accurate name -> action-id map when wired (T12 action ids
+  # carry dots — the syntactic fallback would misread `fs_read` as
+  # `fs:read`); the T11b stub shape resolves syntactically either way
+  defp tool_key(%{tool_keys: nil}, name), do: ToolExecutor.tool_key(name)
+  defp tool_key(%{tool_keys: map}, name), do: Map.get(map, name, ToolExecutor.tool_key(name))
+
   # the provider tool-call id is a DETERMINISTIC function of the ToolCall
   # delta's content address — restart-stable, so a resumed chain reconstructs
   # the same assistant tool_calls message the API accepted (B's posture)
@@ -375,7 +448,7 @@ defmodule Kyber.Agent.Engine do
 
   defp build_messages(set, session_id, memory_ids, window) do
     turns = ContextBuilder.conversation(set, session_id)
-    {elided, windowed} = Enum.split(turns, max(length(turns) - window, 0))
+    {elided, windowed} = ContextBuilder.window(turns, window)
 
     memory_notes =
       for id <- memory_ids,

@@ -71,6 +71,11 @@ defmodule Kyber.Schema.Genesis do
     {"ToolCall", requires: [{"tool", "entity"}, {"args", "string"}, {"requestRef", "delta"}]},
     {"ToolResult",
      requires: [{"call", "delta"}, {"result", "string"}], optional: [{"status", "string"}]},
+    # T12: the permission gate's attested decision on a ToolCall (auditable;
+    # a denied/refused call emits NO ToolResult — reject, never repair)
+    {"GateDecision",
+     requires: [{"decides", "delta"}, {"verdict", "string"}, {"policy", "string"}],
+     optional: [{"reason", "string"}]},
     {"ConversationSummary",
      requires: [{"sessionId", "entity"}, {"content", "string"}], many: [{"covers", "delta"}]},
     {"MemoryEntity",

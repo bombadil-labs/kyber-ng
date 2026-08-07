@@ -1,5 +1,14 @@
 {
+  "_adlcArchive": {
+    "archivedAt": "2026-08-07T05:01:33.230Z",
+    "reason": "completed",
+    "sourceRevision": null,
+    "sourceStoreHash": "7f4ea37c6bb2e6e83748d7925c13646818f8e7020f4fe34aa5e99532f01e1fef",
+    "ticketHash": "b16c7d9d40e4f7c38c06983722bc446a1a78653d07cdd3be97108a26f6c9f1e8",
+    "version": 1
+  },
   "acceptance": "AC6 (memory store round-trips through markdown) + AC10 (gates incl. A/B property)",
+  "completed": true,
   "gate": "mix test && test -f lib/kyber/agent/memory.ex && test -f lib/kyber/agent/memory/projector.ex && test -f lib/kyber/agent/memory/watcher.ex && test -f lib/kyber/agent/memory/tierer.ex && test -f lib/kyber/agent/memory/retriever.ex",
   "id": "T11c-claude",
   "rails": [
