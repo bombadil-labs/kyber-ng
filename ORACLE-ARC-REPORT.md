@@ -108,6 +108,14 @@ What landed:
 
 ## 2. Carries into T14 (the reactor)
 
+**Correction (2026-08-07, user-caught): the premortems ran post-fold as close-out formalities —
+a deviation from the ADLC P1 intent (premortem BEFORE the build). The defect-class findings
+were fixed PRE-MAIN-MERGE in the hardening round (commit `2cd769f`):** AC4 de-placiboed
+(channel-level assertions), below_prompt → conversation_ref discipline, normalize/1 refusal,
+human_author threaded into Index.build, cite-fan cap, divergent_cap ceiling, restart
+determinism pinned, df-saturated + cold-start stated. Documented decisions: O(store) ×2
+accepted, empty pointer tail by construction, human-tier boot wiring still pending.
+
 The premortems are the arc's richest byproduct — every finding recorded as a carry, none
 lost:
 
