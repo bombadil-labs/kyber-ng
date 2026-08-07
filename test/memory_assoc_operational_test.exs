@@ -59,12 +59,14 @@ defmodule Kyber.Agent.MemoryAssocOperationalTest do
     else
       api_key = System.fetch_env!("MOONSHOT_API_KEY")
 
-      # ---- tmp keyring + tmp store, the agent_daemon_test choreography
-      key_dir =
-        Path.join(System.tmp_dir!(), "kyber-t13-keyring-#{System.unique_integer([:positive])}")
+      # ---- tmp keyring + tmp store, the agent_daemon_test choreography.
+      # os_time + unique_integer: globally unique per run (unique_integer
+      # alone restarts at 1 in every VM — a killed run's leftover dir
+      # collides with the next run's, :already_exists)
+      uniq = "#{System.os_time()}-#{System.unique_integer([:positive])}"
 
-      log_dir =
-        Path.join(System.tmp_dir!(), "kyber-t13-log-#{System.unique_integer([:positive])}")
+      key_dir = Path.join(System.tmp_dir!(), "kyber-t13-keyring-#{uniq}")
+      log_dir = Path.join(System.tmp_dir!(), "kyber-t13-log-#{uniq}")
 
       File.mkdir_p!(key_dir)
       File.mkdir_p!(log_dir)

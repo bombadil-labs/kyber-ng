@@ -33,7 +33,7 @@ defmodule Kyber.Agent.HttpClient do
     # would trip the xref warning under --warnings-as-errors
     @impl true
     def post(url, headers, body, _state) do
-      {:ok, _apps} = :application.ensure_all_started([:inets, :ssl])
+      {:ok, _apps} = ensure_http_apps()
       # a caller-supplied content-type rides (the T12 http action posts
       # text/plain); the LLM handler passes none and stays application/json
       content_type = content_type(headers)
@@ -51,6 +51,39 @@ defmodule Kyber.Agent.HttpClient do
 
         {:error, reason} ->
           {:error, reason}
+      end
+    end
+
+    # mix's runtime prunes the code path to the project + declared apps
+    # (observed: :inets/:ssl absent from :code.get_path() under mix run /
+    # mix test), and mix.exs is a frozen rail — so the real adapter repairs
+    # the path from the OTP install at first use, then starts the apps.
+    # Proven live by the AC4 operational run (inets.app unreachable →
+    # MatchError in the engine's LLM exchange, silent turn).
+    defp ensure_http_apps do
+      # the full ssl dependency closure is pruned by mix's runtime code path:
+      # inets -> ssl -> public_key -> asn1, crypto (crypto is declared)
+      for app <- [:asn1, :public_key, :ssl, :inets], do: otp_ebin_on_path(app)
+      :application.ensure_all_started([:inets, :ssl])
+    end
+
+    # the OTP lib dir is resolved from the install ROOT (code:lib_dir/1
+    # fails once the code path is pruned — it consults the path too)
+    defp otp_ebin_on_path(app) do
+      prefix = Atom.to_string(app) <> "-"
+      lib = Path.join(:code.root_dir(), "lib")
+
+      case File.ls(lib) do
+        {:ok, entries} ->
+          case Enum.find(entries, &String.starts_with?(&1, prefix)) do
+            nil -> :ok
+            # :code.add_patha/1 takes a charlist (OTP API) — Path.join
+            # returns a binary; the mismatch is an ArgumentError at runtime
+            dir -> :code.add_patha(String.to_charlist(Path.join([lib, dir, "ebin"])))
+          end
+
+        _error ->
+          :ok
       end
     end
 
