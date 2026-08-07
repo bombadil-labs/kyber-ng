@@ -1,5 +1,14 @@
 {
+  "_adlcArchive": {
+    "archivedAt": "2026-08-07T07:25:32.097Z",
+    "reason": "completed",
+    "sourceRevision": null,
+    "sourceStoreHash": "ce48aab21592f26bca9327f455acd988f5c8a2c49e6a8114689ff90f196ca22d",
+    "ticketHash": "a9e79e48209d80b198e976ab441f9cbf87202e39b67c6e8bfb308a0980407f0c",
+    "version": 1
+  },
   "acceptance": "AC1 (chain is the same chain) + AC2 (gate is the boundary) + AC3 (bounded by construction) + AC10 (gates)",
+  "completed": true,
   "gate": "mix test && test -f lib/kyber/agent/action.ex && test -f lib/kyber/agent/action/gate.ex && test -f lib/kyber/agent/action/fs.ex && test -f lib/kyber/agent/action/shell.ex && test -f lib/kyber/agent/action/http.ex",
   "id": "T12-k3",
   "rails": [
