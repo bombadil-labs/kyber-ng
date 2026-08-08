@@ -27,7 +27,23 @@ defmodule Kyber.Agent.Policy do
   @reason_host "url_policy: host not allowed by the current epoch"
   @reason_forked "url_policy: epoch forked (fail closed)"
 
-  @type epoch :: %{id: String.t(), allow_hosts: [String.t()], allow_schemes: [String.t()]}
+  # T14c D3: the memory family — a SECOND governance family over the same
+  # Policy claim vocabulary, fail-closed from birth (no legacy behavior to
+  # preserve; the URL family's fail-open ungoverned default is recorded debt
+  # with a deferred owner, not precedent)
+  @memory_family "memory"
+  @memory_gated_tools ["memory.read"]
+
+  @reason_memory_entity "memory_policy: entity not allowed by the current epoch"
+  @reason_memory_forked "memory_policy: epoch forked (fail closed)"
+  @reason_memory_ungoverned "memory_policy: no governing epoch (fail closed)"
+
+  @type epoch :: %{
+          id: String.t(),
+          allow_hosts: [String.t()],
+          allow_schemes: [String.t()],
+          allow_entities: [String.t()]
+        }
 
   @spec default_family() :: String.t()
   def default_family, do: @default_family
@@ -43,6 +59,42 @@ defmodule Kyber.Agent.Policy do
 
   @spec reason_forked() :: String.t()
   def reason_forked, do: @reason_forked
+
+  @spec memory_family() :: String.t()
+  def memory_family, do: @memory_family
+
+  @spec memory_gated_tools() :: [String.t()]
+  def memory_gated_tools, do: @memory_gated_tools
+
+  @spec reason_memory_entity() :: String.t()
+  def reason_memory_entity, do: @reason_memory_entity
+
+  @spec reason_memory_forked() :: String.t()
+  def reason_memory_forked, do: @reason_memory_forked
+
+  @spec reason_memory_ungoverned() :: String.t()
+  def reason_memory_ungoverned, do: @reason_memory_ungoverned
+
+  @doc "The current memory-family epoch: `:none`, `{:error, :forked}`, or `{:ok, epoch}`."
+  @spec memory_epoch(map()) :: {:ok, epoch()} | :none | {:error, :forked}
+  def memory_epoch(set), do: current(set, @memory_family)
+
+  @doc """
+  The exact memory check: `:allow` iff the entity id rides the epoch's
+  `allow_entity` list, else the pinned refusal reason. NO downcase on
+  entity ids (the T14b downcase pin is host-specific — entity ids are
+  content-derived, case is not a DNS-class equivalence).
+  """
+  @spec check_memory(epoch(), String.t()) :: :allow | {:refuse, String.t()}
+  def check_memory(epoch, entity_id) do
+    if entity_id in epoch.allow_entities,
+      do: :allow,
+      else: {:refuse, @reason_memory_entity}
+  end
+
+  @doc "True iff the epoch allows the entity — `check_memory/2` as a predicate."
+  @spec matches_memory?(epoch(), String.t()) :: boolean()
+  def matches_memory?(epoch, entity_id), do: check_memory(epoch, entity_id) == :allow
 
   @doc """
   The current epoch of a policy family: the unretracted `Policy` claim
@@ -74,7 +126,16 @@ defmodule Kyber.Agent.Policy do
         :none
 
       [{id, res}] ->
-        {:ok, %{id: id, allow_hosts: res.allow_host, allow_schemes: res.allow_scheme}}
+        {:ok,
+         %{
+           id: id,
+           allow_hosts: res.allow_host,
+           allow_schemes: res.allow_scheme,
+           # T14c D3/L1: the memory allow-list — only compiles/runs against
+           # the evolved Policy schema (allow_entity is visible to typed
+           # resolution only after the genesis evolution + regen)
+           allow_entities: for({:entity, entity_id, _ctx} <- res.allow_entity, do: entity_id)
+         }}
 
       _two_heads ->
         {:error, :forked}

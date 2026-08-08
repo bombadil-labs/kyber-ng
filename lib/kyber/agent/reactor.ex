@@ -131,7 +131,9 @@ defmodule Kyber.Agent.Reactor do
   Start the reactor (pin 2/H3): BY the daemon, under `loop: :reactor` only,
   registered under the module name. Options: `:seed` (the daemon's agent
   seed, required), `:budget_cap` (default #{@default_cap}), `:engine`
-  (keyword | :none, default :none), `:test_pid` (observation pid).
+  (keyword | :none, default :none), `:test_pid` (observation pid),
+  `:operator_seed` (hex — T14c D5: emit the boot attestation at init when
+  the store holds an unretracted seed claim under that seed; default nil).
   """
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
@@ -145,7 +147,8 @@ defmodule Kyber.Agent.Reactor do
 
     with {:ok, engine} <- start_engine(seed, engine_opts),
          {:ok, builder} <- builder_for(seed, engine_opts),
-         {:ok, executor} <- executor_for(seed, engine_opts) do
+         {:ok, executor} <- executor_for(seed, engine_opts),
+         :ok <- attest_boot(opts, seed) do
       # the handlers (pin 6, module functions of (delta, ctx)) reach the
       # state-dependent machinery through the reactor's own process
       # dictionary — the callbacks run inside this process, so the
@@ -490,6 +493,67 @@ defmodule Kyber.Agent.Reactor do
        context: Keyword.get(opts, :context, %{}),
        store: &DurableStore.set/0
      )}
+  end
+
+  # T14c D5/H3: the operator-key boot attestation. Boot opt :operator_seed
+  # (hex), default nil => no attestation (existing boots unchanged); no
+  # UNRETRACTED seed claim in the store under [the boot carrying] the
+  # operator seed => no attestation — skip, never crash. The attested seed
+  # claim is THE oracle seed claim (T14a pin 17: asserted by the daemon at
+  # boot, signed by its boot key — "operator-key signing stays T14c" means
+  # the ATTESTATION is operator-signed, never the seed claim). Emission at
+  # init via DIRECT DurableStore.append (never Daemon.emit); ts = the seed
+  # claim's claims.timestamp — the only store-derived clock at boot — so
+  # reboots over one store merge to exactly one attestation (union-no-op).
+  defp attest_boot(opts, agent_seed) do
+    case Keyword.get(opts, :operator_seed) do
+      nil ->
+        :ok
+
+      operator_seed ->
+        agent_author = Keys.author_for_seed(agent_seed)
+
+        case unretracted_seed_claim(DurableStore.set()) do
+          nil ->
+            :ok
+
+          {seed_claim_id, seed_claims} ->
+            case Events.boot_attestation(
+                   operator_seed,
+                   seed_claims.timestamp,
+                   agent_author,
+                   seed_claim_id
+                 ) do
+              {:ok, signed} ->
+                # skip, never crash: an append failure must not fail the boot
+                case DurableStore.append(Wire.envelope(signed)) do
+                  :ok -> :ok
+                  {:error, _reason} -> :ok
+                end
+
+              {:error, _reason} ->
+                :ok
+            end
+        end
+    end
+  end
+
+  # THE unretracted seed claim: kind "seed" (the oracle seed claim the
+  # daemon asserted at boot), no negates pointer at its id — the store
+  # only learns, so retraction-detection is the closing mechanism
+  defp unretracted_seed_claim(set) do
+    retracted = retracted_ids(set)
+
+    Enum.find_value(set, fn {id, {claims, _sig}} ->
+      if kind(claims) == "seed" and not MapSet.member?(retracted, id), do: {id, claims}
+    end)
+  end
+
+  defp retracted_ids(set) do
+    for {_id, {claims, _sig}} <- set,
+        %{role: "negates", target: {:delta, target, _ctx}} <- claims.pointers,
+        into: MapSet.new(),
+        do: target
   end
 
   defp kind(%{claims: %{pointers: [%{role: role} | _rest]}}), do: role

@@ -41,7 +41,7 @@ defmodule Kyber.Agent.ToolExecutor do
   """
 
   alias Kyber.{Gather, Schema, Wire}
-  alias Kyber.Agent.{Events, Policy}
+  alias Kyber.Agent.{Events, Memory, Policy}
   alias Kyber.Agent.Action.Gate
 
   @doc "The stub registry: `tool:echo` answers its args."
@@ -84,6 +84,35 @@ defmodule Kyber.Agent.ToolExecutor do
   @doc "The registry-accurate name -> key map (dots and colons both sanitize to `_`)."
   @spec tool_key_map(%{optional(String.t()) => term()}) :: %{String.t() => String.t()}
   def tool_key_map(registry), do: Map.new(registry, fn {key, _entry} -> {tool_name(key), key} end)
+
+  @doc """
+  The memory-tool registry listing (T14c M1): `memory.read` for
+  `tool_specs`/`tool_key_map` ONLY — the gate fires on tool_id membership
+  regardless of registry origin, and the executor resolves reads in the
+  dedicated `run` clause over the handler's store snapshot (a 1-arity stub
+  closure's status is hardwired `"ok"` and the action-data MFA cannot see
+  the captured store, so `canon nil => {"", "unknown_entity"}` lives in
+  that clause). `store_fn` is accepted for the pinned shape — the listing
+  itself carries no store access.
+  """
+  @spec memory_tools(fun()) :: %{String.t() => map()}
+  def memory_tools(_store_fn) do
+    %{
+      "memory.read" => %{
+        description: "Read the memory canon for an entity.",
+        parameters: %{
+          "type" => "object",
+          "properties" => %{
+            "entity" => %{
+              "type" => "string",
+              "description" => "The entity id whose memory canon to read."
+            }
+          },
+          "required" => ["entity"]
+        }
+      }
+    }
+  end
 
   @doc """
   The gather handler closure. Options: `:seed` (required), `:tools` (the
@@ -137,14 +166,22 @@ defmodule Kyber.Agent.ToolExecutor do
       nil ->
         decision = Gate.decide(gate, tool_id, args)
 
-        # the URL policy gate (T14b) sees only permitted calls: AFTER the
-        # permission gate allows, BEFORE any execution
+        # the policy layers (T14b url_policy, T14c memory_policy) see only
+        # permitted calls: AFTER the permission gate allows, BEFORE any
+        # execution. The decide-chain order is pinned: Gate.decide ->
+        # url_policy -> memory_policy -> execute — layers disjoint by tool
+        # id; memory_policy appended LAST because existing refusal
+        # precedence is regression-frozen and appending is the only order
+        # that provably cannot perturb the T14a/T14b suite. The FIRST
+        # refusal claims the call's single GateDecision slot.
         policy_verdict =
-          if decision.verdict == :allow, do: url_policy(set, tool_id, args), else: :allow
+          if decision.verdict == :allow,
+            do: policy_verdict(set, tool_id, args),
+            else: :allow
 
         case policy_verdict do
-          {:refuse, reason, epoch_id} ->
-            case Events.gate_decision(seed, ts, call_id, "refuse", "url_policy", reason, epoch_id) do
+          {:refuse, policy, reason, epoch_id} ->
+            case Events.gate_decision(seed, ts, call_id, "refuse", policy, reason, epoch_id) do
               {:ok, signed} -> {[Wire.envelope(signed)], :refuse}
               {:error, _reason} -> {[], :refuse}
             end
@@ -162,6 +199,60 @@ defmodule Kyber.Agent.ToolExecutor do
               {:error, _reason} -> {[], :refuse}
             end
         end
+    end
+  end
+
+  # T14c D3: the two policy layers, in pinned order. A layer that does not
+  # gate the tool id abstains (:allow); the first {:refuse, policy, reason,
+  # epoch_id} wins the call's single GateDecision slot.
+  defp policy_verdict(set, tool_id, args) do
+    case url_policy(set, tool_id, args) do
+      {:refuse, reason, epoch_id} ->
+        {:refuse, "url_policy", reason, epoch_id}
+
+      :allow ->
+        memory_policy(set, tool_id, args)
+    end
+  end
+
+  # the memory_policy layer (T14c D3), mirroring url_policy/3 clause for
+  # clause: ungated tool => :allow; ungoverned store => FAIL-CLOSED refusal
+  # (the memory tool is born in this slice with no legacy behavior to
+  # preserve — the URL family's fail-open ungoverned default is recorded
+  # debt, not precedent); forked epoch => fail closed; undecodable args =>
+  # the policy layer abstains (action validation owns it — the
+  # fork×undecodable cell is T14d's); zero allow_entity pointers => the
+  # check refuses everything.
+  defp memory_policy(set, tool_id, args) do
+    if tool_id in Policy.memory_gated_tools() do
+      case Policy.memory_epoch(set) do
+        :none ->
+          {:refuse, "memory_policy", Policy.reason_memory_ungoverned(), nil}
+
+        {:error, :forked} ->
+          {:refuse, "memory_policy", Policy.reason_memory_forked(), nil}
+
+        {:ok, epoch} ->
+          case extract_entity(args) do
+            :abstain ->
+              :allow
+
+            {:ok, entity_id} ->
+              case Policy.check_memory(epoch, entity_id) do
+                :allow -> :allow
+                {:refuse, reason} -> {:refuse, "memory_policy", reason, epoch.id}
+              end
+          end
+      end
+    else
+      :allow
+    end
+  end
+
+  defp extract_entity(args) do
+    case JSON.decode(args) do
+      {:ok, %{"entity" => entity_id}} when is_binary(entity_id) -> {:ok, entity_id}
+      _other -> :abstain
     end
   end
 
@@ -205,7 +296,7 @@ defmodule Kyber.Agent.ToolExecutor do
   defp result_wires(set, seed, ts, call_id, tool_id, args, tools, context) do
     case stored_tool_result(set, call_id) do
       nil ->
-        {result, status} = run(tools, tool_id, args, context)
+        {result, status} = run(tools, tool_id, args, context, set)
 
         case Events.tool_result(seed, ts, call_id, result, status) do
           {:ok, signed} -> [Wire.envelope(signed)]
@@ -224,7 +315,28 @@ defmodule Kyber.Agent.ToolExecutor do
     end
   end
 
-  defp run(tools, tool_id, args, context) do
+  # T14c M1: "memory.read" resolves in a DEDICATED run clause over the
+  # handler's :store snapshot (the store thunk's answer at decision time —
+  # the executor stays a pure function of (store, call delta, state)). The
+  # 1-arity stub closure's status is hardwired "ok" and the action-data MFA
+  # cannot see the captured store, so `canon nil => {"", "unknown_entity"}`
+  # lives HERE — a resolution outcome, never a refusal; the gate runs
+  # strictly BEFORE resolution, so refused known/unknown are
+  # indistinguishable (no existence oracle).
+  defp run(_tools, "memory.read", args, _context, store_set) do
+    case JSON.decode(args) do
+      {:ok, %{"entity" => entity_id}} when is_binary(entity_id) ->
+        case Memory.canon(store_set, entity_id) do
+          nil -> {"", "unknown_entity"}
+          %{content: content} -> {content, "ok"}
+        end
+
+      _other ->
+        {"malformed action arguments: " <> args, "error"}
+    end
+  end
+
+  defp run(tools, tool_id, args, context, _store_set) do
     case Map.fetch(tools, tool_id) do
       {:ok, fun} when is_function(fun, 1) ->
         try do
