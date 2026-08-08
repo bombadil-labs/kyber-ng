@@ -82,6 +82,16 @@ defmodule Kyber.Daemon do
   `:manual`, default #{@default_tick_ms}), `:pulse_only` (list of kind-marker
   roles, default `[]` — persist-everything), `:narrate` (boolean, default
   false — one line per dispatch/fire/persist for the operator).
+
+  T14a (the reactor, OPT-IN — the default stays `:ack`, pin 25/H7):
+  `:loop` accepts `:reactor` (the reactor owns all five kinds wholesale; the
+  daemon's flush forwards cursor deltas to it as `{:ingest, delta}` casts
+  with a `:sync` barrier — pin 26), and the reactor boot opts thread through
+  untouched: `:oracle_seed` (`:present`/`:absent`, default `:absent` — the
+  pin-17 seed assertion), `:budget_cap` (positive integer, default 32),
+  `:engine` (keyword | `:none`, default `:none` — the hosted engine's full
+  construction surface, H6), `:test_pid` (observation pid for the
+  `Ctx.test_pid` probes).
   """
   @spec boot(keyword()) :: {:ok, pid()} | {:error, term()}
   def boot(opts) do
@@ -146,10 +156,16 @@ defmodule Kyber.Daemon do
       Process.flag(:trap_exit, true)
       {:ok, gather} = start_gather()
 
-      # `:loop` (T11b): `:ack` (default) subscribes the T10 deterministic ack
-      # loop — the fallback, not a casualty (AC9); `:none` leaves "received"
-      # to the LLM stack (`Kyber.Agent.attach/1` wires it post-boot)
-      if Keyword.get(opts, :loop, :ack) == :ack do
+      # `:loop` (T11b + T14a): `:ack` (default) subscribes the T10
+      # deterministic ack loop — the fallback, not a casualty (AC9);
+      # `:none` leaves "received" to the LLM stack
+      # (`Kyber.Agent.attach/1` wires it post-boot); `:reactor` (T14a,
+      # OPT-IN — the shipped default stays `:ack`, pin 25/H7) makes the
+      # reactor the owner of all five kinds wholesale — the daemon's own
+      # gather holds no reactor subscriptions (pin 25's own-container)
+      loop = Keyword.get(opts, :loop, :ack)
+
+      if loop == :ack do
         {:ok, _ref} = Gather.subscribe("received", AgentLoop.handler(seed))
       end
 
@@ -163,14 +179,39 @@ defmodule Kyber.Daemon do
         tick_ms: Keyword.get(opts, :tick_ms, @default_tick_ms),
         pulse_only: Keyword.get(opts, :pulse_only, []),
         narrate: Keyword.get(opts, :narrate, false),
+        loop: loop,
         fired: 0,
         persisted: 0,
         pulsed: 0,
         skipped: 0
       }
 
-      schedule(state)
-      {:ok, state}
+      case loop do
+        :reactor ->
+          # pin 17: the oracle_seed boot-opt assertion — `:present` appends
+          # ONE fixed-content seed delta at boot, signed by the daemon's
+          # existing boot key (fixed content => fixed content-derived id =>
+          # the two-boot AC5 companion holds). M2: retraction-detection (a
+          # negates pointer targeting the seed id) is the gate's closing
+          # mechanism — the reactor reads it from store state.
+          with :ok <- assert_oracle_seed(state, opts),
+               # H3: the reactor is started BY the daemon — linked
+               # immediately after the store is confirmed (guard_store
+               # above), before any dispatch can occur; registered under the
+               # module name so the pin-1 cast reaches it; its lifetime IS
+               # the daemon's (never in the app tree, application.ex
+               # untouched)
+               {:ok, reactor} <- start_reactor(reactor_opts(opts, seed)) do
+            schedule(Map.put(state, :reactor, reactor))
+            {:ok, Map.put(state, :reactor, reactor)}
+          else
+            {:error, reason} -> {:stop, reason}
+          end
+
+        _ack_or_none ->
+          schedule(state)
+          {:ok, state}
+      end
     else
       {:error, reason} -> {:stop, reason}
     end
@@ -199,6 +240,9 @@ defmodule Kyber.Daemon do
   # the gather is link-coupled: if it dies abnormally the daemon stops with
   # it (the supervisor's :transient restart re-inits both)
   def handle_info({:EXIT, pid, reason}, %{gather: pid} = state), do: {:stop, reason, state}
+  # the reactor is link-coupled exactly like the gather: an abnormal death
+  # stops the daemon (the supervisor's :transient restart re-inits both)
+  def handle_info({:EXIT, pid, reason}, %{reactor: pid} = state), do: {:stop, reason, state}
   def handle_info({:EXIT, _pid, _reason}, state), do: {:noreply, state}
 
   @impl true
@@ -215,10 +259,42 @@ defmodule Kyber.Daemon do
   defp do_tick(state) do
     {consumed, deltas} = collect(state)
     state = %{state | cursor: state.cursor + consumed}
-    {outputs, state} = dispatch(deltas, state)
-    state = Enum.reduce(outputs, state, fn wire, s -> sink(wire, s, 0) |> elem(1) end)
-    state = maybe_checkpoint(deltas, state)
-    heartbeat(state)
+
+    case state.loop do
+      :reactor ->
+        # pin 26/H1: under loop: :reactor the flush does NOT route through
+        # the daemon's own Gather (which holds no reactor subscriptions);
+        # it collects cursor deltas exactly as today and FORWARDS each as an
+        # {:ingest, delta} cast — the pin-1 seam — then performs the :sync
+        # barrier AFTER the forwarding casts (mailbox ordering: the casts are
+        # processed before the :sync reply), so tick returning means the
+        # forwarded deltas were ingested. Pin 8's once-per-delta-id routing
+        # dedupe drops any delta the push cast already delivered — only
+        # genuine log-tail dead letters actually dispatch.
+        state = forward_to_reactor(state, deltas)
+        state = maybe_checkpoint(deltas, state)
+        heartbeat(state)
+
+      _ack_or_none ->
+        {outputs, state} = dispatch(deltas, state)
+        state = Enum.reduce(outputs, state, fn wire, s -> sink(wire, s, 0) |> elem(1) end)
+        state = maybe_checkpoint(deltas, state)
+        heartbeat(state)
+    end
+  end
+
+  # the reactor-mode flush: cast each cursor delta into the reactor (the
+  # pin-1 seam), then the sync barrier. The reactor NEVER makes a
+  # synchronous call to the daemon (pin 26(c)) — daemon->reactor traffic is
+  # casts plus this single :sync call inside tick.
+  defp forward_to_reactor(state, deltas) do
+    Enum.each(deltas, fn delta ->
+      narrate(state, "forwarded #{kind(delta)} #{short(delta.id)}")
+      GenServer.cast(Kyber.Agent.Reactor, {:ingest, delta})
+    end)
+
+    GenServer.call(Kyber.Agent.Reactor, :sync)
+    state
   end
 
   # the log-channel intake: everything past the cursor, classified exactly
@@ -378,9 +454,16 @@ defmodule Kyber.Daemon do
     build_signed(state, [%{role: "tick", target: {:entity, "cron:daemon-ticker", "fired"}}])
   end
 
-  defp build_signed(state, pointers) do
+  defp build_signed(state, pointers), do: build_signed(state, pointers, now_ts())
+
+  # pin 17: the oracle seed's timestamp is FIXED (never now) — the seed's
+  # content-derived id must be identical across boots for the two-boot AC5
+  # companion (identical seeded commit sequence => identical delta-id sets)
+  @oracle_seed_ts 1_700_000_000_000.0
+
+  defp build_signed(state, pointers, ts) do
     raw = %{
-      timestamp: 1.0 * System.system_time(:millisecond),
+      timestamp: ts,
       author: state.author,
       pointers: pointers
     }
@@ -389,6 +472,8 @@ defmodule Kyber.Daemon do
     {:ok, sig} = Keys.sign(claims, state.seed)
     Wire.envelope({claims, sig})
   end
+
+  defp now_ts, do: 1.0 * System.system_time(:millisecond)
 
   # the cursor is derived, never a source of truth: the highest checkpoint
   # position in the replayed set
@@ -438,6 +523,57 @@ defmodule Kyber.Daemon do
       {:error, {:already_started, pid}} ->
         Process.link(pid)
         {:ok, pid}
+    end
+  end
+
+  # T14a (H3): the reactor boot path. Started only under loop: :reactor; the
+  # boot opts budget_cap:/engine:/test_pid are threaded UNTOUCHED to the
+  # reactor (pins 12/21, H6).
+  defp reactor_opts(opts, seed) do
+    [
+      seed: seed,
+      budget_cap: Keyword.get(opts, :budget_cap, 32),
+      engine: Keyword.get(opts, :engine, :none),
+      test_pid: Keyword.get(opts, :test_pid)
+    ]
+  end
+
+  defp start_reactor(opts) do
+    case Kyber.Agent.Reactor.start_link(opts) do
+      {:ok, pid} ->
+        {:ok, pid}
+
+      {:error, {:already_started, pid}} ->
+        Process.link(pid)
+        {:ok, pid}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  # pin 17: the oracle_seed assertion — :present appends ONE fixed-content
+  # seed delta (fixed timestamp + fixed pointers, signed by the daemon's
+  # boot key) so its content-derived id is deterministic across boots; the
+  # reactor's gate reads it from store state. :absent (the default) appends
+  # nothing. A failed append refuses the boot.
+  defp assert_oracle_seed(state, opts) do
+    case Keyword.get(opts, :oracle_seed, :absent) do
+      :present ->
+        wire =
+          build_signed(
+            state,
+            [%{role: "seed", target: {:entity, "oracle", "seed"}}],
+            @oracle_seed_ts
+          )
+
+        case DurableStore.append(wire) do
+          :ok -> :ok
+          {:error, reason} -> {:error, {:oracle_seed, reason}}
+        end
+
+      :absent ->
+        :ok
     end
   end
 
