@@ -75,7 +75,16 @@ defmodule Kyber.Schema.Genesis do
     # a denied/refused call emits NO ToolResult — reject, never repair)
     {"GateDecision",
      requires: [{"decides", "delta"}, {"verdict", "string"}, {"policy", "string"}],
-     optional: [{"reason", "string"}]},
+     optional: [{"reason", "string"}, {"policy_epoch", "delta"}]},
+    # T14b: a governance epoch as a store claim — supersession is an
+    # explicit pointer, revocation is retraction (negates), never deletion
+    {"Policy",
+     requires: [{"policy", "entity"}],
+     many: [{"allow_host", "string"}, {"allow_scheme", "string"}],
+     optional: [{"supersedes", "delta"}]},
+    # T14b: a duplicate ToolCall observed — absorbed and acked, never
+    # re-executed
+    {"ToolCallDuplicate", requires: [{"dedupes", "delta"}, {"result", "delta"}]},
     {"ConversationSummary",
      requires: [{"sessionId", "entity"}, {"content", "string"}], many: [{"covers", "delta"}]},
     {"MemoryEntity",

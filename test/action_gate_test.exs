@@ -279,8 +279,11 @@ defmodule Kyber.Agent.ActionGateTest do
     # the human tightens the list after the crash — the replay does NOT
     # re-decide: the persisted decision is the authority (the chain is the
     # state), re-emitted byte-identical
+    # (T14b: the re-fire also carries the ToolCallDuplicate observation —
+    # the stored decision + result stay byte-identical, never re-decided)
     refired = executor(store, workspace, Gate.new(deny: ["fs.read"])).([call])
-    assert refired == first
+    assert [gate_refire, result_refire, _dup_wire] = refired
+    assert [gate_refire, result_refire] == first
   end
 
   test "AC2: decide/2 is the pure policy reading (the boot-resolved posture)" do

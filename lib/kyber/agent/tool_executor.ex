@@ -41,7 +41,7 @@ defmodule Kyber.Agent.ToolExecutor do
   """
 
   alias Kyber.{Gather, Schema, Wire}
-  alias Kyber.Agent.Events
+  alias Kyber.Agent.{Events, Policy}
   alias Kyber.Agent.Action.Gate
 
   @doc "The stub registry: `tool:echo` answers its args."
@@ -137,17 +137,68 @@ defmodule Kyber.Agent.ToolExecutor do
       nil ->
         decision = Gate.decide(gate, tool_id, args)
 
-        case Events.gate_decision(
-               seed,
-               ts,
-               call_id,
-               to_string(decision.verdict),
-               to_string(decision.policy),
-               decision.reason
-             ) do
-          {:ok, signed} -> {[Wire.envelope(signed)], decision.verdict}
-          {:error, _reason} -> {[], :refuse}
+        # the URL policy gate (T14b) sees only permitted calls: AFTER the
+        # permission gate allows, BEFORE any execution
+        policy_verdict =
+          if decision.verdict == :allow, do: url_policy(set, tool_id, args), else: :allow
+
+        case policy_verdict do
+          {:refuse, reason, epoch_id} ->
+            case Events.gate_decision(seed, ts, call_id, "refuse", "url_policy", reason, epoch_id) do
+              {:ok, signed} -> {[Wire.envelope(signed)], :refuse}
+              {:error, _reason} -> {[], :refuse}
+            end
+
+          :allow ->
+            case Events.gate_decision(
+                   seed,
+                   ts,
+                   call_id,
+                   to_string(decision.verdict),
+                   to_string(decision.policy),
+                   decision.reason
+                 ) do
+              {:ok, signed} -> {[Wire.envelope(signed)], decision.verdict}
+              {:error, _reason} -> {[], :refuse}
+            end
         end
+    end
+  end
+
+  # a refused URL never touches the network; no policy claim ⇒ ungoverned
+  # (allow — the recorded hole, owned by the deferred governance-default
+  # slice); a fork fails closed; undecodable args ⇒ the policy layer
+  # abstains, deferring to the action's own validation
+  defp url_policy(set, tool_id, args) do
+    if tool_id in Policy.gated_tools() do
+      case Policy.current(set) do
+        :none ->
+          :allow
+
+        {:error, :forked} ->
+          {:refuse, Policy.reason_forked(), nil}
+
+        {:ok, epoch} ->
+          case extract_url(args) do
+            :abstain ->
+              :allow
+
+            {:ok, url} ->
+              case Policy.check(epoch, url) do
+                :allow -> :allow
+                {:refuse, reason} -> {:refuse, reason, epoch.id}
+              end
+          end
+      end
+    else
+      :allow
+    end
+  end
+
+  defp extract_url(args) do
+    case JSON.decode(args) do
+      {:ok, %{"url" => url}} when is_binary(url) -> {:ok, url}
+      _other -> :abstain
     end
   end
 
@@ -161,9 +212,15 @@ defmodule Kyber.Agent.ToolExecutor do
           {:error, _reason} -> []
         end
 
-      wire ->
-        # answer from the store — the action is NEVER re-executed
-        [wire]
+      {wire, result_id} ->
+        # answer from the store — the action is NEVER re-executed; the
+        # duplicate is observed (T14b): same ts + ids ⇒ same observation
+        # id, so merge-is-union collapses to exactly one record per
+        # (call, result) pair. Answer first.
+        case Events.tool_call_duplicate(seed, ts, call_id, result_id) do
+          {:ok, signed} -> [wire, Wire.envelope(signed)]
+          {:error, _reason} -> [wire]
+        end
     end
   end
 
@@ -229,10 +286,13 @@ defmodule Kyber.Agent.ToolExecutor do
   defp stored_tool_result(set, call_id) do
     set
     |> by_timestamp()
-    |> Enum.find_value(fn {_id, {claims, sig}} ->
+    |> Enum.find_value(fn {id, {claims, sig}} ->
       case Schema.resolve(claims) do
-        %{type: "ToolResult", call: {:delta, ^call_id, _ctx}} -> Wire.envelope({claims, sig})
-        _other -> nil
+        %{type: "ToolResult", call: {:delta, ^call_id, _ctx}} ->
+          {Wire.envelope({claims, sig}), id}
+
+        _other ->
+          nil
       end
     end)
   end

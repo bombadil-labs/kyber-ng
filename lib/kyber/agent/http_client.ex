@@ -42,7 +42,8 @@ defmodule Kyber.Agent.HttpClient do
       http_options = [
         ssl: ssl_options(),
         timeout: 120_000,
-        connect_timeout: 10_000
+        connect_timeout: 10_000,
+        autoredirect: false
       ]
 
       case apply(:httpc, :request, [:post, request, http_options, [body_format: :binary]]) do
@@ -95,7 +96,8 @@ defmodule Kyber.Agent.HttpClient do
       http_options = [
         ssl: ssl_options(),
         timeout: 30_000,
-        connect_timeout: 10_000
+        connect_timeout: 10_000,
+        autoredirect: false
       ]
 
       case apply(:httpc, :request, [:get, request, http_options, [body_format: :binary]]) do
