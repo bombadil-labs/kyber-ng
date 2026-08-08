@@ -487,6 +487,7 @@ defmodule Kyber.Agent.Reactor do
        seed: seed,
        tools: Keyword.get(opts, :tools, ToolExecutor.stub_tools()),
        gate: Keyword.get(opts, :gate, Gate.new()),
+       context: Keyword.get(opts, :context, %{}),
        store: &DurableStore.set/0
      )}
   end
