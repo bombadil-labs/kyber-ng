@@ -77,14 +77,27 @@ defmodule Kyber.Schema.Genesis do
      requires: [{"decides", "delta"}, {"verdict", "string"}, {"policy", "string"}],
      optional: [{"reason", "string"}, {"policy_epoch", "delta"}]},
     # T14b: a governance epoch as a store claim — supersession is an
-    # explicit pointer, revocation is retraction (negates), never deletion
+    # explicit pointer, revocation is retraction (negates), never deletion.
+    # T14c (D8/A1): the closed schema EVOLVES with the memory family's
+    # `allow_entity` role — without it, typed resolution cannot see the
+    # allow-list and every memory-gate variant vacuously allows/refuses
     {"Policy",
      requires: [{"policy", "entity"}],
-     many: [{"allow_host", "string"}, {"allow_scheme", "string"}],
+     many: [{"allow_host", "string"}, {"allow_scheme", "string"}, {"allow_entity", "entity"}],
      optional: [{"supersedes", "delta"}]},
     # T14b: a duplicate ToolCall observed — absorbed and acked, never
     # re-executed
     {"ToolCallDuplicate", requires: [{"dedupes", "delta"}, {"result", "delta"}]},
+    # T14c (D1): the prompt-as-delta claim — the assembled prompt the model
+    # SAW, answered as a store delta. EXACTLY three pointers, sessionId
+    # FIRST (the kind-marker grammar: the two requestRef-first readers —
+    # Engine.answered?/2 and the conversation lens — key on the first role)
+    {"PromptAssembled",
+     requires: [{"sessionId", "entity"}, {"requestRef", "delta"}, {"content", "string"}]},
+    # T14c (D5): the operator-key boot attestation — the operator's key
+    # attests the agent's boot, an explicit store-visible participant
+    {"BootAttestation",
+     requires: [{"operator", "entity"}, {"agent", "entity"}, {"boot", "delta"}]},
     {"ConversationSummary",
      requires: [{"sessionId", "entity"}, {"content", "string"}], many: [{"covers", "delta"}]},
     {"MemoryEntity",

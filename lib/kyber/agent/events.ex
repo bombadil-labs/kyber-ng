@@ -184,6 +184,69 @@ defmodule Kyber.Agent.Events do
     ])
   end
 
+  @doc """
+  `PromptAssembled` — the prompt-as-delta claim (T14c D1): the assembled
+  prompt the model SAW, answered as a store delta. EXACTLY three pointers,
+  `sessionId` FIRST (the kind-marker grammar — `"sessionId"` routes to no
+  subscription and matches no lens; the two `requestRef` readers,
+  `Engine.answered?/2` and the conversation lens, key on the FIRST role).
+  `content` is the canonical JSON of the message list
+  (`Kyber.Agent.Prompt.canonical/1`) — exactly what `LlmHandler.chat/3`
+  receives. `ts` is the triggering `InferenceRequested` delta's
+  `claims.timestamp`, never wall-clock; ONE claim per assembled prompt.
+  """
+  @spec prompt_assembled(String.t(), number(), String.t(), String.t(), String.t()) ::
+          {:ok, signed()} | {:error, term()}
+  def prompt_assembled(seed, ts, request_id, session_id, content) do
+    build(seed, ts, "PromptAssembled", [
+      %{role: "sessionId", target: {:entity, session_id, "prompts"}},
+      %{role: "requestRef", target: {:delta, request_id, "prompted"}},
+      %{role: "content", target: {:string, content}}
+    ])
+  end
+
+  @doc """
+  `Policy` — the memory-family governance epoch (T14c D3): type `"Policy"`
+  over the `{:entity, "memory", "epoch"}` target, the allow-list riding
+  `allow_entity` roles (`{:entity, entity_id, "readable"}`), optional
+  `supersedes`. Zero `allow_entity` pointers => refuse all gated reads. NO
+  downcase on entity ids (the T14b downcase pin is host-specific). The
+  epoch's `ts` is caller-derived (the operator's store clock, never
+  wall-clock in the decision surface).
+  """
+  @spec memory_policy(String.t(), number(), [String.t()], String.t() | nil) ::
+          {:ok, signed()} | {:error, term()}
+  def memory_policy(seed, ts, allow_entities, supersedes \\ nil) do
+    build(seed, ts, "Policy", [
+      %{role: "policy", target: {:entity, "memory", "epoch"}},
+      Enum.map(allow_entities, &%{role: "allow_entity", target: {:entity, &1, "readable"}}),
+      if(supersedes,
+        do: [%{role: "supersedes", target: {:delta, supersedes, "superseded"}}],
+        else: []
+      )
+    ])
+  end
+
+  @doc """
+  `BootAttestation` — the operator-key boot attestation (T14c D5): the
+  operator's key ATTESTS the agent's boot (it never authorizes — it appears
+  in no gate decision), signed with the OPERATOR seed. EXACTLY three
+  pointers: `operator` -> `{:entity, operator_author, "attests"}`,
+  `agent` -> `{:entity, agent_author, "attested"}`,
+  `boot` -> `{:delta, seed_claim_id, "booted_under"}`. `ts` is the seed
+  claim's `claims.timestamp` — the only store-derived clock at boot — so
+  reboots over one store merge to exactly one attestation.
+  """
+  @spec boot_attestation(String.t(), number(), String.t(), String.t()) ::
+          {:ok, signed()} | {:error, term()}
+  def boot_attestation(operator_seed, ts, agent_author, seed_claim_id) do
+    build(operator_seed, ts, "BootAttestation", [
+      %{role: "operator", target: {:entity, Keys.author_for_seed(operator_seed), "attests"}},
+      %{role: "agent", target: {:entity, agent_author, "attested"}},
+      %{role: "boot", target: {:delta, seed_claim_id, "booted_under"}}
+    ])
+  end
+
   # ---------------------------------------------------------------- helpers
 
   defp build(seed, ts, type, pointers) do

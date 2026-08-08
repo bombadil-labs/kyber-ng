@@ -528,13 +528,16 @@ defmodule Kyber.Daemon do
 
   # T14a (H3): the reactor boot path. Started only under loop: :reactor; the
   # boot opts budget_cap:/engine:/test_pid are threaded UNTOUCHED to the
-  # reactor (pins 12/21, H6).
+  # reactor (pins 12/21, H6). T14c (D6): :operator_seed (caller-resolved
+  # hex — the daemon loads no keyring itself) rides the same whitelist,
+  # which would otherwise drop the opt before Reactor.start_link.
   defp reactor_opts(opts, seed) do
     [
       seed: seed,
       budget_cap: Keyword.get(opts, :budget_cap, 32),
       engine: Keyword.get(opts, :engine, :none),
-      test_pid: Keyword.get(opts, :test_pid)
+      test_pid: Keyword.get(opts, :test_pid),
+      operator_seed: Keyword.get(opts, :operator_seed)
     ]
   end
 
