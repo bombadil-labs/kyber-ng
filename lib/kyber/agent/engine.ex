@@ -24,12 +24,9 @@ defmodule Kyber.Agent.Engine do
   use GenServer
 
   alias Kyber.{DurableStore, Schema, Wire}
-  alias Kyber.Agent.{ContextBuilder, Events, LlmHandler, ToolExecutor}
+  alias Kyber.Agent.{ContextBuilder, Events, LlmHandler, Prompt, ToolExecutor}
 
   @default_window 8
-  @system_prompt "You are kyber, an agent living in a claims substrate. " <>
-                   "Ground your answer in the conversation and memory notes provided. " <>
-                   "Use the provided tools when they help."
 
   @type status :: %{
           answered: non_neg_integer(),
@@ -168,6 +165,18 @@ defmodule Kyber.Agent.Engine do
 
   # ------------------------------------------------------------- inference
 
+  # T14c D2 store-then-send, in pinned order: (a) set = store.(); (b)
+  # answered-skip — an answered request is a counted skip, never re-fired
+  # (first-role match; the sessionId-first PromptAssembled can never
+  # saturate it); (c) replay pre-check — an unretracted PromptAssembled
+  # with requestRef to this request exists => decode and send THOSE bytes,
+  # emit nothing (the crash-between-emit-and-answer window that id-dedupe
+  # alone leaves open); (d) else assemble -> canonical -> emit -> decode ->
+  # chat. The model only ever sees bytes decoded from a store artifact —
+  # sent==stored is structural, never compared after the fact. A decode
+  # failure on a stored claim is store corruption: raise, never re-assemble
+  # (a silent re-assemble would mint a SECOND PromptAssembled and break
+  # AC1's exactly-one).
   defp infer(request_id, typed, state) do
     set = state.store.()
 
@@ -175,20 +184,97 @@ defmodule Kyber.Agent.Engine do
       notify(state, {:skipped, request_id})
       %{state | skipped: state.skipped + 1}
     else
-      {:delta, prompt_id, _} = typed.promptRef
-      {:entity, session_id, _} = typed.sessionId
-      memory_ids = for {:delta, id, _ctx} <- typed.memoryPointers, do: id
+      case replayed_prompt(set, request_id) do
+        {:ok, messages} ->
+          complete(turn(request_id, typed, messages), set, state)
 
-      turn = %{
-        request_id: request_id,
-        prompt_id: prompt_id,
-        session_id: session_id,
-        memory_ids: memory_ids,
-        messages: build_messages(set, session_id, memory_ids, state.window)
-      }
+        :none ->
+          messages = Prompt.assemble(set, session_id(typed), memory_ids(typed), state.window)
+          canonical = Prompt.canonical(messages)
+          # D1: ts = the triggering InferenceRequested's claims.timestamp —
+          # never wall-clock (AC5)
+          ts = typed.timestamp
 
-      complete(turn, set, state)
+          case Events.prompt_assembled(
+                 state.llm.seed,
+                 ts,
+                 request_id,
+                 session_id(typed),
+                 canonical
+               ) do
+            {:ok, signed} ->
+              wire = Wire.envelope(signed)
+              state.sink.(wire)
+
+              case Prompt.decode(canonical) do
+                {:ok, decoded} ->
+                  complete(turn(request_id, typed, decoded), set, state)
+
+                {:error, :malformed} ->
+                  raise "PromptAssembled store corruption: canonical does not decode"
+              end
+
+            {:error, _reason} ->
+              # the prompt was never admitted — the chain stays unanswered;
+              # resume/1 picks it up (reject, never repair)
+              state
+          end
+      end
     end
+  end
+
+  defp turn(request_id, typed, messages) do
+    {:delta, prompt_id, _} = typed.promptRef
+    {:entity, session_id, _} = typed.sessionId
+
+    %{
+      request_id: request_id,
+      prompt_id: prompt_id,
+      session_id: session_id,
+      memory_ids: memory_ids(typed),
+      messages: messages
+    }
+  end
+
+  defp session_id(%{sessionId: {:entity, session_id, _ctx}}), do: session_id
+
+  defp memory_ids(%{memoryPointers: pointers}),
+    do: for({:delta, id, _ctx} <- pointers, do: id)
+
+  # the replay pre-check: an UNRETRACTED PromptAssembled pointing at this
+  # request exists in the store — decode and re-send THOSE bytes, emit
+  # nothing. A stored claim that does not decode is store corruption.
+  defp replayed_prompt(set, request_id) do
+    retracted = retracted_ids(set)
+
+    case Enum.find(set, fn {id, {claims, _sig}} ->
+           not MapSet.member?(retracted, id) and
+             kind(claims) == "sessionId" and
+             match?(%{type: "PromptAssembled"}, Schema.resolve(claims)) and
+             match?({:delta, ^request_id, _ctx}, pointer(claims, "requestRef"))
+         end) do
+      {_id, {claims, _sig}} ->
+        case pointer(claims, "content") do
+          {:string, canonical} ->
+            case Prompt.decode(canonical) do
+              {:ok, messages} -> {:ok, messages}
+              {:error, :malformed} -> raise "PromptAssembled store corruption: decode failed"
+            end
+
+          _other ->
+            raise "PromptAssembled store corruption: no content pointer"
+        end
+
+      nil ->
+        :none
+    end
+  end
+
+  defp retracted_ids(set) do
+    for {_id, {claims, _sig}} <- set,
+        %{role: "negates", target: {:delta, target, _ctx}} <- claims.pointers,
+        into: MapSet.new(),
+        do: target
   end
 
   defp complete(turn, set, state) do
@@ -406,7 +492,7 @@ defmodule Kyber.Agent.Engine do
           prompt_id: prompt_id,
           session_id: session_id,
           memory_ids: memory_ids,
-          messages: build_messages(set, session_id, memory_ids, state.window)
+          messages: Prompt.assemble(set, session_id, memory_ids, state.window)
         },
         tool_id: tool_id,
         args: call.args
@@ -445,36 +531,6 @@ defmodule Kyber.Agent.Engine do
   end
 
   # ----------------------------------------------------------- rehydration
-
-  defp build_messages(set, session_id, memory_ids, window) do
-    turns = ContextBuilder.conversation(set, session_id)
-    {elided, windowed} = ContextBuilder.window(turns, window)
-
-    memory_notes =
-      for id <- memory_ids,
-          {claims, _sig} <- [Map.get(set, id)],
-          {:string, content} <- [pointer(claims, "content")],
-          do: %{"role" => "system", "content" => "Memory: " <> content}
-
-    summary_notes =
-      for {_id, {claims, _sig}} <- Enum.sort_by(set, fn {_id, {c, _s}} -> c.timestamp end),
-          declared_type(claims) == "ConversationSummary",
-          match?({:entity, ^session_id, _}, pointer(claims, "sessionId")),
-          {:string, content} <- [pointer(claims, "content")],
-          do: %{"role" => "system", "content" => "Summary of earlier turns: " <> content}
-
-    elision_note =
-      case elided do
-        [] -> []
-        turns -> [%{"role" => "system", "content" => "#{length(turns)} earlier turns elided."}]
-      end
-
-    [%{"role" => "system", "content" => @system_prompt}] ++
-      memory_notes ++
-      summary_notes ++
-      elision_note ++
-      Enum.map(windowed, &%{"role" => &1.role, "content" => &1.content})
-  end
 
   # -------------------------------------------------------------- machinery
 

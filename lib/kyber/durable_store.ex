@@ -108,6 +108,16 @@ defmodule Kyber.DurableStore do
   @impl true
   def handle_call({:append, wire}, _from, state) do
     {reply, new_state} = do_append(wire, state)
+
+    # U1 (T14a pin 1): the post-commit push cast — immediately after the
+    # write-ahead commit accepts the delta, cast it into the reactor (the
+    # store process serializes appends, so delivery order == commit order by
+    # construction). The cast payload needs Store.verify(wire) re-derivation
+    # — the append handler holds only the wire (L10). Where no reactor is
+    # running the cast is a verified silent no-op (store-only contexts:
+    # durable_store_test, CLI ingest, federation — unaffected). The pulse
+    # admission for the ephemeral channel is unchanged.
+    if reply == :ok, do: notify_reactor(wire)
     {:reply, reply, new_state}
   end
 
@@ -127,6 +137,15 @@ defmodule Kyber.DurableStore do
   @impl true
   def terminate(_reason, %{io: nil}), do: :ok
   def terminate(_reason, %{io: io}), do: File.close(io)
+
+  # the pin-1 seam: GenServer.cast to the registered reactor name; a cast to
+  # a non-existent process is dropped, never a crash
+  defp notify_reactor(wire) do
+    case Store.verify(wire) do
+      {:ok, delta} -> GenServer.cast(Kyber.Agent.Reactor, {:ingest, delta})
+      {:error, _reason} -> :ok
+    end
+  end
 
   # ------------------------------------------------------------- write-ahead
 

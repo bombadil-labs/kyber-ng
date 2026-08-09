@@ -84,16 +84,64 @@ defmodule Kyber.Agent.Events do
   `GateDecision` — the permission gate's attested decision on a `ToolCall`
   (T12): `allow` / `deny` / `refuse`, pointer-linked to the call it
   decides. Every decision is a delta (auditable); a denied or refused call
-  emits NO `ToolResult` — reject, never repair.
+  emits NO `ToolResult` — reject, never repair. T14b: `url_policy`
+  refusals carry the deciding epoch as an optional `policy_epoch` pointer
+  (a refusal-shape extension; existing call sites byte-unchanged).
   """
-  @spec gate_decision(String.t(), number(), String.t(), String.t(), String.t(), String.t() | nil) ::
-          {:ok, signed()} | {:error, term()}
-  def gate_decision(seed, ts, call_id, verdict, policy, reason \\ nil) do
+  @spec gate_decision(
+          String.t(),
+          number(),
+          String.t(),
+          String.t(),
+          String.t(),
+          String.t() | nil,
+          String.t() | nil
+        ) :: {:ok, signed()} | {:error, term()}
+  def gate_decision(seed, ts, call_id, verdict, policy, reason \\ nil, policy_epoch \\ nil) do
     build(seed, ts, "GateDecision", [
       %{role: "decides", target: {:delta, call_id, "decided"}},
       %{role: "verdict", target: {:string, verdict}},
       %{role: "policy", target: {:string, policy}},
-      if(reason, do: [%{role: "reason", target: {:string, reason}}], else: [])
+      if(reason, do: [%{role: "reason", target: {:string, reason}}], else: []),
+      if(policy_epoch,
+        do: [%{role: "policy_epoch", target: {:delta, policy_epoch, "under"}}],
+        else: []
+      )
+    ])
+  end
+
+  @doc """
+  `Policy` — a governance epoch as a store claim (T14b): exact downcased
+  hosts, explicit schemes (no default exists — zero `allow_scheme`
+  pointers refuses all gated calls), optional `supersedes` pointer to the
+  epoch it replaces. Revocation is retraction (`negates`), never deletion.
+  """
+  @spec policy(String.t(), number(), String.t(), [String.t()], [String.t()], String.t() | nil) ::
+          {:ok, signed()} | {:error, term()}
+  def policy(seed, ts, family, allow_hosts, allow_schemes, supersedes \\ nil) do
+    build(seed, ts, "Policy", [
+      %{role: "policy", target: {:entity, family, "epoch"}},
+      Enum.map(allow_hosts, &%{role: "allow_host", target: {:string, String.downcase(&1)}}),
+      Enum.map(allow_schemes, &%{role: "allow_scheme", target: {:string, &1}}),
+      if(supersedes,
+        do: [%{role: "supersedes", target: {:delta, supersedes, "superseded"}}],
+        else: []
+      )
+    ])
+  end
+
+  @doc """
+  `ToolCallDuplicate` — a duplicate `ToolCall` observed (T14b): the stored
+  answer is re-emitted byte-identical, the duplicate recorded, the action
+  never re-run. Claims the CALL's timestamp, so every duplicate derives
+  the same observation id and merge-is-union yields exactly one record.
+  """
+  @spec tool_call_duplicate(String.t(), number(), String.t(), String.t()) ::
+          {:ok, signed()} | {:error, term()}
+  def tool_call_duplicate(seed, ts, call_id, result_id) do
+    build(seed, ts, "ToolCallDuplicate", [
+      %{role: "dedupes", target: {:delta, call_id, "deduplicated"}},
+      %{role: "result", target: {:delta, result_id, "observed"}}
     ])
   end
 
@@ -133,6 +181,69 @@ defmodule Kyber.Agent.Events do
       %{role: "edits", target: {:delta, edited_id, "edited"}},
       %{role: "content", target: {:string, content}},
       %{role: "reason", target: {:string, reason}}
+    ])
+  end
+
+  @doc """
+  `PromptAssembled` — the prompt-as-delta claim (T14c D1): the assembled
+  prompt the model SAW, answered as a store delta. EXACTLY three pointers,
+  `sessionId` FIRST (the kind-marker grammar — `"sessionId"` routes to no
+  subscription and matches no lens; the two `requestRef` readers,
+  `Engine.answered?/2` and the conversation lens, key on the FIRST role).
+  `content` is the canonical JSON of the message list
+  (`Kyber.Agent.Prompt.canonical/1`) — exactly what `LlmHandler.chat/3`
+  receives. `ts` is the triggering `InferenceRequested` delta's
+  `claims.timestamp`, never wall-clock; ONE claim per assembled prompt.
+  """
+  @spec prompt_assembled(String.t(), number(), String.t(), String.t(), String.t()) ::
+          {:ok, signed()} | {:error, term()}
+  def prompt_assembled(seed, ts, request_id, session_id, content) do
+    build(seed, ts, "PromptAssembled", [
+      %{role: "sessionId", target: {:entity, session_id, "prompts"}},
+      %{role: "requestRef", target: {:delta, request_id, "prompted"}},
+      %{role: "content", target: {:string, content}}
+    ])
+  end
+
+  @doc """
+  `Policy` — the memory-family governance epoch (T14c D3): type `"Policy"`
+  over the `{:entity, "memory", "epoch"}` target, the allow-list riding
+  `allow_entity` roles (`{:entity, entity_id, "readable"}`), optional
+  `supersedes`. Zero `allow_entity` pointers => refuse all gated reads. NO
+  downcase on entity ids (the T14b downcase pin is host-specific). The
+  epoch's `ts` is caller-derived (the operator's store clock, never
+  wall-clock in the decision surface).
+  """
+  @spec memory_policy(String.t(), number(), [String.t()], String.t() | nil) ::
+          {:ok, signed()} | {:error, term()}
+  def memory_policy(seed, ts, allow_entities, supersedes \\ nil) do
+    build(seed, ts, "Policy", [
+      %{role: "policy", target: {:entity, "memory", "epoch"}},
+      Enum.map(allow_entities, &%{role: "allow_entity", target: {:entity, &1, "readable"}}),
+      if(supersedes,
+        do: [%{role: "supersedes", target: {:delta, supersedes, "superseded"}}],
+        else: []
+      )
+    ])
+  end
+
+  @doc """
+  `BootAttestation` — the operator-key boot attestation (T14c D5): the
+  operator's key ATTESTS the agent's boot (it never authorizes — it appears
+  in no gate decision), signed with the OPERATOR seed. EXACTLY three
+  pointers: `operator` -> `{:entity, operator_author, "attests"}`,
+  `agent` -> `{:entity, agent_author, "attested"}`,
+  `boot` -> `{:delta, seed_claim_id, "booted_under"}`. `ts` is the seed
+  claim's `claims.timestamp` — the only store-derived clock at boot — so
+  reboots over one store merge to exactly one attestation.
+  """
+  @spec boot_attestation(String.t(), number(), String.t(), String.t()) ::
+          {:ok, signed()} | {:error, term()}
+  def boot_attestation(operator_seed, ts, agent_author, seed_claim_id) do
+    build(operator_seed, ts, "BootAttestation", [
+      %{role: "operator", target: {:entity, Keys.author_for_seed(operator_seed), "attests"}},
+      %{role: "agent", target: {:entity, agent_author, "attested"}},
+      %{role: "boot", target: {:delta, seed_claim_id, "booted_under"}}
     ])
   end
 

@@ -234,7 +234,12 @@ defmodule Kyber.Agent.ActionChainTest do
     refire_wires = run_executor(store, call_delta, workspace)
 
     # the byte-identical re-fire holds: both wires re-emitted from the store
-    assert refire_wires == first_wires
+    # (T14b: the re-fire also carries the ToolCallDuplicate observation —
+    # answer first, then the record; the stored wires stay byte-identical)
+    assert [gate_refire, result_refire, dup_wire] = refire_wires
+    assert [gate_refire, result_refire] == first_wires
+    {:ok, dup_delta} = Store.verify(dup_wire)
+    assert %{type: "ToolCallDuplicate"} = Schema.resolve(dup_delta.claims)
 
     # and the answer is the ORIGINAL content — the file was not re-read
     {:ok, delta} = Store.verify(result_wire)
