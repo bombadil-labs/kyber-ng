@@ -214,10 +214,14 @@ defmodule Kyber.Agent.Engine do
                   raise "PromptAssembled store corruption: canonical does not decode"
               end
 
-            {:error, _reason} ->
-              # the prompt was never admitted — the chain stays unanswered;
-              # resume/1 picks it up (reject, never repair)
-              state
+            {:error, reason} ->
+              # C1 (T14d): a PromptAssembled CONSTRUCTION failure fails HARD —
+              # never a silent skip. The tuple IS engine-reachable via the
+              # raw-admission door (a hand-crafted InferenceRequested with a
+              # non-number timestamp — the schema compiler merges
+              # claims.timestamp unchecked), and a silent skip would leave
+              # the chain to resume/1 and hide the corruption.
+              raise "PromptAssembled construction failed: " <> inspect(reason)
           end
       end
     end

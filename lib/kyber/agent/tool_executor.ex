@@ -41,7 +41,7 @@ defmodule Kyber.Agent.ToolExecutor do
   """
 
   alias Kyber.{Gather, Schema, Wire}
-  alias Kyber.Agent.{Events, Memory, Policy}
+  alias Kyber.Agent.{Action, Events, Memory, Policy}
   alias Kyber.Agent.Action.Gate
 
   @doc "The stub registry: `tool:echo` answers its args."
@@ -315,6 +315,59 @@ defmodule Kyber.Agent.ToolExecutor do
     end
   end
 
+  # T14d D6 — the fs.read OUTPUT cap: an executor fs.read-keyed clause over
+  # the context's :output_cap (65_536 by construction at action.ex — the
+  # cap's ONE home; tests inject 1024). A past-cap "ok" result truncates
+  # with the house "\n" joiner + Action.truncation_marker; at exactly the
+  # cap, untruncated, NO marker; a refusal/error is NEVER truncated (the
+  # pinned "refused: ..." spelling survives verbatim). The executor clause
+  # (not an Action.Fs edit) is the licensed home — a uniform executor cap
+  # would re-truncate self-capped actions' marker tails.
+  defp run(tools, "fs.read", args, context, store_set) do
+    case run_uncapped(tools, "fs.read", args, context, store_set) do
+      {result, "ok"} when is_binary(result) ->
+        case context[:output_cap] do
+          cap when is_integer(cap) and byte_size(result) > cap ->
+            {binary_part(result, 0, cap) <> "\n" <> Action.truncation_marker(cap), "ok"}
+
+          _within_or_uncapped ->
+            {result, "ok"}
+        end
+
+      other ->
+        other
+    end
+  end
+
+  # T14d D7 — the fs.list ENTRY cap: 1024 (the ONE new literal), first 1024
+  # of the SORTED listing (the sort pre-exists at fs.ex) + the count-worded
+  # marker, status "ok". The B2 newline-in-filename edge (a name containing
+  # "\n" breaks the line grammar, counting as two entries) is RECORDED, not
+  # handled — a later fix is a visible diff, never a silent drift.
+  @fs_list_cap 1024
+  @fs_list_marker "[truncated: listing exceeded the #{@fs_list_cap}-entry cap]"
+
+  defp run(tools, "fs.list", args, context, store_set) do
+    case run_uncapped(tools, "fs.list", args, context, store_set) do
+      {listing, "ok"} when is_binary(listing) ->
+        case String.split(listing, "\n") do
+          entries when length(entries) > @fs_list_cap ->
+            {Enum.take(entries, @fs_list_cap) |> Enum.join("\n") |> Kernel.<>("\n" <> @fs_list_marker), "ok"}
+
+          _within_cap ->
+            {listing, "ok"}
+        end
+
+      other ->
+        other
+    end
+  end
+
+  defp run(tools, tool_id, args, context, store_set),
+    do: run_uncapped(tools, tool_id, args, context, store_set)
+
+  # the uncapped run path — the memory.read resolution clause and the
+  # registry routing (the fs bounds clauses cap above, then delegate here)
   # T14c M1: "memory.read" resolves in a DEDICATED run clause over the
   # handler's :store snapshot (the store thunk's answer at decision time —
   # the executor stays a pure function of (store, call delta, state)). The
@@ -323,7 +376,7 @@ defmodule Kyber.Agent.ToolExecutor do
   # lives HERE — a resolution outcome, never a refusal; the gate runs
   # strictly BEFORE resolution, so refused known/unknown are
   # indistinguishable (no existence oracle).
-  defp run(_tools, "memory.read", args, _context, store_set) do
+  defp run_uncapped(_tools, "memory.read", args, _context, store_set) do
     case JSON.decode(args) do
       {:ok, %{"entity" => entity_id}} when is_binary(entity_id) ->
         case Memory.canon(store_set, entity_id) do
@@ -336,7 +389,7 @@ defmodule Kyber.Agent.ToolExecutor do
     end
   end
 
-  defp run(tools, tool_id, args, context, _store_set) do
+  defp run_uncapped(tools, tool_id, args, context, _store_set) do
     case Map.fetch(tools, tool_id) do
       {:ok, fun} when is_function(fun, 1) ->
         try do
