@@ -137,7 +137,9 @@ defmodule Kyber.Agent.Policy do
            allow_entities: for({:entity, entity_id, _ctx} <- res.allow_entity, do: entity_id)
          }}
 
-      _two_heads ->
+      # D3 (T14d): the catch-all is normative for ANY n >= 2 live heads —
+      # same tuple, same reason, no distinct error, no winner-picking
+      _two_or_more_heads ->
         {:error, :forked}
     end
   end
