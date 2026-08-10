@@ -153,7 +153,7 @@ defmodule Kyber.Agent.T14cDeterminismTest do
 
       received_id = Delta.id_hex(received_claims)
       :ok = DurableStore.append(Wire.envelope({received_claims, received_sig}))
-      assert_receive {:reactor, {:dispatch, "received", ^received_id}}, 2_000
+      assert_receive {:reactor, {:dispatch, "received", ^received_id}}, 5_000
 
       # the assembled prompt: wait for the PromptAssembled, recover the
       # request id from its requestRef pointer

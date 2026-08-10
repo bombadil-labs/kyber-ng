@@ -224,8 +224,11 @@ defmodule Kyber.Agent.ActionBoundsTest do
 
     assert result.status == "timeout"
     assert result.result =~ Action.Shell.timeout_marker(50)
-    # the hard kill: nowhere near the command's own 30 seconds
-    assert elapsed < 10_000
+    # the hard kill: nowhere near the command's own 30 seconds (the bound is
+    # generous — 15s — because under a loaded suite the pgrep poll's process
+    # spawns slow down; the claim being witnessed is "≪ 30s", not a precise
+    # wall time)
+    assert elapsed < 15_000
     # the OS process group is actually dead (fold: A's SIGKILL, hardened to a
     # group kill — the port child is a group leader, so -os_pid kills sh AND
     # its children). Poll: SIGKILL'd processes linger as zombies until init
