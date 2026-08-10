@@ -401,12 +401,31 @@ defmodule Kyber.Agent.BoundaryMatrixTest do
     )
   end
 
-  # A13 (fold P3) — the url ungoverned fail-open hole, witnessed as a
-  # TRIPWIRE: with no url_policy claim the call EXECUTES. The deferred
-  # governance-default slice MUST consciously flip this test when the hole
-  # is closed — never drift.
-  test "A13: url ungoverned fail-open TRIPWIRE — the call executes (recorded hole)" do
+  # A13 (fold P3) — the url ungoverned fail-open hole, CLOSED by T14e: with
+  # no url_policy claim the call is REFUSED with the url_ungoverned reason —
+  # never executed (the T14d tripwire's purpose is served: the deferred
+  # governance-default slice consciously flipped it HERE; the `:none -> :allow`
+  # fail-open row no longer exists). Reverting the closure fails this leg:
+  # the call would execute and `refute_received` trips.
+  test "A13: url ungoverned fails CLOSED — no url_policy claim, refused, no request" do
     handler = url_handler(%{})
+    call = call_delta("http.get", JSON.encode!(%{"url" => "https://anywhere.example/"}), @ts + 1)
+
+    assert [refusal_wire] = handler.([call])
+    assert_refusal(
+      refusal_wire,
+      "url_policy",
+      "url_policy: no governing epoch (fail closed)",
+      nil
+    )
+    refute_received {:http_get, _}
+  end
+
+  # A13b (T14e blast-radius leg) — the closure must not break GOVERNED url
+  # calls: with a governing url_policy claim the SAME call still executes
+  test "A13b: governed url calls still execute — the closure's blast radius is zero" do
+    {epoch_id, epoch} = url_epoch(["anywhere.example"], ["https"])
+    handler = url_handler(%{epoch_id => epoch})
     call = call_delta("http.get", JSON.encode!(%{"url" => "https://anywhere.example/"}), @ts + 1)
 
     assert [_gate_wire, result_wire] = handler.([call])

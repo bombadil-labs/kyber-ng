@@ -257,14 +257,15 @@ defmodule Kyber.Agent.ToolExecutor do
   end
 
   # a refused URL never touches the network; no policy claim ⇒ ungoverned
-  # (allow — the recorded hole, owned by the deferred governance-default
-  # slice); a fork fails closed; undecodable args ⇒ the policy layer
-  # abstains, deferring to the action's own validation
+  # FAIL-CLOSED (T14e: the T14d fail-open hole is closed — mirroring the
+  # memory family's :none row, which precedes args decode: url args are
+  # never examined under :none); a fork fails closed; undecodable args ⇒
+  # the policy layer abstains, deferring to the action's own validation
   defp url_policy(set, tool_id, args) do
     if tool_id in Policy.gated_tools() do
       case Policy.current(set) do
         :none ->
-          :allow
+          {:refuse, Policy.reason_url_ungoverned(), nil}
 
         {:error, :forked} ->
           {:refuse, Policy.reason_forked(), nil}

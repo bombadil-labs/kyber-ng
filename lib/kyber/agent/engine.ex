@@ -154,9 +154,17 @@ defmodule Kyber.Agent.Engine do
         tool_result(id, typed, state)
 
       {"decides",
-       %{type: "GateDecision", verdict: verdict, decides: {:delta, call_id, _ctx}} = typed}
-      when verdict != :allow ->
-        refusal(call_id, typed, state)
+       %{type: "GateDecision", verdict: verdict, decides: {:delta, call_id, _ctx}} = typed} ->
+        # E1 (T14e): the resolved verdict is a WIRE STRING ("allow"/"refuse").
+        # The pinned compare is `to_string(verdict) != "allow"` — dialect-
+        # agnostic (a hypothetical atom verdict still compares correctly) —
+        # but to_string/1 is NOT guard-safe, so it lives in the clause body,
+        # not a guard. Decided-allow falls through: no fabricated refusal.
+        if to_string(verdict) != "allow" do
+          refusal(call_id, typed, state)
+        else
+          state
+        end
 
       _other ->
         state
@@ -419,7 +427,7 @@ defmodule Kyber.Agent.Engine do
         if answered?(set, turn.request_id) do
           %{state | skipped: state.skipped + 1, pending: Map.delete(state.pending, call_id)}
         else
-          reason = typed.reason || Atom.to_string(typed.verdict)
+          reason = typed.reason || to_string(typed.verdict)
 
           turn = %{
             turn

@@ -37,6 +37,7 @@ defmodule Kyber.Agent.Policy do
   @reason_memory_entity "memory_policy: entity not allowed by the current epoch"
   @reason_memory_forked "memory_policy: epoch forked (fail closed)"
   @reason_memory_ungoverned "memory_policy: no governing epoch (fail closed)"
+  @reason_url_ungoverned "url_policy: no governing epoch (fail closed)"
 
   @type epoch :: %{
           id: String.t(),
@@ -74,6 +75,9 @@ defmodule Kyber.Agent.Policy do
 
   @spec reason_memory_ungoverned() :: String.t()
   def reason_memory_ungoverned, do: @reason_memory_ungoverned
+
+  @spec reason_url_ungoverned() :: String.t()
+  def reason_url_ungoverned, do: @reason_url_ungoverned
 
   @doc "The current memory-family epoch: `:none`, `{:error, :forked}`, or `{:ok, epoch}`."
   @spec memory_epoch(map()) :: {:ok, epoch()} | :none | {:error, :forked}

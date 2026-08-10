@@ -12,6 +12,7 @@ defmodule Kyber.Agent.ActionBoundsTest do
   alias Kyber.Agent.{Action, ToolExecutor}
   alias Kyber.Agent.Action.Gate
   alias Kyber.Agent.Events, as: AgentEvents
+  alias Rhizomatic.Delta
 
   @agent_seed String.duplicate("b2", 32)
   @fixture_content "the oracle answer is 42"
@@ -48,6 +49,17 @@ defmodule Kyber.Agent.ActionBoundsTest do
   end
 
   defp start_store, do: elem(Agent.start_link(fn -> %{} end), 1)
+
+  # T14e: the http action tests exercise the ACTION layer — the E2 closure
+  # refuses ungoverned url calls at the gate, so every http test's store is
+  # GOVERNED with a url_policy epoch allow-listing exactly its test URLs
+  # (the closure's blast radius is governed-calls-still-execute, A13b)
+  defp seed_epoch(hosts, schemes) do
+    {:ok, {claims, sig}} =
+      AgentEvents.policy(@agent_seed, 1_700_000_000_000.0, "url_policy", hosts, schemes)
+
+    {Delta.id_hex(claims), {claims, sig}}
+  end
 
   # bounds tests allow-list everything under test; the gate's own boundary
   # is AC2's file
@@ -286,6 +298,8 @@ defmodule Kyber.Agent.ActionBoundsTest do
   test "AC3: http response bodies are capped with the marker; request bodies over the cap are refused" do
     {_base, ws} = tmp_workspace()
     store = start_store()
+    {epoch_id, epoch} = seed_epoch(["example.test"], ["https"])
+    Agent.update(store, &Map.put(&1, epoch_id, epoch))
     big_body = String.duplicate("x", 5_000)
 
     context = %{
@@ -330,6 +344,8 @@ defmodule Kyber.Agent.ActionBoundsTest do
   test "AC3: http refuses non-http schemes and credentialed URLs (no secrets in payloads)" do
     {_base, ws} = tmp_workspace()
     store = start_store()
+    {epoch_id, epoch} = seed_epoch(["example.test"], ["https"])
+    Agent.update(store, &Map.put(&1, epoch_id, epoch))
 
     context =
       Action.context(
@@ -337,14 +353,53 @@ defmodule Kyber.Agent.ActionBoundsTest do
         http: {StubActionHttp, %{reply_to: self(), status: 200, body: "ok"}}
       )
 
-    for url <- [
-          "file:///etc/hostname",
-          "gopher://example.test/",
-          "https://user:pass@example.test/"
-        ] do
-      result = run_action(store, context, "http.get", JSON.encode!(%{"url" => url}))
-      assert result.status == "refused"
+    # the T14e closure's layering: non-http schemes are refused by the url
+    # GATE (a single GateDecision — the action never sees them); the
+    # credentialed https URL passes the gate (https + example.test are
+    # allowed) and is refused by the ACTION (no secrets in payloads). No
+    # network either way.
+    handler =
+      ToolExecutor.handler(
+        seed: @agent_seed,
+        tools: Action.registry(),
+        gate: Gate.new(default: :allow),
+        context: context,
+        store: fn -> Agent.get(store, & &1) end
+      )
+
+    call = fn url ->
+      {:ok, signed} =
+        AgentEvents.tool_call(
+          @agent_seed,
+          1_700_000_000_000.0,
+          "http.get",
+          JSON.encode!(%{"url" => url}),
+          String.duplicate("cd", 32)
+        )
+
+      {:ok, call} = Store.verify(Wire.envelope(signed))
+      call
     end
+
+    for url <- ["file:///etc/hostname", "gopher://example.test/"] do
+      assert [refusal_wire] = handler.([call.(url)])
+      {:ok, refusal} = Store.verify(refusal_wire)
+      resolved = Schema.resolve(refusal.claims)
+      assert resolved.type == "GateDecision"
+      assert resolved.verdict == "refuse"
+      assert resolved.reason == "url_policy: scheme not allowed by the current epoch"
+    end
+
+    credentialed =
+      run_action(
+        store,
+        context,
+        "http.get",
+        JSON.encode!(%{"url" => "https://user:pass@example.test/"})
+      )
+
+    assert credentialed.status == "refused"
+    assert credentialed.result =~ "no secrets in payloads"
 
     refute_received {:http_get, _}
   end
@@ -352,6 +407,8 @@ defmodule Kyber.Agent.ActionBoundsTest do
   test "AC3: http non-2xx and transport failures are recorded statuses, never crashes" do
     {_base, ws} = tmp_workspace()
     store = start_store()
+    {epoch_id, epoch} = seed_epoch(["example.test"], ["https"])
+    Agent.update(store, &Map.put(&1, epoch_id, epoch))
 
     failing = %{
       reply_to: self(),
