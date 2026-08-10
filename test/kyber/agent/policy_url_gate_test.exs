@@ -138,12 +138,20 @@ defmodule Kyber.Agent.PolicyUrlGateTest do
     assert_received {:http_get, "https://ALLOWED.Example/x"}
   end
 
-  test "AC1: no policy claim in the store — ungoverned, the call executes (the recorded hole)" do
+  test "AC1: no policy claim in the store — ungoverned, the call is REFUSED (T14e closes the hole)" do
     handler = handler_with(%{})
     call = call_delta("http.get", "https://anywhere.example/", @ts + 1)
 
-    assert [_gate_wire, _result_wire] = handler.([call])
-    assert_received {:http_get, "https://anywhere.example/"}
+    assert [refusal_wire] = handler.([call])
+    {:ok, refusal} = Store.verify(refusal_wire)
+    resolved = Schema.resolve(refusal.claims)
+    assert resolved.type == "GateDecision"
+    assert resolved.verdict == "refuse"
+    assert resolved.policy == "url_policy"
+    assert resolved.reason == "url_policy: no governing epoch (fail closed)"
+    assert resolved.policy_epoch == nil
+
+    refute_received {:http_get, _}
   end
 
   test "AC1: a forked epoch refuses all gated calls — fail closed" do

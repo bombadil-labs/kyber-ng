@@ -47,12 +47,12 @@ defmodule Kyber.Agent.EnginePathsTest do
     end
   end
 
-  defp llm do
+  defp llm(http \\ {StubHttp, %{reply_to: self()}}) do
     {:ok, handler} =
       LlmHandler.new(
         seed: @agent_seed,
         api_key: "test-key-never-real",
-        http: {StubHttp, %{reply_to: self()}},
+        http: http,
         model: "stub-model"
       )
 
@@ -80,7 +80,7 @@ defmodule Kyber.Agent.EnginePathsTest do
         Keyword.merge(
           [
             name: nil,
-            llm: llm(),
+            llm: llm(Keyword.get(opts, :http, {StubHttp, %{reply_to: self()}})),
             store: fn -> Agent.get(store, & &1) end,
             sink: fn wire ->
               put_wire(store, wire)
@@ -291,5 +291,193 @@ defmodule Kyber.Agent.EnginePathsTest do
     assert_engine_raises(engine, %{id: "req-c4b", claims: request},
       "PromptAssembled store corruption: canonical does not decode"
     )
+  end
+  # -------------------------------------------------------------- E1 (T14e)
+
+  # the tool-calling model stub (the E1 legs): on the FIRST call there is no
+  # tool message in context, so the model asks for the echo tool; on every
+  # later call it answers from whatever tool message it sees — the refusal
+  # loop ("refused: ...") and the real-result flow both land here, so the
+  # test can assert exactly what the model's view carried
+  defmodule ToolStubHttp do
+    @behaviour Kyber.Agent.HttpClient
+
+    @impl true
+    def post(_url, _headers, body, state) do
+      decoded = JSON.decode!(body)
+      send(state.reply_to, {:llm_request, decoded})
+
+      message =
+        case Enum.find(decoded["messages"], &(&1["role"] == "tool")) do
+          %{"content" => content} ->
+            %{"role" => "assistant", "content" => "The tool said: " <> content}
+
+          nil ->
+            %{
+              "role" => "assistant",
+              "content" => nil,
+              "tool_calls" => [
+                %{
+                  "id" => "call_e1",
+                  "type" => "function",
+                  "function" => %{"name" => "tool_echo", "arguments" => "{\"args\":\"e1-ping\"}"}
+                }
+              ]
+            }
+        end
+
+      {:ok,
+       %{
+         status: 200,
+         body:
+           JSON.encode!(%{
+             "choices" => [%{"index" => 0, "message" => message}]
+           })
+       }}
+    end
+  end
+
+  # receive sink wires until one of the wanted type arrives (earlier wires —
+  # the PromptAssembled — are consumed and discarded)
+  defp sink_typed(type) do
+    assert_receive {:sink, wire}, 2_000
+    {:ok, delta} = Store.verify(wire)
+
+    case Schema.resolve(delta.claims) do
+      %{type: ^type} = typed -> {typed, delta}
+      _other -> sink_typed(type)
+    end
+  end
+
+  # the shared E1 fixture: an InferenceRequested that makes the model ask for
+  # the echo tool — the engine emits the ToolCall and keeps the call pending;
+  # returns {engine, call_delta}
+  defp tool_chain(store, request_id) do
+    engine =
+      start_engine(store, http: {ToolStubHttp, %{reply_to: self()}})
+
+    request = raw_inference_requested(@ts, request_id, "session:s1", "prompt:p1")
+    assert Engine.handler(engine).([%{id: request_id, claims: request}]) == []
+
+    {_call, call_delta} = sink_typed("ToolCall")
+    assert_receive {:llm_request, _}
+    {engine, call_delta}
+  end
+
+  # E1a — the M5 decided-allow pass-through: a store containing a
+  # GateDecision claim with verdict "allow" for a pending call routes to
+  # `_other -> state` — NO fabricated refusal reaches the model (no re-plan
+  # call, no emitted wire) and the call STAYS pending for its real
+  # ToolResult. Restoring the atom guard (`!= :allow`) fails this leg: the
+  # wire verdict is a STRING, so every GateDecision would fabricate a
+  # refusal.
+  test "E1a: decided-allow pass-through — an allow GateDecision emits NO refusal wire" do
+    store = start_store(%{})
+    {engine, call_delta} = tool_chain(store, "req-e1a")
+
+    {:ok, {claims, sig}} =
+      Events.gate_decision(@agent_seed, @ts + 1, call_delta.id, "allow", "test_policy")
+
+    gate_delta = put_wire(store, Wire.envelope({claims, sig}))
+
+    assert Engine.handler(engine).([gate_delta]) == []
+
+    # the sync barrier: status/1 is a call that serializes behind the cast —
+    # the GateDecision has been processed by now; the call is still pending
+    assert %{pending: 1, tool_calls: 1} = Engine.status(engine)
+
+    # no fabricated refusal: no re-plan model call, no emitted wire
+    refute_received {:llm_request, _}
+    refute_received {:sink, _}
+  end
+
+  # E1b — decided-refuse WITH a reason: the refusal routes back to the model
+  # (the refusal loop) carrying the pinned reason
+  test "E1b: decided-refuse with a reason — the refusal carries the reason" do
+    store = start_store(%{})
+    {engine, call_delta} = tool_chain(store, "req-e1b")
+
+    {:ok, {claims, sig}} =
+      Events.gate_decision(
+        @agent_seed,
+        @ts + 1,
+        call_delta.id,
+        "refuse",
+        "test_policy",
+        "the policy says no"
+      )
+
+    gate_delta = put_wire(store, Wire.envelope({claims, sig}))
+
+    assert Engine.handler(engine).([gate_delta]) == []
+
+    # the model re-plans and its view carries the refused-call tool message
+    # with the pinned reason
+    assert_receive {:llm_request, body}, 2_000
+
+    assert %{"content" => "refused: the policy says no"} =
+             Enum.find(body["messages"], &(&1["role"] == "tool"))
+
+    {response, _} = sink_typed("ResponseDelta")
+    assert response.content == "The tool said: refused: the policy says no"
+    assert response.requestRef == {:delta, "req-e1b", "answered"}
+  end
+
+  # E1c — decided-refuse with NO reason: the reason falls back to the wire
+  # verdict spelling ("refuse") — no crash. Restoring `Atom.to_string`
+  # crashes the engine on the string verdict (ArgumentError) and no re-plan
+  # arrives: this leg fails.
+  test "E1c: decided-refuse without a reason — reason falls back to the verdict spelling" do
+    store = start_store(%{})
+    {engine, call_delta} = tool_chain(store, "req-e1c")
+
+    {:ok, {claims, sig}} =
+      Events.gate_decision(@agent_seed, @ts + 1, call_delta.id, "refuse", "test_policy")
+
+    gate_delta = put_wire(store, Wire.envelope({claims, sig}))
+
+    assert Engine.handler(engine).([gate_delta]) == []
+
+    assert_receive {:llm_request, body}, 2_000
+
+    assert %{"content" => "refused: refuse"} =
+             Enum.find(body["messages"], &(&1["role"] == "tool"))
+
+    {response, _} = sink_typed("ResponseDelta")
+    assert response.content == "The tool said: refused: refuse"
+  end
+
+  # E1d — decided-allow + the matching ToolResult: after the pass-through,
+  # the REAL ToolResult claim still flows to the model's view (the semantic
+  # degradation carry closed — the model sees the result, not a refusal)
+  test "E1d: decided-allow + matching ToolResult — the real result flows to the model's view" do
+    store = start_store(%{})
+    {engine, call_delta} = tool_chain(store, "req-e1d")
+
+    {:ok, {claims, sig}} =
+      Events.gate_decision(@agent_seed, @ts + 1, call_delta.id, "allow", "test_policy")
+
+    gate_delta = put_wire(store, Wire.envelope({claims, sig}))
+
+    assert Engine.handler(engine).([gate_delta]) == []
+    # the pass-through keeps the call pending — no fabricated refusal
+    assert %{pending: 1} = Engine.status(engine)
+
+    {:ok, {tr_claims, tr_sig}} =
+      Events.tool_result(@agent_seed, @ts + 2, call_delta.id, "the-real-result", "ok")
+
+    tr_delta = put_wire(store, Wire.envelope({tr_claims, tr_sig}))
+
+    assert Engine.handler(engine).([tr_delta]) == []
+
+    # the model's view carries the REAL result, not a fabricated refusal
+    assert_receive {:llm_request, body}, 2_000
+
+    assert %{"content" => "the-real-result"} =
+             Enum.find(body["messages"], &(&1["role"] == "tool"))
+
+    {response, _} = sink_typed("ResponseDelta")
+    assert response.content == "The tool said: the-real-result"
+    assert response.requestRef == {:delta, "req-e1d", "answered"}
   end
 end

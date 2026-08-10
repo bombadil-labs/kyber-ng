@@ -20,6 +20,7 @@ defmodule Kyber.Agent.ToolBoundsTest do
   alias Kyber.Agent.{Action, Events, ToolExecutor}
   alias Kyber.Agent.Action.Gate
   alias Kyber.Agent.Events, as: AgentEvents
+  alias Rhizomatic.Delta
 
   @agent_seed String.duplicate("b2", 32)
   @ts 1_700_000_000_000.0
@@ -54,6 +55,17 @@ defmodule Kyber.Agent.ToolBoundsTest do
   end
 
   defp start_store, do: elem(Agent.start_link(fn -> %{} end), 1)
+
+  # T14e: the http bounds tests exercise the ACTION layer — the E2 closure
+  # refuses ungoverned url calls at the gate, so every http test's store is
+  # GOVERNED with a url_policy epoch allow-listing exactly its test URLs
+  # (the closure's blast radius is governed-calls-still-execute, A13b)
+  defp seed_epoch(hosts, schemes) do
+    {:ok, {claims, sig}} =
+      AgentEvents.policy(@agent_seed, @ts, "url_policy", hosts, schemes)
+
+    {Delta.id_hex(claims), {claims, sig}}
+  end
 
   defp run_action(store, context, tool_id, args, ts \\ @ts) do
     {:ok, signed} = AgentEvents.tool_call(@agent_seed, ts, tool_id, args, String.duplicate("cd", 32))
@@ -359,6 +371,8 @@ defmodule Kyber.Agent.ToolBoundsTest do
   test "B4: http response bodies are capped with the marker (65_536 by construction, injected 1024)" do
     {_base, ws} = tmp_workspace()
     store = start_store()
+    {epoch_id, epoch} = seed_epoch(["example.test"], ["https"])
+    Agent.update(store, &Map.put(&1, epoch_id, epoch))
     big_body = String.duplicate("x", 5_000)
 
     context = %{
@@ -380,6 +394,8 @@ defmodule Kyber.Agent.ToolBoundsTest do
   test "B4: a POST body over the cap is REFUSED, never truncated, and never sent" do
     {_base, ws} = tmp_workspace()
     store = start_store()
+    {epoch_id, epoch} = seed_epoch(["example.test"], ["https"])
+    Agent.update(store, &Map.put(&1, epoch_id, epoch))
 
     context = %{
       Action.context(
@@ -433,6 +449,8 @@ defmodule Kyber.Agent.ToolBoundsTest do
   test "B4: a transport timeout maps via inspect(reason) to the http.<method> <url>: :timeout error" do
     {_base, ws} = tmp_workspace()
     store = start_store()
+    {epoch_id, epoch} = seed_epoch(["example.test"], ["https"])
+    Agent.update(store, &Map.put(&1, epoch_id, epoch))
 
     context =
       Action.context(
