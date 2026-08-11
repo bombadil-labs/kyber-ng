@@ -23,12 +23,16 @@ defmodule Kyber.Agent.Skill do
   retraction of a non-head set-delta is a silent no-op; removal of the head
   NEVER exposes the prior version (no retraction-path rollback — rollback is
   a NEW superseding set, forward-only). A negation cycle is self-neutralizing
-  (deterministic, terminates). The flat house `negates` scan (policy.ex /
-  engine.ex / reactor.ex / attestation.ex) is deliberately NOT copied — it
-  cannot express restore.
+  (deterministic, terminates). The recursive-existential machinery is the
+  SHARED `Kyber.Agent.Liveness` helper (T14g M1 — ONE implementation; skill
+  passes the identity negator filter, identity passes the boot-constant
+  author filter). The flat house `negates` scan (policy.ex / engine.ex /
+  reactor.ex / attestation.ex) is deliberately NOT copied — it cannot
+  express restore.
   """
 
   alias Kyber.{DeltaSet, Schema}
+  alias Kyber.Agent.Liveness
 
   @type view :: %{
           name: String.t(),
@@ -63,7 +67,7 @@ defmodule Kyber.Agent.Skill do
       _ ->
         {head_id, head} = List.last(ordered)
 
-        if live?(set, head_id, MapSet.new()) do
+        if live?(set, head_id) do
           {:ok,
            %{
              name: name,
@@ -98,29 +102,11 @@ defmodule Kyber.Agent.Skill do
     |> Enum.sort_by(& &1.name)
   end
 
-  # recursive-existential liveness: a delta id is live iff NO live negation
-  # targets it. `path` guards the recursion — a negation cycle is
-  # self-neutralizing (a revisited id answers live), so the fold terminates
-  # and stays iteration-order-independent (the existential is order-free).
-  defp live?(set, id, path) do
-    if MapSet.member?(path, id) do
-      true
-    else
-      path = MapSet.put(path, id)
-      # live iff NO LIVE negation targets it: not (exists y in N(x): live(y))
-      not Enum.any?(negators(set, id), fn negator -> live?(set, negator, path) end)
-    end
-  end
-
-  # the negation scan is kind-agnostic (any claim with a `negates` pointer),
-  # the house retraction vocabulary — out-of-band negations take effect on
-  # their target's arrival (L5), and the SkillRetract kind rides the same
-  # role.
-  defp negators(set, id) do
-    for {nid, {claims, _sig}} <- set,
-        %{role: "negates", target: {:delta, ^id, _ctx}} <- claims.pointers,
-        do: nid
-  end
+  # T14g M1: the SHARED recursive-existential liveness helper — skill passes
+  # identity as the negator filter (author-blind, unchanged); identity
+  # passes the boot-constant author filter (H2). ONE implementation, never
+  # two divergent ones.
+  defp live?(set, id), do: Liveness.live?(set, id, fn _claims -> true end)
 
   defp names(set) do
     (for {_id, {claims, _sig}} <- set,

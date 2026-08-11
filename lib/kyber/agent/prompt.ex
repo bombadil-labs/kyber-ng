@@ -8,7 +8,7 @@ defmodule Kyber.Agent.Prompt do
   delta set, so two boots over the same store produce byte-identical
   prompt answers (AC1).
 
-  `assemble/4` is `Engine.build_messages/4` extracted verbatim, amended by
+  `assemble/6` is `Engine.build_messages/4` extracted verbatim, amended by
   the D4 ruling: the memory-notes gather is a SECOND gated surface, gated
   by a call-less mechanism — the memory epoch filters `memory_ids` before
   any note is built. Entity allowed => note included; entity not allowed =>
@@ -19,6 +19,14 @@ defmodule Kyber.Agent.Prompt do
   PREDATES governance, exactly as http tools did; the tool, born in this
   slice, is fail-closed by contrast).
 
+  T14g (R1/G3/G8): the 6th argument is the BOOT CONTEXT
+  `{profile | nil, operator_author | nil}` — the identity block (the
+  always-on block, FIRST after the system message, 8192 disjoint cap,
+  never windowed) renders under it, the memory gather's `:none` arm FLIPS
+  to omit-all under ANY active profile (N1 — the legacy fail-open arm stays
+  for profile-less boots), and the skill lens sources its epoch from the
+  profile's families under a profile (M2).
+
   id->entity resolution is by CHAIN MEMBERSHIP (`Memory.resolve_set/2`),
   never the delta's direct entity pointer: the gather iterates memory DELTA
   ids while the retriever answers canon HEAD ids, and a canon head that is
@@ -28,7 +36,7 @@ defmodule Kyber.Agent.Prompt do
   included (legacy).
   """
 
-  alias Kyber.Agent.{ContextBuilder, Memory, Policy, Skill}
+  alias Kyber.Agent.{ContextBuilder, Identity, Memory, Policy, Profile, Skill}
   alias Kyber.Agent.Memory.Assoc
 
   @system_prompt "You are kyber, an agent living in a claims substrate. " <>
@@ -48,13 +56,30 @@ defmodule Kyber.Agent.Prompt do
   stored claim still wins on replay even if the epoch changed after
   emission).
   """
-  @spec assemble(Kyber.DeltaSet.t(), String.t(), [String.t()], non_neg_integer()) :: [map()]
-  def assemble(set, session_id, memory_ids, window \\ 8, prompt_text \\ nil) do
+  @spec assemble(
+          Kyber.DeltaSet.t(),
+          String.t(),
+          [String.t()],
+          non_neg_integer(),
+          String.t() | nil,
+          {String.t() | nil, String.t() | nil}
+        ) :: [map()]
+  def assemble(set, session_id, memory_ids, window \\ 8, prompt_text \\ nil, boot \\ {nil, nil}) do
+    {profile_name, operator_author} = boot
+    # the profile view is resolved ONCE per assemble (folds are recomputed
+    # per read, never latched) and threads into the identity block, the
+    # memory gather and the skill lens alike
+    profile_view = profile_view(set, operator_author, profile_name)
+
     turns = ContextBuilder.conversation(set, session_id)
     {elided, windowed} = ContextBuilder.window(turns, window)
 
+    identity_notes =
+      for note <- Identity.block(set, operator_author, profile_view),
+          do: %{"role" => "system", "content" => note}
+
     memory_notes =
-      for id <- gather_ids(set, memory_ids),
+      for id <- gather_ids(set, memory_ids, profile_view),
           {claims, _sig} <- [Map.get(set, id)],
           {:string, content} <- [pointer(claims, "content")],
           do: %{"role" => "system", "content" => "Memory: " <> content}
@@ -66,7 +91,7 @@ defmodule Kyber.Agent.Prompt do
           {:string, content} <- [pointer(claims, "content")],
           do: %{"role" => "system", "content" => "Summary of earlier turns: " <> content}
 
-    skill_notes = skill_notes(set, prompt_text)
+    skill_notes = skill_notes(set, prompt_text, profile_view)
 
     elision_note =
       case elided do
@@ -74,9 +99,11 @@ defmodule Kyber.Agent.Prompt do
         turns -> [%{"role" => "system", "content" => "#{length(turns)} earlier turns elided."}]
       end
 
-    # the pinned order: system -> memory_notes -> summary_notes ->
-    # skill_notes -> elision -> turns (M3)
+    # the pinned order (T14g G3 — the T14f M3 parent pin, byte-for-byte):
+    # system -> IDENTITY -> memory_notes -> summary_notes -> skill_notes ->
+    # elision -> turns
     [%{"role" => "system", "content" => @system_prompt}] ++
+      identity_notes ++
       memory_notes ++
       summary_notes ++
       skill_notes ++
@@ -116,10 +143,26 @@ defmodule Kyber.Agent.Prompt do
   # skills (L8 — the asymmetry with the memory gather's fail-open :none arm
   # is pinned; the two arms never unify); NO GateDecision is minted (the
   # lens is prompt assembly, not a gate). No prompt text => no skills ride.
-  defp skill_notes(_set, nil), do: []
+  defp skill_notes(_set, nil, _profile_view), do: []
 
-  defp skill_notes(set, prompt_text) when is_binary(prompt_text) do
-    case Policy.skill_epoch(set) do
+  defp skill_notes(set, prompt_text, profile_view) when is_binary(prompt_text) do
+    # T14g (M2): under a profile the lens's epoch source is the PROFILE's
+    # families (the derived fail-closed defaults); profile-less boots keep
+    # the boot families. Both answer `{:ok, epoch}` or nothing — the lens
+    # stays fail-closed either way.
+    epoch =
+      case profile_view do
+        nil ->
+          case Policy.skill_epoch(set) do
+            {:ok, epoch} -> {:ok, epoch}
+            other -> other
+          end
+
+        view ->
+          Profile.skill_epoch(set, view)
+      end
+
+    case epoch do
       {:ok, epoch} -> ranked_skill_notes(set, epoch, prompt_text)
       _none_or_forked -> []
     end
@@ -214,6 +257,18 @@ defmodule Kyber.Agent.Prompt do
 
   # the call-less gate: epoch-filter the gather's memory ids BEFORE any
   # note is built (see the moduledoc for the full ruling)
+  # T14g (R1/G8/N1): the :none gather arm FLIPS under a profile — the legacy
+  # fail-open include-all stays for profile-less boots (byte-identical
+  # legacy behavior); under ANY active profile the epoch source is the
+  # profile's families (UNION, M3) and an ungoverned union governs NOTHING
+  # (omit-all — the AC2 leak through the gather is closed).
+  defp gather_ids(set, memory_ids, nil), do: gather_ids(set, memory_ids, Policy.memory_epoch(set))
+
+  defp gather_ids(set, memory_ids, %{name: _name} = profile_view) do
+    {:ok, epoch} = Profile.memory_epoch(set, profile_view)
+    gather_ids(set, memory_ids, {:ok, epoch})
+  end
+
   defp gather_ids(_set, memory_ids, :none), do: memory_ids
   defp gather_ids(_set, _memory_ids, {:error, :forked}), do: []
 
@@ -233,16 +288,27 @@ defmodule Kyber.Agent.Prompt do
     end)
   end
 
-  defp gather_ids(set, memory_ids) do
-    gather_ids(set, memory_ids, Policy.memory_epoch(set))
-  end
-
   # chain membership: the memory whose chain contains the delta id — never
   # the delta's own entity pointer (a MemoryEdited canon head carries none)
   defp entity_for(memories, id) do
     case Enum.find(memories, &(id in &1.chain)) do
       %{entity: entity_id} -> entity_id
       nil -> nil
+    end
+  end
+
+  # ----------------------------------------------------- the boot context
+
+  # resolve the boot profile's ProfileSet view once per assemble; nil when
+  # profile-less OR the operator author is absent (the nil-seed leg is
+  # fail-closed: no operator seed => no identity block, no profile view)
+  defp profile_view(_set, _operator_author, nil), do: nil
+  defp profile_view(_set, nil, _profile_name), do: nil
+
+  defp profile_view(set, operator_author, profile_name) do
+    case Profile.resolve(set, operator_author, profile_name) do
+      {:ok, view} -> view
+      :not_found -> nil
     end
   end
 

@@ -211,7 +211,16 @@ defmodule Kyber.SchemaTest do
           {&Kyber.Agent.Events.skill_set/7, "SkillSet",
            {@seed, @ts, "greet", "Greet", "say hello", "{}", id64("99")}},
           {&Kyber.Agent.Events.skill_retract/4, "SkillRetract",
-           {@seed, @ts, "greet", id64("99")}}
+           {@seed, @ts, "greet", id64("99")}},
+          # T14g (G2/N2): the identity/profile builders and the profile-
+          # keyed PromptAssembled against their schemas — the fold only sees
+          # typed deltas, so schema drift would blind it silently
+          {&Kyber.Agent.Events.identity_set/6, "IdentitySet",
+           {@seed, @ts, "identity:soul", "soul", "I am Veles.", id64("99")}},
+          {&Kyber.Agent.Events.profile_set/7, "ProfileSet",
+           {@seed, @ts, "channel:discord", "rules", ["identity:soul"], ["memory.read"], ["memory"]}},
+          {&Kyber.Agent.Events.prompt_assembled/6, "PromptAssembled",
+           {@seed, @ts, "req-1", "session:s1", "{}", "channel:discord"}}
         ] do
       {:ok, {claims, _sig}} = apply(emitter, Tuple.to_list(args))
 

@@ -89,11 +89,16 @@ defmodule Kyber.Schema.Genesis do
     # re-executed
     {"ToolCallDuplicate", requires: [{"dedupes", "delta"}, {"result", "delta"}]},
     # T14c (D1): the prompt-as-delta claim — the assembled prompt the model
-    # SAW, answered as a store delta. EXACTLY three pointers, sessionId
-    # FIRST (the kind-marker grammar: the two requestRef-first readers —
-    # Engine.answered?/2 and the conversation lens — key on the first role)
+    # SAW, answered as a store delta. sessionId FIRST (the kind-marker
+    # grammar: the two requestRef-first readers — Engine.answered?/2 and
+    # the conversation lens — key on the first role)
     {"PromptAssembled",
-     requires: [{"sessionId", "entity"}, {"requestRef", "delta"}, {"content", "string"}]},
+     requires: [{"sessionId", "entity"}, {"requestRef", "delta"}, {"content", "string"}],
+     # T14g (N2/H4): the replay seam is PROFILE-KEYED — the key rides as an
+     # optional `profile` string role, emitted ONLY under a profile
+     # (profile-less mints stay byte-identical); keyed-vs-unkeyed is a MISS,
+     # never a cross-serve (the matrix is closed both ways)
+     optional: [{"profile", "string"}]},
     # T14c (D5): the operator-key boot attestation — the operator's key
     # attests the agent's boot, an explicit store-visible participant
     {"BootAttestation",
@@ -116,6 +121,30 @@ defmodule Kyber.Schema.Genesis do
      requires: [{"skill", "entity"}, {"description", "string"}, {"body", "string"}],
      optional: [{"metadata", "string"}, {"source", "delta"}]},
     {"SkillRetract", requires: [{"skill", "entity"}, {"negates", "delta"}]},
+    # T14g (G2): the identity aggregate — the soul/user/operator primitives
+    # are DERIVED entities (a view over their delta stream, never a blob),
+    # operator-attested (the boot-constant author, R1/H2). The `entity`
+    # pointer (`identity:<id>`) is the binding (one entity per primitive —
+    # the MemoryEntity precedent, role name `entity`, pinned deliberately);
+    # the closed `kind` field (soul/user/operator) is the fold key; `body`
+    # is the rendered text; `source` is the optional provenance pointer.
+    # An unknown kind string or a whitespace-only kind/id is FOLD-INERT
+    # (closed set, reject-never-repair).
+    {"IdentitySet",
+     requires: [{"entity", "entity"}, {"kind", "string"}, {"body", "string"}],
+     optional: [{"source", "delta"}]},
+    # T14g (G2): the profile declaration delta — a profile is a POLICY-
+    # SHAPED BINDING (identity view + epoch-bounded memory/skill visibility
+    # + capability subset), never a storage mechanism. The name rides as
+    # the `profile` entity aggregate key (the ATTACH key, G5); `rules` is
+    # the rendered profile-rules text (the "Profile: <name>\n" block
+    # segment); `rides` are `identity:<id>` ENTITY REFS (the identity view);
+    # `allow_tool` and `families` are strings (capability subset / live
+    # family-name epoch refs). Declarations carry the SAME author filter as
+    # identity primitives (H2c — no agent-declared visibility escalation).
+    {"ProfileSet",
+     requires: [{"profile", "entity"}, {"rules", "string"}],
+     many: [{"rides", "entity"}, {"allow_tool", "string"}, {"families", "string"}]},
 
     # The T10 infra events (spec/01-events.md §2), named into the vocabulary.
     {"MessageReceived",

@@ -234,23 +234,98 @@ defmodule Kyber.Agent.Events do
   end
 
   @doc """
-  `PromptAssembled` — the prompt-as-delta claim (T14c D1): the assembled
-  prompt the model SAW, answered as a store delta. EXACTLY three pointers,
-  `sessionId` FIRST (the kind-marker grammar — `"sessionId"` routes to no
-  subscription and matches no lens; the two `requestRef` readers,
-  `Engine.answered?/2` and the conversation lens, key on the FIRST role).
-  `content` is the canonical JSON of the message list
-  (`Kyber.Agent.Prompt.canonical/1`) — exactly what `LlmHandler.chat/3`
-  receives. `ts` is the triggering `InferenceRequested` delta's
-  `claims.timestamp`, never wall-clock; ONE claim per assembled prompt.
+  `IdentitySet` — one full-set identity write (T14g G2): the soul/user/
+  operator primitives are DERIVED entities, a view over their `IdentitySet`
+  delta stream (never a blob). The `entity` pointer (`identity:<id>`) is
+  the binding (one entity per primitive; the role name `entity` is the
+  MemoryEntity precedent, pinned deliberately); the `kind` field is the
+  CLOSED fold key (soul/user/operator — an unknown kind is FOLD-INERT);
+  `body` is the rendered text; `source` is the optional provenance pointer.
+  The claims are OPERATOR-ATTESTED (G7): the fold pre-filters to the boot-
+  constant author (R1/H2), so an agent-signed write is door-admissible but
+  never renders (AC3's rejection = fold-inertness, M6). Whole-set supersede
+  per T14f H6: the latest live set-delta of the kind wins.
   """
-  @spec prompt_assembled(String.t(), number(), String.t(), String.t(), String.t()) ::
-          {:ok, signed()} | {:error, term()}
-  def prompt_assembled(seed, ts, request_id, session_id, content) do
+  @spec identity_set(
+          String.t(),
+          number(),
+          String.t(),
+          String.t(),
+          String.t(),
+          String.t() | nil
+        ) :: {:ok, signed()} | {:error, term()}
+  def identity_set(seed, ts, id, kind, body, source \\ nil) do
+    build(seed, ts, "IdentitySet", [
+      %{role: "entity", target: {:entity, id, "identity"}},
+      %{role: "kind", target: {:string, kind}},
+      %{role: "body", target: {:string, body}},
+      if(source, do: [%{role: "source", target: {:delta, source, "attested"}}], else: [])
+    ])
+  end
+
+  @doc """
+  `ProfileSet` — one profile declaration delta (T14g G2/G5/G8): a profile
+  is a POLICY-SHAPED BINDING — identity view + epoch-bounded memory/skill
+  visibility + capability subset — never a storage mechanism. The name
+  rides as the `profile` entity aggregate key (the ATTACH key); `rules` is
+  the rendered profile-rules text (the always-on block's
+  `"Profile: <name>\n"` segment); `rides` are `identity:<id>` ENTITY REFS
+  (which primitives the profile rides); `allow_tool` and `families` are
+  strings (the capability subset / the live family-name epoch refs).
+  Declarations are OPERATOR-ATTESTED (H2c): the fold pre-filters to the
+  boot-constant author — an agent-declared ProfileSet is fold-inert and
+  can never escalate visibility.
+  """
+  @spec profile_set(
+          String.t(),
+          number(),
+          String.t(),
+          String.t(),
+          [String.t()],
+          [String.t()],
+          [String.t()]
+        ) :: {:ok, signed()} | {:error, term()}
+  def profile_set(seed, ts, name, rules, rides \\ [], allow_tool \\ [], families \\ []) do
+    build(seed, ts, "ProfileSet", [
+      %{role: "profile", target: {:entity, name, "profiles"}},
+      %{role: "rules", target: {:string, rules}},
+      Enum.map(rides, &%{role: "rides", target: {:entity, &1, "rides"}}),
+      Enum.map(allow_tool, &%{role: "allow_tool", target: {:string, &1}}),
+      Enum.map(families, &%{role: "families", target: {:string, &1}})
+    ])
+  end
+
+  @doc """
+  `PromptAssembled` — the prompt-as-delta claim (T14c D1): the assembled
+  prompt the model SAW, answered as a store delta. `sessionId` FIRST (the
+  kind-marker grammar — `"sessionId"` routes to no subscription and matches
+  no lens; the two `requestRef` readers, `Engine.answered?/2` and the
+  conversation lens, key on the FIRST role). `content` is the canonical
+  JSON of the message list (`Kyber.Agent.Prompt.canonical/1`) — exactly
+  what `LlmHandler.chat/3` receives. `ts` is the triggering
+  `InferenceRequested` delta's `claims.timestamp`, never wall-clock; ONE
+  claim per (assembled prompt, profile).
+
+  T14g (N2/H4): the claim is PROFILE-KEYED — the optional `profile` string
+  role rides ONLY under a profile (profile-less mints stay BYTE-IDENTICAL:
+  `profile == nil` emits no pointer); keyed-vs-unkeyed is a MISS at the
+  replay check, never a cross-serve (a legacy unkeyed claim never serves a
+  profiled boot and vice versa).
+  """
+  @spec prompt_assembled(
+          String.t(),
+          number(),
+          String.t(),
+          String.t(),
+          String.t(),
+          String.t() | nil
+        ) :: {:ok, signed()} | {:error, term()}
+  def prompt_assembled(seed, ts, request_id, session_id, content, profile \\ nil) do
     build(seed, ts, "PromptAssembled", [
       %{role: "sessionId", target: {:entity, session_id, "prompts"}},
       %{role: "requestRef", target: {:delta, request_id, "prompted"}},
-      %{role: "content", target: {:string, content}}
+      %{role: "content", target: {:string, content}},
+      if(profile, do: [%{role: "profile", target: {:string, profile}}], else: [])
     ])
   end
 
