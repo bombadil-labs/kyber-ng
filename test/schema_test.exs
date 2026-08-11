@@ -219,8 +219,16 @@ defmodule Kyber.SchemaTest do
            {@seed, @ts, "identity:soul", "soul", "I am Veles.", id64("99")}},
           {&Kyber.Agent.Events.profile_set/7, "ProfileSet",
            {@seed, @ts, "channel:discord", "rules", ["identity:soul"], ["memory.read"], ["memory"]}},
-          {&Kyber.Agent.Events.prompt_assembled/6, "PromptAssembled",
-           {@seed, @ts, "req-1", "session:s1", "{}", "channel:discord"}}
+          {&Kyber.Agent.Events.prompt_assembled/7, "PromptAssembled",
+           {@seed, @ts, "req-1", "session:s1", "{}", "channel:discord", id64("77")}},
+          # T14h (N5): the always-on family — StandingDigest / StandingFlag /
+          # EpochKeyMaterial builders against their schemas (the folds only
+          # see typed deltas, so schema drift would blind them silently)
+          {&Kyber.Agent.Events.standing_digest/5, "StandingDigest",
+           {@seed, @ts, "session:s1", "asked: hi", [id64("11")]}},
+          {&Kyber.Agent.Events.standing_flag/3, "StandingFlag", {@seed, @ts, "memory:e1"}},
+          {&Kyber.Agent.Events.epoch_key_material/5, "EpochKeyMaterial",
+           {@seed, @ts, "channel:discord", "[]", id64("99")}}
         ] do
       {:ok, {claims, _sig}} = apply(emitter, Tuple.to_list(args))
 

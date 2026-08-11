@@ -21,6 +21,7 @@ defmodule Kyber.Agent.AlwaysOnTest do
 
   alias Kyber.{Keys, Schema, Store, Wire}
   alias Kyber.Agent.{ContextBuilder, Engine, Events, LlmHandler, MemoryPort, Prompt}
+  alias Rhizomatic.Delta
 
   @agent_seed String.duplicate("b2", 32)
   @operator_seed String.duplicate("7f", 32)
@@ -181,7 +182,13 @@ defmodule Kyber.Agent.AlwaysOnTest do
 
     as_of_mint =
       Map.reject(set, fn {_id, {claims, _sig}} ->
-        match?(%{type: type} when type in ["ResponseDelta", "MessageSent"], Schema.resolve(claims))
+        # T14h: the digest family is minted AFTER the PromptAssembled (the
+        # answer path's zero-charge side emission, H1 pre-emission) — the
+        # as-of-mint set below the PA excludes it too
+        match?(
+          %{type: type} when type in ["ResponseDelta", "MessageSent", "StandingDigest", "EpochKeyMaterial"],
+          Schema.resolve(claims)
+        )
       end)
 
     re_derived = Prompt.assemble(as_of_mint, "session:s1", [], 8, "hello", {nil, author})
@@ -277,5 +284,204 @@ defmodule Kyber.Agent.AlwaysOnTest do
     refute Enum.any?(contents, &String.starts_with?(&1, "User: "))
     refute Enum.any?(contents, &String.starts_with?(&1, "Operator: "))
     assert hd(messages) == %{"role" => "system", "content" => Prompt.system_prompt()}
+  end
+
+  # ====================================================== T14h (always-on)
+
+  defp author, do: Keys.author_for_seed(@operator_seed)
+
+  # the standing fold's inputs: a flagged + epoch-allowed memory canon
+  # (StandingFlag + MemoryEntity + the memory-family epoch)
+  defp standing_store(entity, content) do
+    store = start_store()
+    {:ok, mem} = Events.memory_entity(@agent_seed, @ts, entity, content, [])
+    put_wire(store, Wire.envelope(mem))
+    {:ok, flag} = Events.standing_flag(@agent_seed, @ts + 1, entity)
+    put_wire(store, Wire.envelope(flag))
+    {:ok, epoch} = Events.memory_policy(@operator_seed, @ts + 2, [entity])
+    put_wire(store, Wire.envelope(epoch))
+    store
+  end
+
+  test "T14h AC1: the standing block rides EVERY prompt — prompt_text nil AND a zero-overlap prompt render the SAME deterministic bytes" do
+    store = standing_store("memory:e1", "the standing fact")
+    set = Agent.get(store, & &1)
+
+    # the anti-placebo: a prompt engineered for ZERO digest overlap with the
+    # standing entities — the block takes NO prompt_text input (AC1 by
+    # construction)
+    plain = Prompt.assemble(set, "session:s1", [], 8, nil, {nil, author()})
+    placebo = Prompt.assemble(set, "session:s1", [], 8, "entirely unrelated question", {nil, author()})
+
+    standing = %{"role" => "system", "content" => "Standing:\n- memory:e1: the standing fact"}
+    assert standing in plain
+    assert standing in placebo
+  end
+
+  test "T14h AC1: the block's slot — system -> identity -> always-on -> memory_notes (the pinned bracket order)" do
+    store = identity_store("soul body", "user body")
+
+    {:ok, mem} = Events.memory_entity(@agent_seed, @ts + 10, "memory:e1", "the standing fact", [])
+    mem_delta = put_wire(store, Wire.envelope(mem))
+
+    {:ok, flag} = Events.standing_flag(@agent_seed, @ts + 11, "memory:e1")
+    put_wire(store, Wire.envelope(flag))
+
+    {:ok, epoch} = Events.memory_policy(@operator_seed, @ts + 12, ["memory:e1", "memory:n2"])
+    put_wire(store, Wire.envelope(epoch))
+
+    # a SECOND entity, NOT standing — its memory note rides the gather AFTER
+    # the always-on block (standing wins the dedup for the flagged entity)
+    {:ok, mem2} = Events.memory_entity(@agent_seed, @ts + 13, "memory:n2", "a plain note", [])
+    n2_delta = put_wire(store, Wire.envelope(mem2))
+
+    set = Agent.get(store, & &1)
+    messages = Prompt.assemble(set, "session:s1", [mem_delta.id, n2_delta.id], 8, nil, {nil, author()})
+
+    assert Enum.map(messages, & &1["content"]) == [
+             Prompt.system_prompt(),
+             "Soul: soul body",
+             "User: user body",
+             "Standing:\n- memory:e1: the standing fact",
+             "Memory: a plain note"
+           ]
+  end
+
+  test "T14h AC1: a standing supersede changes the block's bytes — the render is store-derived, never hardcoded" do
+    store = standing_store("memory:e1", "original fact")
+    set = Agent.get(store, & &1)
+    before = Prompt.assemble(set, "session:s1", [], 8, nil, {nil, author()})
+    assert Enum.any?(before, &(&1["content"] == "Standing:\n- memory:e1: original fact"))
+
+    # the canon supersedes (MemoryEdited): the standing block re-derives the
+    # NEW canon content
+    {:ok, mem} = Events.memory_entity(@agent_seed, @ts, "memory:e1", "original fact", [])
+    {:ok, edited} = Events.memory_edited(@agent_seed, @ts + 20, mem_id(mem), "superseded fact")
+    put_wire(store, Wire.envelope(edited))
+
+    set = Agent.get(store, & &1)
+    after_messages = Prompt.assemble(set, "session:s1", [], 8, nil, {nil, author()})
+    assert Enum.any?(after_messages, &(&1["content"] == "Standing:\n- memory:e1: superseded fact"))
+  end
+
+  defp mem_id({claims, _sig}), do: Delta.id_hex(claims)
+
+  test "T14h AC3 (fold door): a channel profile's standing section excludes broader memory — sequential boots, leakage ABSENT" do
+    store = start_store()
+
+    # two flagged + broadly-allowed entities
+    {:ok, mem1} = Events.memory_entity(@agent_seed, @ts, "memory:pub", "public fact", [])
+    put_wire(store, Wire.envelope(mem1))
+    {:ok, mem2} = Events.memory_entity(@agent_seed, @ts + 1, "memory:priv", "broader-memory fact", [])
+    put_wire(store, Wire.envelope(mem2))
+    {:ok, f1} = Events.standing_flag(@agent_seed, @ts + 2, "memory:pub")
+    put_wire(store, Wire.envelope(f1))
+    {:ok, f2} = Events.standing_flag(@agent_seed, @ts + 3, "memory:priv")
+    put_wire(store, Wire.envelope(f2))
+    {:ok, epoch} = Events.memory_policy(@operator_seed, @ts + 4, ["memory:pub", "memory:priv"])
+    put_wire(store, Wire.envelope(epoch))
+
+    # the channel profile names NO family: its governing epoch is the derived
+    # fail-closed default "memory:profile/channel:discord" (empty-until-seeded)
+    {:ok, profile} = Events.profile_set(@operator_seed, @ts + 5, "channel:discord", "rules", [], [], [])
+    put_wire(store, Wire.envelope(profile))
+
+    set = Agent.get(store, & &1)
+
+    # boot A (profile-less): the broad memory epoch governs — both ride
+    profile_less = Prompt.assemble(set, "session:s1", [], 8, nil, {nil, author()})
+    assert Enum.any?(profile_less, &(&1["content"] == "Standing:\n- memory:pub: public fact\n- memory:priv: broader-memory fact"))
+
+    # boot B (channel profile): the union over the profile's families
+    # governs NOTHING (no family named) — broader memory is excluded from
+    # the standing section (born fail-closed, H6)
+    channel = Prompt.assemble(set, "session:s1", [], 8, nil, {"channel:discord", author()})
+    refute Enum.any?(channel, &(&1["content"] =~ "Standing:"))
+  end
+
+  test "T14h AC3 (digest door): the trajectory is session-scoped at mint AND read — a channel profile's block shows ONLY its session's stream" do
+    store = start_store()
+
+    # session A's stream (the channel's own session)
+    {:ok, rec_a} = Kyber.Events.message_received(String.duplicate("a1", 32), @ts, "msg:a", "chan-1", "session:a", "channel question")
+    put_wire(store, Wire.envelope(rec_a))
+    {:ok, req_a} = Events.inference_requested(@agent_seed, @ts + 1, "m", "session:a", "conv", "pr", [])
+    req_a_id = Delta.id_hex(elem(req_a, 0))
+    put_wire(store, Wire.envelope(req_a))
+    {:ok, resp_a} = Events.response_delta(@agent_seed, @ts + 2, req_a_id, 0.0, "channel answer", [])
+    put_wire(store, Wire.envelope(resp_a))
+
+    # session B's stream (the broader memory's session — must never ride)
+    {:ok, rec_b} = Kyber.Events.message_received(String.duplicate("a1", 32), @ts + 10, "msg:b", "chan-1", "session:b", "other session secret")
+    put_wire(store, Wire.envelope(rec_b))
+    {:ok, req_b} = Events.inference_requested(@agent_seed, @ts + 11, "m", "session:b", "conv", "pr", [])
+    req_b_id = Delta.id_hex(elem(req_b, 0))
+    put_wire(store, Wire.envelope(req_b))
+    {:ok, resp_b} = Events.response_delta(@agent_seed, @ts + 12, req_b_id, 0.0, "other answer", [])
+    put_wire(store, Wire.envelope(resp_b))
+
+    # mint the digest for session A through the REAL path
+    set = Agent.get(store, & &1)
+    :ok = Kyber.Agent.Digest.mint(@agent_seed, fn w -> put_wire(store, w) end, set, "session:a", @ts + 1)
+
+    set = Agent.get(store, & &1)
+
+    # a channel-profile boot over the SAME store: the trajectory section
+    # shows session A's asked line ONLY — session B never rides
+    messages = Prompt.assemble(set, "session:a", [], 8, nil, {"channel:discord", author()})
+    trajectory = Enum.find(Enum.map(messages, & &1["content"]), &String.starts_with?(&1, "Trajectory:"))
+
+    assert trajectory =~ "channel question"
+    refute trajectory =~ "other session secret"
+    refute trajectory =~ "other answer"
+  end
+
+  test "T14h AC4: the THIRD budget is disjoint from the identity block's 8192 — a near-cap identity block and a full standing section both render" do
+    store = start_store()
+
+    # identity: a soul doc near the 8192 identity cap
+    big_soul = String.duplicate("s", 8_000)
+    {:ok, soul} = Events.identity_set(@operator_seed, @ts, "identity:soul", "soul", big_soul)
+    put_wire(store, Wire.envelope(soul))
+
+    # standing: a flagged + allowed entity whose section is near the 4096 cap
+    {:ok, mem} = Events.memory_entity(@agent_seed, @ts + 1, "memory:e1", String.duplicate("f", 4_000), [])
+    put_wire(store, Wire.envelope(mem))
+    {:ok, flag} = Events.standing_flag(@agent_seed, @ts + 2, "memory:e1")
+    put_wire(store, Wire.envelope(flag))
+    {:ok, epoch} = Events.memory_policy(@operator_seed, @ts + 3, ["memory:e1"])
+    put_wire(store, Wire.envelope(epoch))
+
+    set = Agent.get(store, & &1)
+    messages = Prompt.assemble(set, "session:s1", [], 8, nil, {nil, author()})
+    contents = Enum.map(messages, & &1["content"])
+
+    # the identity block's 8192 never pools with the standing block's 4096:
+    # the soul note (8000+ bytes, within ITS budget) rides AND the standing
+    # section (within ITS budget) rides — two disjoint budgets
+    assert Enum.any?(contents, &(&1 == "Soul: " <> big_soul))
+    assert Enum.any?(contents, &(&1 == "Standing:\n- memory:e1: " <> String.duplicate("f", 4_000)))
+  end
+
+  test "T14h M7: a standing line DROPPED by the 4096 skip-whole still gets its memory note — the dedup reads POST-CAP rendered" do
+    store = start_store()
+
+    # an entity whose standing line alone would blow the block budget
+    {:ok, mem} = Events.memory_entity(@agent_seed, @ts, "memory:huge", String.duplicate("x", 5_000), [])
+    huge_delta = put_wire(store, Wire.envelope(mem))
+    {:ok, flag} = Events.standing_flag(@agent_seed, @ts + 1, "memory:huge")
+    put_wire(store, Wire.envelope(flag))
+    {:ok, epoch} = Events.memory_policy(@operator_seed, @ts + 2, ["memory:huge"])
+    put_wire(store, Wire.envelope(epoch))
+
+    set = Agent.get(store, & &1)
+    messages = Prompt.assemble(set, "session:s1", [huge_delta.id], 8, nil, {nil, author()})
+    contents = Enum.map(messages, & &1["content"])
+
+    # NO standing line (skip-whole dropped it)…
+    refute Enum.any?(contents, &String.starts_with?(&1, "Standing:"))
+    # …and the entity NEVER vanishes: its memory note still rides (the
+    # gather_ids dedup reads the POST-CAP rendered set — M7)
+    assert Enum.any?(contents, &(&1 == "Memory: " <> String.duplicate("x", 5_000)))
   end
 end

@@ -24,7 +24,8 @@ defmodule Kyber.Agent.Engine do
   use GenServer
 
   alias Kyber.{DurableStore, Schema, Wire}
-  alias Kyber.Agent.{ContextBuilder, Events, LlmHandler, Prompt, ToolExecutor}
+  alias Rhizomatic.Delta
+  alias Kyber.Agent.{ContextBuilder, Digest, Events, LlmHandler, Prompt, ToolExecutor}
 
   @default_window 8
 
@@ -200,7 +201,7 @@ defmodule Kyber.Agent.Engine do
       notify(state, {:skipped, request_id})
       %{state | skipped: state.skipped + 1}
     else
-      case replayed_prompt(set, request_id, elem(state.boot, 0)) do
+      case replayed_prompt(set, request_id, typed.timestamp, state) do
         {:ok, messages} ->
           complete(turn(request_id, typed, messages), set, state)
 
@@ -224,17 +225,28 @@ defmodule Kyber.Agent.Engine do
           # never wall-clock (AC5)
           ts = typed.timestamp
 
-          # T14g (N2/H4): the mint site rides the profile key — profile-less
-          # boots mint BYTE-IDENTICAL unkeyed claims (prompt_assembled/6
-          # emits no pointer for nil); keyed-vs-unkeyed is a MISS at the
-          # replay check, never a cross-serve.
+          # T14g (N2/H4) + T14h (N5/H3): the mint site rides the profile
+          # key — profile-less boots mint BYTE-IDENTICAL unkeyed claims
+          # (prompt_assembled/7 emits no pointer for nil); keyed-vs-unkeyed
+          # is a MISS at the replay check, never a cross-serve. Under a
+          # profile the key-material delta (the sorted {family, epoch-id}
+          # roster + the ProfileSet head id) rides FIRST and the PA points
+          # at its content id (match-or-rederive; the digest id is NEVER
+          # the key).
+          km = key_material(set, ts, state)
+
+          if km do
+            state.sink.(Wire.envelope(km.signed))
+          end
+
           case Events.prompt_assembled(
                  state.llm.seed,
                  ts,
                  request_id,
                  session_id(typed),
                  canonical,
-                 elem(state.boot, 0)
+                 elem(state.boot, 0),
+                 km && km.id
                ) do
             {:ok, signed} ->
               wire = Wire.envelope(signed)
@@ -267,6 +279,10 @@ defmodule Kyber.Agent.Engine do
 
     %{
       request_id: request_id,
+      # T14h (H7): the digest mint's trigger ts — the request's
+      # claims.timestamp, threaded from the dispatch (deterministic whether
+      # or not the request delta rides the store)
+      request_ts: typed.timestamp,
       prompt_id: prompt_id,
       session_id: session_id,
       memory_ids: memory_ids(typed),
@@ -289,15 +305,24 @@ defmodule Kyber.Agent.Engine do
   # boots); keyed-vs-unkeyed is a MISS BOTH ways (a legacy unkeyed claim
   # never serves a profiled boot, a keyed claim never serves a profile-less
   # boot). Exactly-one is per (request, profile).
-  defp replayed_prompt(set, request_id, profile) do
+  defp replayed_prompt(set, request_id, trigger_ts, state) do
     retracted = retracted_ids(set)
+
+    # T14h (N2/H3): the expected key-material id, re-derived from the
+    # CURRENT set + boot — nil for profile-less boots; a rotated roster
+    # (or a moved ProfileSet head) re-derives a DIFFERENT id and MISSES
+    # (match-or-rederive — the rotation door closes; stored-claim-wins
+    # stands only where the key matches). The material's ts is the
+    # DISPATCHED request's claims.timestamp (the same ts the mint used) —
+    # deterministic whether or not the request delta rides the store.
+    km_id = key_material_id(set, trigger_ts, state)
 
     case Enum.find(set, fn {id, {claims, _sig}} ->
            not MapSet.member?(retracted, id) and
              kind(claims) == "sessionId" and
              match?(%{type: "PromptAssembled"}, Schema.resolve(claims)) and
              match?({:delta, ^request_id, _ctx}, pointer(claims, "requestRef")) and
-             profile_key_matches?(claims, profile)
+             profile_key_matches?(claims, state.boot, km_id)
          end) do
       {_id, {claims, _sig}} ->
         case pointer(claims, "content") do
@@ -316,13 +341,65 @@ defmodule Kyber.Agent.Engine do
     end
   end
 
-  # the N2 key matrix: keyed==keyed on the same name matches; keyed vs
-  # unkeyed is a MISS in both directions; both unkeyed matches.
-  defp profile_key_matches?(claims, boot_profile) do
+  # the N2/H3 key matrix: keyed==keyed on the same name matches; keyed vs
+  # unkeyed is a MISS in both directions; both unkeyed matches. Under a
+  # profiled boot the (profile, sorted {family, epoch-id} roster + ProfileSet
+  # head id) material door is CLOSED: the stored claim must carry the EXACT
+  # current key-material id (a legacy profile-keyed claim without the
+  # material is a MISS — the roster cannot be verified — and the digest id
+  # is NEVER the key).
+  defp profile_key_matches?(claims, {boot_profile, _operator_author}, km_id) do
     case pointer(claims, "profile") do
-      {:string, ^boot_profile} -> true
+      {:string, ^boot_profile} -> km_matches?(claims, km_id)
       nil -> boot_profile == nil
       _other -> false
+    end
+  end
+
+  defp km_matches?(_claims, nil), do: false
+
+  defp km_matches?(claims, km_id) do
+    match?({:delta, ^km_id, _ctx}, pointer(claims, "replayKey"))
+  end
+
+  # T14h (N2/H3): the signed key-material delta + its content id under a
+  # profile — nil for profile-less boots and on construction failure (the
+  # material is best-effort: a failed build keys nothing; the PA mint's own
+  # raise (C1) is untouched). Deterministic at mint AND replay (same
+  # material + same trigger ts + same seed => same id).
+  defp key_material(set, ts, state) do
+    case Prompt.replay_key(set, state.boot) do
+      nil ->
+        nil
+
+      material ->
+        case Events.epoch_key_material(
+               state.llm.seed,
+               ts,
+               material.profile,
+               material.roster,
+               material.head
+             ) do
+          {:ok, signed} ->
+            %{id: Delta.id_hex(elem(signed, 0)), signed: signed}
+
+          _error ->
+            nil
+        end
+    end
+  end
+
+  defp key_material_id(set, ts, state) do
+    case key_material(set, ts, state) do
+      %{id: id} -> id
+      nil -> nil
+    end
+  end
+
+  defp request_ts(set, request_id) do
+    case Map.get(set, request_id) do
+      {claims, _sig} -> claims.timestamp
+      nil -> nil
     end
   end
 
@@ -364,6 +441,18 @@ defmodule Kyber.Agent.Engine do
     response_wire = Wire.envelope(signed)
     state.sink.(response_wire)
     deliver(turn, response_wire["id"], content, set, ts, state)
+
+    # T14h (H7): the digest mint — a ZERO-CHARGE side emission (no
+    # Budget.charge, no turn attribution, no GateDecision), deriving over
+    # the dispatch-entry `set` (H1 — PRE-EMISSION: the just-emitted
+    # ResponseDelta's wall-clock ts is NOT in it; a mint-time re-read would
+    # break AC5). trigger ts = the answered request's claims.timestamp,
+    # never wall-clock. Construction errors SWALLOW inside Digest.mint (M9).
+    # The mint rides BEFORE the completion signal: {:answered} means the
+    # whole answer — side emissions included — has landed (the reactor's
+    # lifecycle and the tests' no-sleep choreography both key on it).
+    mint_digest(set, turn, state)
+
     notify(state, {:answered, turn.request_id})
 
     state = %{
@@ -373,6 +462,19 @@ defmodule Kyber.Agent.Engine do
     }
 
     maybe_summarize(turn, set, ts, state)
+  end
+
+  # T14h (H7): trigger-ts mints, session-scoped at mint AND read; the
+  # change-guard + empty-derivation no-mint + the swallowing arm all live
+  # in Digest.mint — the engine never raises on a digest.
+  defp mint_digest(set, turn, state) do
+    trigger_ts = turn.request_ts || request_ts(set, turn.request_id)
+
+    if is_number(trigger_ts) do
+      Digest.mint(state.llm.seed, state.sink, set, turn.session_id, trigger_ts)
+    end
+
+    :ok
   end
 
   # the delivery leg: message.sent via the prompt's channel — a prompt with
@@ -545,6 +647,9 @@ defmodule Kyber.Agent.Engine do
       %{
         turn: %{
           request_id: request_id,
+          # T14h (H7): the digest mint's trigger ts (the rebuild path reads
+          # the request from the store — same deterministic value)
+          request_ts: request_claims.timestamp,
           prompt_id: prompt_id,
           session_id: session_id,
           memory_ids: memory_ids,
@@ -566,44 +671,19 @@ defmodule Kyber.Agent.Engine do
     end
   end
 
-  # where did this request's chain stop? (resume/1's classification)
-  defp chain_position(set, request_id) do
-    calls =
-      for {id, {claims, _sig}} <- set,
-          kind(claims) == "tool",
-          match?(
-            %{type: "ToolCall", requestRef: {:delta, ^request_id, _}},
-            Schema.resolve(claims)
-          ),
-          do: {id, claims}
-
-    case Enum.sort_by(calls, fn {_id, claims} -> claims.timestamp end) |> List.last() do
-      nil ->
-        :top
-
-      {call_id, _claims} ->
-        set
-        |> Enum.find(fn {_id, {claims, _sig}} ->
-          kind(claims) == "call" and
-            match?(%{type: "ToolResult", call: {:delta, ^call_id, _}}, Schema.resolve(claims))
-        end)
-        |> case do
-          {id, {claims, _sig}} -> {:tool_result, %{id: id, claims: claims}}
-          nil -> :tool_waiting
-        end
-    end
-  end
+  # where did this request's chain stop? (resume/1's classification — the
+  # SHARED ContextBuilder.chain_position/2, T14h M2)
+  defp chain_position(set, request_id), do: ContextBuilder.chain_position(set, request_id)
 
   # ----------------------------------------------------------- rehydration
 
   # -------------------------------------------------------------- machinery
 
-  defp answered?(set, request_id) do
-    Enum.any?(set, fn {_id, {claims, _sig}} ->
-      kind(claims) == "requestRef" and
-        match?({:delta, ^request_id, _ctx}, pointer(claims, "requestRef"))
-    end)
-  end
+  # T14h (M2): the answered oracle + chain-position classification are the
+  # SHARED ContextBuilder helpers (ONE implementation, never a re-
+  # implementation — a requestRef-anywhere match would go dark exactly in
+  # the crash window the open-threads fold exists to surface)
+  defp answered?(set, request_id), do: ContextBuilder.answered?(set, request_id)
 
   # spine-8 checkpoint (folded from B): once a session's conversation exceeds
   # twice the window, emit ONE deterministic ConversationSummary covering the

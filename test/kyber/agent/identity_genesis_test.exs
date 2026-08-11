@@ -209,10 +209,11 @@ defmodule Kyber.Agent.IdentityGenesisTest do
            {@operator_seed, @ts, "identity:soul", "soul", "body", id64("99")}},
           {&Events.profile_set/7, "ProfileSet",
            {@operator_seed, @ts, "channel:discord", "rules", ["identity:soul"], ["tool:echo"], ["memory"]}},
-          # N2: the /6 builder with the profile key — profile-less /5 stays
-          # byte-identical (no profile pointer)
-          {&Events.prompt_assembled/6, "PromptAssembled",
-           {@agent_seed, @ts, "req-1", "session:s1", "{}", "channel:discord"}}
+          # N2 + T14h (N5): the /7 builder with the profile key + the key-
+          # material pointer — profile-less mints stay byte-identical (no
+          # profile pointer, no replayKey pointer)
+          {&Events.prompt_assembled/7, "PromptAssembled",
+           {@agent_seed, @ts, "req-1", "session:s1", "{}", "channel:discord", id64("77")}}
         ] do
       {:ok, {claims, _sig}} = apply(emitter, Tuple.to_list(args))
 
@@ -262,6 +263,8 @@ defmodule Kyber.Agent.IdentityGenesisTest do
     assert_receive {:llm_request, _body}, 2_000
     sink_typed("ResponseDelta")
     sink_typed("MessageSent")
+    # T14h: the answer path's zero-charge StandingDigest emission
+    sink_typed("StandingDigest")
 
     # a re-boot under the SAME profile reuses the stored claim: the crash-
     # window re-fire (the SAME InferenceRequested re-routed) is a counted
@@ -337,8 +340,14 @@ defmodule Kyber.Agent.IdentityGenesisTest do
     store1 = start_store()
     stored = Prompt.canonical([%{"role" => "system", "content" => "stored system"}, %{"role" => "user", "content" => "hi"}])
 
+    # T14h (N2/H3): the stored claim carries the FULL material key — the
+    # (profile, sorted {family, epoch-id} roster + ProfileSet head id)
+    # replay key, never a bare profile name
+    set1 = Agent.get(store1, & &1)
+    km_id1 = replay_key_id(set1, {"channel:discord", "author"}, @agent_seed, @ts)
+
     {:ok, {pa1_claims, pa1_sig}} =
-      Events.prompt_assembled(@agent_seed, @ts, "req-cw1", "session:s1", stored, "channel:discord")
+      Events.prompt_assembled(@agent_seed, @ts, "req-cw1", "session:s1", stored, "channel:discord", km_id1)
 
     put_wire(store1, Wire.envelope({pa1_claims, pa1_sig}))
     prompt1 = ingest_received(store1, @ts, "msg-1", "hi")
@@ -349,11 +358,18 @@ defmodule Kyber.Agent.IdentityGenesisTest do
     assert_receive {:llm_request, body1}, 2_000
 
     # the model saw the STORED canonical bytes — replayed, never re-minted
-    # (no fresh PromptAssembled: the replay path emits nothing)
+    # (no fresh PromptAssembled: the replay path emits nothing — exactly
+    # one PA in the store; the digest the answer path mints is NOT a PA)
     assert body1["messages"] == Prompt.decode(stored) |> elem(1)
-    refute_receive {:sink, %{"claims" => %{"pointers" => [%{"role" => "sessionId"} | _]}}}, 100
     sink_typed("ResponseDelta")
     sink_typed("MessageSent")
+    # T14h: the answer path's zero-charge StandingDigest emission
+    sink_typed("StandingDigest")
+    set1 = Agent.get(store1, & &1)
+    assert [_one_pa] =
+             Enum.filter(set1, fn {_id, {c, _s}} ->
+               match?(%{type: "PromptAssembled"}, Schema.resolve(c))
+             end)
 
     # ---- scenario 2: a DIFFERENT profile — key MISS, re-derive + fresh
     # mint keyed under the NEW profile (the A->B leak is closed)
@@ -377,6 +393,14 @@ defmodule Kyber.Agent.IdentityGenesisTest do
     assert Enum.any?(pa2_delta.claims.pointers, &(&1 == %{role: "profile", target: {:string, "other:profile"}}))
     sink_typed("ResponseDelta")
     sink_typed("MessageSent")
+  end
+
+  # T14h (N2/H3): the expected key-material id for the stored-claim fixtures —
+  # the same derivation the engine's replay pre-check uses
+  defp replay_key_id(set, boot, seed, ts) do
+    %{profile: profile, roster: roster, head: head} = Prompt.replay_key(set, boot)
+    {:ok, {km_claims, _sig}} = Events.epoch_key_material(seed, ts, profile, roster, head)
+    Rhizomatic.Delta.id_hex(km_claims)
   end
 
   # the raw-admission door: an InferenceRequested with a PINNED id, so the

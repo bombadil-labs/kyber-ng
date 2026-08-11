@@ -304,13 +304,20 @@ defmodule Kyber.Agent.Events do
   JSON of the message list (`Kyber.Agent.Prompt.canonical/1`) — exactly
   what `LlmHandler.chat/3` receives. `ts` is the triggering
   `InferenceRequested` delta's `claims.timestamp`, never wall-clock; ONE
-  claim per (assembled prompt, profile).
+  claim per (assembled prompt, profile, roster).
 
   T14g (N2/H4): the claim is PROFILE-KEYED — the optional `profile` string
   role rides ONLY under a profile (profile-less mints stay BYTE-IDENTICAL:
   `profile == nil` emits no pointer); keyed-vs-unkeyed is a MISS at the
   replay check, never a cross-serve (a legacy unkeyed claim never serves a
   profiled boot and vice versa).
+
+  T14h (N5/H3): the key EXTENDS to the (profile, sorted {family, epoch-id}
+  roster + ProfileSet head id) material — the optional `replayKey` delta
+  role points at the `EpochKeyMaterial` delta's content id (the /7 arity),
+  emitted ONLY under a profile; profile-less mints stay BYTE-IDENTICAL
+  (`profile == nil` and `replay_key == nil` emit no pointers). The digest
+  id is NEVER the key.
   """
   @spec prompt_assembled(
           String.t(),
@@ -318,14 +325,74 @@ defmodule Kyber.Agent.Events do
           String.t(),
           String.t(),
           String.t(),
+          String.t() | nil,
           String.t() | nil
         ) :: {:ok, signed()} | {:error, term()}
-  def prompt_assembled(seed, ts, request_id, session_id, content, profile \\ nil) do
+  def prompt_assembled(seed, ts, request_id, session_id, content, profile \\ nil, replay_key \\ nil) do
     build(seed, ts, "PromptAssembled", [
       %{role: "sessionId", target: {:entity, session_id, "prompts"}},
       %{role: "requestRef", target: {:delta, request_id, "prompted"}},
       %{role: "content", target: {:string, content}},
-      if(profile, do: [%{role: "profile", target: {:string, profile}}], else: [])
+      if(profile, do: [%{role: "profile", target: {:string, profile}}], else: []),
+      if(replay_key, do: [%{role: "replayKey", target: {:delta, replay_key, "keyed"}}], else: [])
+    ])
+  end
+
+  @doc """
+  `StandingDigest` — the trajectory view (T14h H5/N5): a per-answer mint
+  over the session's covered delta set ({MessageReceived, ResponseDelta,
+  ToolCall, ToolResult, GateDecision}, liveness-filtered, session-scoped),
+  whole-set supersede by `{ts, id}` (NO `supersedes` pointer — the T14g G2
+  norm; two live same-session heads resolve latest-wins, never a fork
+  error). `sessionId` FIRST (routes to no subscription, matches no lens —
+  the minter never observes its own output); `content` is the POST-CAP
+  rendered trajectory (N=16 items newest-first, 2048-byte contiguous stop);
+  `covers` = EXACTLY the rendered lines' deltas (M8). `ts` is the
+  triggering `InferenceRequested` delta's `claims.timestamp`, never
+  wall-clock (H2) — a crash-window re-fire re-mints the same content + same
+  ts => same content id => merge-is-union collapses to one digest.
+  """
+  @spec standing_digest(String.t(), number(), String.t(), String.t(), [String.t()]) ::
+          {:ok, signed()} | {:error, term()}
+  def standing_digest(seed, ts, session_id, content, covers) do
+    build(seed, ts, "StandingDigest", [
+      %{role: "sessionId", target: {:entity, session_id, "digests"}},
+      %{role: "content", target: {:string, content}},
+      Enum.map(covers, &%{role: "covers", target: {:delta, &1, "covered"}})
+    ])
+  end
+
+  @doc """
+  `StandingFlag` — the standing salience marker (T14h H4): flags a memory
+  entity as standing (the always-on fold's input). The `"standing"` kind
+  marker routes to no subscription. Unflag = negate the flag
+  (retraction-is-negation), never identity surgery; re-flag after removal
+  rides with no special case. Whitespace-only entity ids are FOLD-INERT.
+  """
+  @spec standing_flag(String.t(), number(), String.t()) :: {:ok, signed()} | {:error, term()}
+  def standing_flag(seed, ts, entity_id) do
+    build(seed, ts, "StandingFlag", [
+      %{role: "standing", target: {:entity, entity_id, "standing"}}
+    ])
+  end
+
+  @doc """
+  `EpochKeyMaterial` — the replay key's material (T14h N2/H3): the delta
+  carrying the profile's SORTED `{family, epoch-id}` roster (canonical JSON
+  of the pairs over the profile's NAMED families, resolved via
+  `Policy.current/2` — never the union epoch's nil id) + the ProfileSet
+  head id (the declaration's own head — the T14g latest-wins fold). The
+  content-derived id IS the key's material form: match-or-rederive
+  compares ids, and the digest id is NEVER the key. Emitted ONLY under a
+  profile (profile-less mints stay byte-identical — T14g M4).
+  """
+  @spec epoch_key_material(String.t(), number(), String.t(), String.t(), String.t() | nil) ::
+          {:ok, signed()} | {:error, term()}
+  def epoch_key_material(seed, ts, profile, roster_json, head) do
+    build(seed, ts, "EpochKeyMaterial", [
+      %{role: "profile", target: {:string, profile}},
+      %{role: "roster", target: {:string, roster_json}},
+      if(head, do: [%{role: "head", target: {:delta, head, "declared"}}], else: [])
     ])
   end
 
