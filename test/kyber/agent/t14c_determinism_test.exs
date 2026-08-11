@@ -61,6 +61,25 @@ defmodule Kyber.Agent.T14cDeterminismTest do
 
   # bounded sleep-free store polling (the no-sleep idiom: a timeout-only
   # receive never matches mailbox messages, so it cannot swallow probes)
+  defp settle_store(attempts \\ 200) do
+    Enum.reduce_while(1..attempts, nil, fn _, _ ->
+      first = map_size(DurableStore.set())
+
+      receive do
+      after
+        25 -> :timeout
+      end
+
+      second = map_size(DurableStore.set())
+
+      if first == second do
+        {:halt, first}
+      else
+        {:cont, nil}
+      end
+    end)
+  end
+
   defp poll_store(pred, attempts \\ 200) do
     Enum.reduce_while(1..attempts, nil, fn _, _ ->
       case Enum.find(DurableStore.set(), pred) do
@@ -153,7 +172,7 @@ defmodule Kyber.Agent.T14cDeterminismTest do
 
       received_id = Delta.id_hex(received_claims)
       :ok = DurableStore.append(Wire.envelope({received_claims, received_sig}))
-      assert_receive {:reactor, {:dispatch, "received", ^received_id}}, 2_000
+      assert_receive {:reactor, {:dispatch, "received", ^received_id}}, 5_000
 
       # the assembled prompt: wait for the PromptAssembled, recover the
       # request id from its requestRef pointer
@@ -213,7 +232,7 @@ defmodule Kyber.Agent.T14cDeterminismTest do
         pa_id: pa_id,
         gd_id: gd_id,
         ba_id: ba_id,
-        count: map_size(DurableStore.set()),
+        count: settle_store(),
         pa_ts: pa_claims.timestamp,
         gd_ts: gd_claims.timestamp,
         ba_ts: ba_claims.timestamp

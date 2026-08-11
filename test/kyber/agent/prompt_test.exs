@@ -250,6 +250,8 @@ defmodule Kyber.Agent.PromptTest do
     sink_typed("PromptAssembled")
     sink_typed("ResponseDelta")
     sink_typed("MessageSent")
+    # T14h: the answer path's zero-charge StandingDigest emission
+    sink_typed("StandingDigest")
     assert_receive {:llm_request, _body}
 
     size_before = map_size(Agent.get(store, & &1))
@@ -331,7 +333,18 @@ defmodule Kyber.Agent.PromptTest do
   # the store state at-or-below a timestamp — re-derivation reads the
   # state the claim was assembled from, never the deltas above it
   defp below(set, ts) do
-    Enum.filter(set, fn {_id, {claims, _sig}} -> claims.timestamp <= ts end)
+    # T14h: the digest family is minted AFTER the PromptAssembled (the
+    # answer path's zero-charge side emission) — the as-of-mint set excludes
+    # it; the map shape is the DeltaSet contract
+    set
+    |> Enum.filter(fn {_id, {claims, _sig}} ->
+      claims.timestamp <= ts and
+        not match?(
+          %{type: type} when type in ["StandingDigest", "EpochKeyMaterial"],
+          Schema.resolve(claims)
+        )
+    end)
+    |> Map.new()
   end
 
   defp request_id_of(%{requestRef: {:delta, id, _ctx}}), do: id

@@ -27,24 +27,38 @@ defmodule Kyber.Events do
   @doc """
   `message.received` — a human (or remote) message arrives (spec/01-events.md
   §2.1). Author: the human's key. Pointers: received / at / by / content /
-  session.
+  session, plus T14j (C2) the OPTIONAL `discordUser` STRING pointer
+  (`"discord:user:" <> author_id`; `nil` omits it ENTIRELY — the /7 nil arm
+  is byte-identical to /6, no `%{role: "discordUser", target: nil}`
+  residue). The role is `discordUser`, NEVER `author` (the compiler's
+  merge-over would overwrite the signer). Missing / whitespace-only authors
+  mint nil (fail-closed).
   """
-  @spec message_received(String.t(), number(), String.t(), String.t(), String.t(), String.t()) ::
-          {:ok, signed()} | {:error, term()}
-  def message_received(human_seed_hex, ts, message_id, channel_id, session_id, content) do
+  @spec message_received(
+          String.t(),
+          number(),
+          String.t(),
+          String.t(),
+          String.t(),
+          String.t(),
+          String.t() | nil
+        ) :: {:ok, signed()} | {:error, term()}
+  def message_received(human_seed_hex, ts, message_id, channel_id, session_id, content, discord_user \\ nil) do
     with {:ok, ts} <- timestamp(ts),
          {:ok, author} <- author_for(human_seed_hex) do
       claims = %{
         timestamp: ts,
         author: author,
-        pointers: [
-          %{role: "received", target: {:entity, message_id, "incoming"}},
-          %{role: "at", target: {:entity, channel_id, "messages"}},
-          %{role: "by", target: {:entity, human_entity_id(author), "sent"}},
-          %{role: "content", target: {:string, content}},
-          %{role: "session", target: {:entity, session_id, "messages"}},
-          type("MessageReceived")
-        ]
+        pointers:
+          List.flatten([
+            %{role: "received", target: {:entity, message_id, "incoming"}},
+            %{role: "at", target: {:entity, channel_id, "messages"}},
+            %{role: "by", target: {:entity, human_entity_id(author), "sent"}},
+            %{role: "content", target: {:string, content}},
+            %{role: "session", target: {:entity, session_id, "messages"}},
+            if(discord_user, do: [%{role: "discordUser", target: {:string, discord_user}}], else: []),
+            type("MessageReceived")
+          ])
       }
 
       signed(claims, human_seed_hex)

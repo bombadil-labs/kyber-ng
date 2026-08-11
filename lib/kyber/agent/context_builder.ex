@@ -15,7 +15,7 @@ defmodule Kyber.Agent.ContextBuilder do
   sink by content address (AC3).
   """
 
-  alias Kyber.{DurableStore, Gather, Wire}
+  alias Kyber.{DurableStore, Gather, Schema, Wire}
   alias Kyber.Agent.{Events, MemoryPort}
 
   @model "kimi-k3"
@@ -86,6 +86,64 @@ defmodule Kyber.Agent.ContextBuilder do
   """
   @spec window([map()], non_neg_integer()) :: {[map()], [map()]}
   def window(turns, n \\ 8), do: Enum.split(turns, max(length(turns) - n, 0))
+
+  # -------------------------------------------------- the shared chain helpers
+
+  @doc """
+  The answered oracle (T14h M2 — SHARED with the engine, ONE implementation,
+  never a re-implementation): a request is answered iff a FIRST-ROLE
+  `requestRef` delta targets it — the `ResponseDelta`'s kind marker. The
+  `sessionId`-first `PromptAssembled`'s `requestRef` role is SECOND and can
+  never saturate it (a requestRef-anywhere match would call a
+  PromptAssembled-without-ResponseDelta request "answered" — going dark
+  exactly in the crash window the open-threads fold exists to surface).
+  Retraction-blind by design (engine.ex:198-199) — `answer/4` is the only
+  writer and the store only learns.
+  """
+  @spec answered?(Kyber.DeltaSet.t(), String.t()) :: boolean()
+  def answered?(set, request_id) do
+    Enum.any?(set, fn {_id, {claims, _sig}} ->
+      kind(claims) == "requestRef" and
+        match?({:delta, ^request_id, _ctx}, pointer(claims, "requestRef"))
+    end)
+  end
+
+  @doc """
+  The chain-position classification (T14h M2 — SHARED with the engine, ONE
+  implementation): where did this request's chain stop? `:top` (no ToolCall
+  yet), `{:tool_result, %{id: id, claims: claims}}` (the latest ToolCall has
+  its ToolResult), or `:tool_waiting` (a ToolCall still awaits its result —
+  the resume scan leaves it for the executor; the open-threads fold
+  surfaces it as in-flight work).
+  """
+  @spec chain_position(Kyber.DeltaSet.t(), String.t()) ::
+          :top | {:tool_result, map()} | :tool_waiting
+  def chain_position(set, request_id) do
+    calls =
+      for {id, {claims, _sig}} <- set,
+          kind(claims) == "tool",
+          match?(
+            %{type: "ToolCall", requestRef: {:delta, ^request_id, _}},
+            Schema.resolve(claims)
+          ),
+          do: {id, claims}
+
+    case Enum.sort_by(calls, fn {_id, claims} -> claims.timestamp end) |> List.last() do
+      nil ->
+        :top
+
+      {call_id, _claims} ->
+        set
+        |> Enum.find(fn {_id, {claims, _sig}} ->
+          kind(claims) == "call" and
+            match?(%{type: "ToolResult", call: {:delta, ^call_id, _}}, Schema.resolve(claims))
+        end)
+        |> case do
+          {id, {claims, _sig}} -> {:tool_result, %{id: id, claims: claims}}
+          nil -> :tool_waiting
+        end
+    end
+  end
 
   @doc """
   Normalize a retriever answer to the associative shape (T13): the T11c

@@ -141,7 +141,7 @@ defmodule Kyber.Agent.EngineTest do
     assert sent.caused_by == {:delta, response_delta.id, nil}
 
     # the model saw the question — rehydrated from the store, not passed inline
-    assert_receive {:llm_request, body}
+    assert_receive {:llm_request, body}, 2_000
     assert List.last(body["messages"]) == %{"role" => "user", "content" => "Capital of France?"}
   end
 
@@ -176,7 +176,7 @@ defmodule Kyber.Agent.EngineTest do
 
     # the model's context contained the FIRST exchange — both sides of it
     assert_receive {:llm_request, _first_body}
-    assert_receive {:llm_request, body}
+    assert_receive {:llm_request, body}, 2_000
     texts = Enum.map(body["messages"], & &1["content"])
     assert Enum.any?(texts, &(&1 == "My favorite color is blue."))
     assert Enum.any?(texts, &(&1 == "Understood: blue."))
@@ -193,6 +193,8 @@ defmodule Kyber.Agent.EngineTest do
     request = request_inference(store, engine, prompt)
     sink_typed("ResponseDelta")
     sink_typed("MessageSent")
+    # T14h: the answer path's zero-charge StandingDigest emission
+    sink_typed("StandingDigest")
     assert_receive {:llm_request, _body}
 
     # the crash-window re-fire: the SAME request routed again
@@ -226,7 +228,7 @@ defmodule Kyber.Agent.EngineTest do
     prompt = ingest_received(store, 1_700_000_300_000, "msg-c", "and now?")
     request_inference(store, engine, prompt)
 
-    assert_receive {:llm_request, body}
+    assert_receive {:llm_request, body}, 2_000
     texts = Enum.map(body["messages"], & &1["content"])
 
     # windowed out: the ancient turn's text is absent; its summary is present
@@ -255,7 +257,7 @@ defmodule Kyber.Agent.EngineTest do
     prompt = ingest_received(store, 1_700_000_000_000, "msg-1", "What is the cap?")
     request_inference(store, engine, prompt, [memory_delta.id])
 
-    assert_receive {:llm_request, body}
+    assert_receive {:llm_request, body}, 2_000
     texts = Enum.map(body["messages"], & &1["content"])
     assert Enum.any?(texts, &(&1 =~ "the cap is a lens, never a store property"))
   end

@@ -89,23 +89,100 @@ defmodule Kyber.Schema.Genesis do
     # re-executed
     {"ToolCallDuplicate", requires: [{"dedupes", "delta"}, {"result", "delta"}]},
     # T14c (D1): the prompt-as-delta claim — the assembled prompt the model
-    # SAW, answered as a store delta. EXACTLY three pointers, sessionId
-    # FIRST (the kind-marker grammar: the two requestRef-first readers —
-    # Engine.answered?/2 and the conversation lens — key on the first role)
+    # SAW, answered as a store delta. sessionId FIRST (the kind-marker
+    # grammar: the two requestRef-first readers — Engine.answered?/2 and
+    # the conversation lens — key on the first role)
     {"PromptAssembled",
-     requires: [{"sessionId", "entity"}, {"requestRef", "delta"}, {"content", "string"}]},
+     requires: [{"sessionId", "entity"}, {"requestRef", "delta"}, {"content", "string"}],
+     # T14g (N2/H4): the replay seam is PROFILE-KEYED — the key rides as an
+     # optional `profile` string role, emitted ONLY under a profile
+     # (profile-less mints stay byte-identical); keyed-vs-unkeyed is a MISS,
+     # never a cross-serve (the matrix is closed both ways)
+     # T14h (N5/H3): the replay key EXTENDS to the (profile, sorted
+     # {family, epoch-id} roster + ProfileSet head id) material — the
+     # optional `replayKey` delta role points at the epoch key-material
+     # delta, emitted ONLY under a profile (profile-less mints stay
+     # byte-identical); a claim keyed without the material is a MISS under a
+     # profiled boot (the roster cannot be verified — the rotation door)
+     optional: [{"profile", "string"}, {"replayKey", "delta"}]},
     # T14c (D5): the operator-key boot attestation — the operator's key
     # attests the agent's boot, an explicit store-visible participant
     {"BootAttestation",
      requires: [{"operator", "entity"}, {"agent", "entity"}, {"boot", "delta"}]},
+    # T14j (C3): the summary carries the PROFILE dimension explicitly — the
+    # optional `profile` string role (the T14g profile name) keys the
+    # (session, profile) gather; emitted ONLY under a profile (profile-less
+    # mints stay byte-identical). The summary note rides the profile key the
+    # way the PromptAssembled replay key does.
     {"ConversationSummary",
-     requires: [{"sessionId", "entity"}, {"content", "string"}], many: [{"covers", "delta"}]},
+     requires: [{"sessionId", "entity"}, {"content", "string"}],
+     many: [{"covers", "delta"}],
+     optional: [{"profile", "string"}]},
     {"MemoryEntity",
      requires: [{"entity", "entity"}, {"content", "string"}], many: [{"source", "delta"}]},
     {"MemoryEdited",
      requires: [{"edits", "delta"}, {"content", "string"}], optional: [{"reason", "string"}]},
+    # T14f (H5): the skill aggregate — a skill is a VIEW over its delta
+    # stream, never a blob. The full-set SkillSet carries the whole property
+    # set (name rides as the `skill` entity aggregate key; description/body
+    # ride as strings; metadata is an optional JSON string; source is the
+    # optional provenance pointer to the triggering ToolCall). SkillRetract
+    # is the delta-ID-targeted negation of the order-head set-delta
+    # (retraction-is-negation; liveness is recursive-existential — see
+    # Kyber.Agent.Skill)
+    {"SkillSet",
+     requires: [{"skill", "entity"}, {"description", "string"}, {"body", "string"}],
+     optional: [{"metadata", "string"}, {"source", "delta"}]},
+    {"SkillRetract", requires: [{"skill", "entity"}, {"negates", "delta"}]},
+    # T14g (G2): the identity aggregate — the soul/user/operator primitives
+    # are DERIVED entities (a view over their delta stream, never a blob),
+    # operator-attested (the boot-constant author, R1/H2). The `entity`
+    # pointer (`identity:<id>`) is the binding (one entity per primitive —
+    # the MemoryEntity precedent, role name `entity`, pinned deliberately);
+    # the closed `kind` field (soul/user/operator) is the fold key; `body`
+    # is the rendered text; `source` is the optional provenance pointer.
+    # An unknown kind string or a whitespace-only kind/id is FOLD-INERT
+    # (closed set, reject-never-repair).
+    {"IdentitySet",
+     requires: [{"entity", "entity"}, {"kind", "string"}, {"body", "string"}],
+     optional: [{"source", "delta"}]},
+    # T14g (G2): the profile declaration delta — a profile is a POLICY-
+    # SHAPED BINDING (identity view + epoch-bounded memory/skill visibility
+    # + capability subset), never a storage mechanism. The name rides as
+    # the `profile` entity aggregate key (the ATTACH key, G5); `rules` is
+    # the rendered profile-rules text (the "Profile: <name>\n" block
+    # segment); `rides` are `identity:<id>` ENTITY REFS (the identity view);
+    # `allow_tool` and `families` are strings (capability subset / live
+    # family-name epoch refs). Declarations carry the SAME author filter as
+    # identity primitives (H2c — no agent-declared visibility escalation).
+    {"ProfileSet",
+     requires: [{"profile", "entity"}, {"rules", "string"}],
+     many: [{"rides", "entity"}, {"allow_tool", "string"}, {"families", "string"}]},
+    # T14h (N5): the always-on context family — StandingDigest is the
+    # trajectory view (sessionId FIRST — the kind-marker grammar: routes to
+    # no subscription and matches no lens — the digest-of-digest exclusion;
+    # `covers` = the POST-CAP covered deltas, M8); StandingFlag is the
+    # salience marker (the `standing` kind marker routes to no subscription;
+    # unflag = negate the flag, retraction-is-negation); EpochKeyMaterial is
+    # the replay key's material (the profile's sorted {family, epoch-id}
+    # roster as canonical JSON + the ProfileSet head id — H3)
+    {"StandingDigest",
+     requires: [{"sessionId", "entity"}, {"content", "string"}],
+     many: [{"covers", "delta"}]},
+    {"StandingFlag", requires: [{"standing", "entity"}]},
+    {"EpochKeyMaterial",
+     requires: [{"profile", "string"}, {"roster", "string"}],
+     optional: [{"head", "delta"}]},
 
     # The T10 infra events (spec/01-events.md §2), named into the vocabulary.
+    # T14j (C2): the Discord-user attribution — the OPTIONAL `discordUser`
+    # STRING role (value `"discord:user:" <> author_id`, string-kind BY PIN:
+    # the T14i L2 bare-`discord:` rejection governs ENTITY ids only, never
+    # string roles). The role name is `discordUser` — NEVER `author`, which
+    # the compiler's resolved-pointer merge would silently overwrite the
+    # signer with on every resolved MessageReceived (the merge-over
+    # citation). Attribution is DATA, never a decision surface: the folds
+    # render nothing new.
     {"MessageReceived",
      requires: [
        {"received", "entity"},
@@ -113,7 +190,8 @@ defmodule Kyber.Schema.Genesis do
        {"by", "entity"},
        {"content", "string"},
        {"session", "entity"}
-     ]},
+     ],
+     optional: [{"discordUser", "string"}]},
     {"PromptAnnotated", requires: [{"annotates", "delta"}, {"notes", "string"}]},
     {"LlmResponse",
      requires: [{"responds", "delta"}, {"content", "string"}, {"usage", "entity"}]},

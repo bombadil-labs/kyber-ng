@@ -12,8 +12,8 @@ defmodule Kyber.Agent do
   chain is the state).
   """
 
-  alias Kyber.{Gather, Keys}
-  alias Kyber.Agent.{Action, ContextBuilder, Engine, LlmHandler, MemoryPort, ToolExecutor}
+  alias Kyber.{DurableStore, Gather, Keys}
+  alias Kyber.Agent.{Action, ContextBuilder, Engine, LlmHandler, MemoryPort, Profile, ToolExecutor}
   alias Kyber.Agent.Action.Gate
 
   @doc """
@@ -26,7 +26,13 @@ defmodule Kyber.Agent do
   `:workspace` (the T12 action surface's workspace root), `:gate` (a
   `Kyber.Agent.Action.Gate`, default an empty gate — fail closed),
   `:context` (the action context, default `Action.context/1` on the
-  workspace), `:notify` (pid for engine events). Returns
+  workspace), `:notify` (pid for engine events), `:profile` (T14g G5 — a
+  declared ProfileSet name; an unknown/undeclared name — whitespace-only
+  included (M7) — refuses loudly with `{:error, {:unknown_profile, name}}`;
+  default = the ABSENCE of selection), `:operator_seed` (T14g R1 — the
+  operator's attestation seed; `author_for_seed/1` is derived ONCE from it
+  at boot into the boot context's `operator_author`; the nil-seed leg is
+  FAIL-CLOSED — no operator seed => no identity block, no crash). Returns
   `{:ok, engine_pid, resume_report}`.
   """
   @spec attach(keyword()) :: {:ok, pid(), map()} | {:error, term()}
@@ -34,9 +40,15 @@ defmodule Kyber.Agent do
     keyring_dir = Keyword.fetch!(opts, :keyring_dir)
 
     with {:ok, seed} <- Keys.load_agent_seed(keyring_dir),
-         {:ok, llm} <- llm_handler(opts, seed) do
+         {:ok, llm} <- llm_handler(opts, seed),
+         {:ok, boot} <- Profile.boot_context(opts) do
       memory = Keyword.get(opts, :memory, {MemoryPort.Stub, %{}})
-      tools = Keyword.get(opts, :tools, default_tools(opts))
+      # T14g (G6/L1) + T14i (H8): the profile's capability subset NARROWS
+      # the registry — the ONE shared intersect helper (extracted from this
+      # module's private profile_tools/2) on the SINGLE `tools` var feeding
+      # BOTH the engine specs AND the executor registry; the boot gate is
+      # preserved — a profile can never conjure an allow via Gate.new.
+      tools = opts |> Keyword.get(:tools, default_tools(opts)) |> Profile.intersect_tools(boot)
 
       {:ok, engine} =
         Engine.start_link(
@@ -45,7 +57,8 @@ defmodule Kyber.Agent do
           window: Keyword.get(opts, :window, 8),
           tools: ToolExecutor.tool_specs(tools),
           tool_keys: ToolExecutor.tool_key_map(tools),
-          notify: Keyword.get(opts, :notify)
+          notify: Keyword.get(opts, :notify),
+          boot: boot
         )
 
       {:ok, _ref} =
@@ -65,7 +78,10 @@ defmodule Kyber.Agent do
             seed: seed,
             tools: tools,
             gate: Keyword.get(opts, :gate, Gate.new()),
-            context: Keyword.get(opts, :context, default_context(opts))
+            context: Keyword.get(opts, :context, default_context(opts)),
+            # T14g (M2): the R1 boot context threads into the executor too —
+            # the tool-side policy layers are profile-aware under a profile
+            boot: boot
           )
         )
 
@@ -73,12 +89,26 @@ defmodule Kyber.Agent do
     end
   end
 
-  # a workspace boot opts into the real action registry; without one the
-  # T11b stub tools stay the default (A/B behind the one `:tools` seam)
+  # a workspace boot opts into the real action registry AND the memory +
+  # skill tool surfaces (T14f D9/H4): the ATTACH surface is the only
+  # workspace-aware surface in the repo — a workspace attach boot sees
+  # `memory.read` and the skill tools by default; the stub remains the
+  # no-workspace default (A/B behind the one `:tools` seam). The url/memory
+  # policy layers abstain on skill ids by membership and the registry keys
+  # don't collide (Action.registry() is fs/sh/http), so the merge's blast
+  # radius is clean. Both boot paths still default to `Gate.new()` —
+  # fail-closed on every call (L7).
   defp default_tools(opts) do
     case Keyword.get(opts, :workspace) do
-      nil -> ToolExecutor.stub_tools()
-      _workspace -> Action.registry()
+      nil ->
+        ToolExecutor.stub_tools()
+
+      _workspace ->
+        store_fn = fn -> DurableStore.set() end
+
+        Action.registry()
+        |> Map.merge(ToolExecutor.memory_tools(store_fn))
+        |> Map.merge(ToolExecutor.skill_tools(store_fn))
     end
   end
 
