@@ -41,7 +41,7 @@ defmodule Kyber.Agent.ToolExecutor do
   """
 
   alias Kyber.{Gather, Schema, Wire}
-  alias Kyber.Agent.{Action, Events, Memory, Policy, Skill}
+  alias Kyber.Agent.{Action, Events, Memory, Policy, Profile, Skill}
   alias Kyber.Agent.Action.Gate
 
   @doc "The stub registry: `tool:echo` answers its args."
@@ -173,7 +173,10 @@ defmodule Kyber.Agent.ToolExecutor do
   default an empty gate — fail closed: every call refused), `:context` (the
   boot-resolved action context the real actions require, default `%{}`),
   `:store` (thunk answering the delta set — the answer-from-the-store
-  source; default the durable store when running, empty otherwise).
+  source; default the durable store when running, empty otherwise),
+  `:boot` (T14g R1/M2 — the boot context `{profile | nil, operator_author |
+  nil}`; under a profile the tool-side policy layers source their epochs
+  from the profile's families — the derived fail-closed defaults).
   """
   @spec handler(keyword()) :: Gather.handler()
   def handler(opts) do
@@ -182,17 +185,18 @@ defmodule Kyber.Agent.ToolExecutor do
     gate = Keyword.get(opts, :gate, Gate.new())
     context = Keyword.get(opts, :context, %{})
     store = Keyword.get(opts, :store, &default_store/0)
+    boot = Keyword.get(opts, :boot, {nil, nil})
 
-    fn view -> Enum.flat_map(view, &execute(&1, seed, tools, gate, context, store)) end
+    fn view -> Enum.flat_map(view, &execute(&1, seed, tools, gate, context, store, boot)) end
   end
 
-  defp execute(%{id: call_id, claims: claims}, seed, tools, gate, context, store) do
+  defp execute(%{id: call_id, claims: claims}, seed, tools, gate, context, store, boot) do
     case Schema.resolve(claims) do
       %{type: "ToolCall", tool: {:entity, tool_id, _ctx}, args: args} ->
         set = store.()
 
         {decision_wires, verdict} =
-          decide(set, seed, claims.timestamp, call_id, tool_id, args, gate)
+          decide(set, seed, claims.timestamp, call_id, tool_id, args, gate, boot)
 
         case verdict do
           :allow ->
@@ -211,7 +215,7 @@ defmodule Kyber.Agent.ToolExecutor do
 
   # the store is the state: a persisted decision is re-emitted verbatim
   # (byte-identical), never re-decided
-  defp decide(set, seed, ts, call_id, tool_id, args, gate) do
+  defp decide(set, seed, ts, call_id, tool_id, args, gate, boot) do
     case stored_gate_decision(set, call_id) do
       {wire, verdict} ->
         {[wire], verdict}
@@ -229,7 +233,7 @@ defmodule Kyber.Agent.ToolExecutor do
         # refusal claims the call's single GateDecision slot.
         policy_verdict =
           if decision.verdict == :allow,
-            do: policy_verdict(set, tool_id, args),
+            do: policy_verdict(set, tool_id, args, boot),
             else: :allow
 
         case policy_verdict do
@@ -261,7 +265,7 @@ defmodule Kyber.Agent.ToolExecutor do
   # skill_policy is appended LAST — the precedence chain is
   # regression-frozen and appending is the only order that provably cannot
   # perturb the existing suite (layers are disjoint by tool id).
-  defp policy_verdict(set, tool_id, args) do
+  defp policy_verdict(set, tool_id, args, boot) do
     # url_policy answers the bare {:refuse, reason, epoch_id} (the policy
     # name is pinned HERE); memory_policy and skill_policy answer the full
     # {:refuse, policy, reason, epoch_id} and pass through as-is
@@ -270,12 +274,12 @@ defmodule Kyber.Agent.ToolExecutor do
         {:refuse, "url_policy", reason, epoch_id}
 
       :allow ->
-        case memory_policy(set, tool_id, args) do
+        case memory_policy(set, tool_id, args, boot) do
           {:refuse, _policy, _reason, _epoch_id} = refusal ->
             refusal
 
           :allow ->
-            skill_policy(set, tool_id, args)
+            skill_policy(set, tool_id, args, boot)
         end
     end
   end
@@ -288,7 +292,7 @@ defmodule Kyber.Agent.ToolExecutor do
   # the policy layer abstains (action validation owns it — the
   # fork×undecodable cell is T14d's); zero allow_entity pointers => the
   # check refuses everything.
-  defp memory_policy(set, tool_id, args) do
+  defp memory_policy(set, tool_id, args, {nil, _author}) do
     if tool_id in Policy.memory_gated_tools() do
       case Policy.memory_epoch(set) do
         :none ->
@@ -314,6 +318,39 @@ defmodule Kyber.Agent.ToolExecutor do
     end
   end
 
+  # T14g (M2): under a profile the epoch source is the PROFILE's families
+  # (the derived fail-closed defaults) — the union governs the check; an
+  # unseeded/forked family contributes nothing (omit-all, never fail-open).
+  # The refusal REASON STRINGS are the existing spellings — zero new reason
+  # strings; the union epoch has no single id, so the policy_epoch pointer
+  # rides nil (the optional pointer, omitted at the builder).
+  defp memory_policy(set, tool_id, args, {profile_name, operator_author}) do
+    if tool_id in Policy.memory_gated_tools() do
+      case Profile.resolve(set, operator_author, profile_name) do
+        {:ok, view} ->
+          {:ok, epoch} = Profile.memory_epoch(set, view)
+
+          case extract_entity(args) do
+            :abstain ->
+              :allow
+
+            {:ok, entity_id} ->
+              case Policy.check_memory(epoch, entity_id) do
+                :allow -> :allow
+                {:refuse, reason} -> {:refuse, "memory_policy", reason, nil}
+              end
+          end
+
+        # unreachable at boot (attach refuses unknown profiles); fail-closed
+        # if the fold changed under us
+        :not_found ->
+          {:refuse, "memory_policy", Policy.reason_memory_ungoverned(), nil}
+      end
+    else
+      :allow
+    end
+  end
+
   # the skill_policy layer (T14f D5/M5), mirroring memory_policy clause for
   # clause: ungated tool => :allow; ungoverned store => FAIL-CLOSED refusal;
   # forked epoch => fail closed; undecodable args => the policy layer
@@ -321,7 +358,7 @@ defmodule Kyber.Agent.ToolExecutor do
   # check refuses everything. skill.set AND skill.retract are BOTH gated (a
   # retraction is a write to the same aggregate, N6) and skill.read is
   # gated like memory.read.
-  defp skill_policy(set, tool_id, args) do
+  defp skill_policy(set, tool_id, args, {nil, _author}) do
     if tool_id in Policy.skill_gated_tools() do
       case Policy.skill_epoch(set) do
         :none ->
@@ -341,6 +378,33 @@ defmodule Kyber.Agent.ToolExecutor do
                 {:refuse, reason} -> {:refuse, "skill_policy", reason, epoch.id}
               end
           end
+      end
+    else
+      :allow
+    end
+  end
+
+  # T14g (M2): the profile-aware skill layer — same shape as memory_policy's
+  # profile clause; the epoch source is the profile's families.
+  defp skill_policy(set, tool_id, args, {profile_name, operator_author}) do
+    if tool_id in Policy.skill_gated_tools() do
+      case Profile.resolve(set, operator_author, profile_name) do
+        {:ok, view} ->
+          {:ok, epoch} = Profile.skill_epoch(set, view)
+
+          case extract_skill_name(args) do
+            :abstain ->
+              :allow
+
+            {:ok, name} ->
+              case Policy.check_skill(epoch, name) do
+                :allow -> :allow
+                {:refuse, reason} -> {:refuse, "skill_policy", reason, nil}
+              end
+          end
+
+        :not_found ->
+          {:refuse, "skill_policy", Policy.reason_skill_ungoverned(), nil}
       end
     else
       :allow

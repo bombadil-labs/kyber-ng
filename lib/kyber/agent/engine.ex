@@ -46,7 +46,9 @@ defmodule Kyber.Agent.Engine do
   carry dots, so a real registry wires this map),
   `:store` (thunk answering the delta set, default the durable store),
   `:sink` (wire consumer, default `Kyber.Daemon.emit/1`), `:name` (default
-  `#{inspect(__MODULE__)}`; `nil` for anonymous).
+  `#{inspect(__MODULE__)}`; `nil` for anonymous), `:boot` (T14g R1 — the
+  boot context `{profile | nil, operator_author | nil}`, default `{nil,
+  nil}`: the nil-seed leg is fail-closed — no identity block, no crash).
   """
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
@@ -93,6 +95,12 @@ defmodule Kyber.Agent.Engine do
        window: Keyword.get(opts, :window, @default_window),
        tools: Keyword.get(opts, :tools, ToolExecutor.tool_specs()),
        tool_keys: Keyword.get(opts, :tool_keys),
+       # T14g (R1 — the keystone): one boot context {profile | nil,
+       # operator_author | nil} threaded attach -> start_link -> state ->
+       # BOTH assemble sites + replayed_prompt + resume/1. The nil-seed leg
+       # ({nil, nil}) is FAIL-CLOSED: no operator seed => no identity block,
+       # never a crash.
+       boot: Keyword.get(opts, :boot, {nil, nil}),
        store: Keyword.get(opts, :store, fn -> DurableStore.set() end),
        sink: Keyword.get(opts, :sink, &Kyber.Daemon.emit/1),
        notify: Keyword.get(opts, :notify),
@@ -192,23 +200,41 @@ defmodule Kyber.Agent.Engine do
       notify(state, {:skipped, request_id})
       %{state | skipped: state.skipped + 1}
     else
-      case replayed_prompt(set, request_id) do
+      case replayed_prompt(set, request_id, elem(state.boot, 0)) do
         {:ok, messages} ->
           complete(turn(request_id, typed, messages), set, state)
 
         :none ->
-          messages = Prompt.assemble(set, session_id(typed), memory_ids(typed), state.window)
+          # T14f first-assembly fix (rides R1): the PRIMARY infer path passes
+          # prompt_text — the skill lens fires on first assembly, not just on
+          # rebuild_pending (the pre-fix merged-site miss: :200 never passed
+          # prompt_text and the lens was DARK on first assembly).
+          messages =
+            Prompt.assemble(
+              set,
+              session_id(typed),
+              memory_ids(typed),
+              state.window,
+              Prompt.prompt_text(set, prompt_id(typed)),
+              state.boot
+            )
+
           canonical = Prompt.canonical(messages)
           # D1: ts = the triggering InferenceRequested's claims.timestamp —
           # never wall-clock (AC5)
           ts = typed.timestamp
 
+          # T14g (N2/H4): the mint site rides the profile key — profile-less
+          # boots mint BYTE-IDENTICAL unkeyed claims (prompt_assembled/6
+          # emits no pointer for nil); keyed-vs-unkeyed is a MISS at the
+          # replay check, never a cross-serve.
           case Events.prompt_assembled(
                  state.llm.seed,
                  ts,
                  request_id,
                  session_id(typed),
-                 canonical
+                 canonical,
+                 elem(state.boot, 0)
                ) do
             {:ok, signed} ->
               wire = Wire.envelope(signed)
@@ -250,20 +276,28 @@ defmodule Kyber.Agent.Engine do
 
   defp session_id(%{sessionId: {:entity, session_id, _ctx}}), do: session_id
 
+  defp prompt_id(%{promptRef: {:delta, prompt_id, _ctx}}), do: prompt_id
+
   defp memory_ids(%{memoryPointers: pointers}),
     do: for({:delta, id, _ctx} <- pointers, do: id)
 
   # the replay pre-check: an UNRETRACTED PromptAssembled pointing at this
   # request exists in the store — decode and re-send THOSE bytes, emit
   # nothing. A stored claim that does not decode is store corruption.
-  defp replayed_prompt(set, request_id) do
+  # T14g (N2/H4): the replay pre-check is PROFILE-KEYED — a stored claim
+  # matches iff its profile key equals the boot's (nil==nil for profile-less
+  # boots); keyed-vs-unkeyed is a MISS BOTH ways (a legacy unkeyed claim
+  # never serves a profiled boot, a keyed claim never serves a profile-less
+  # boot). Exactly-one is per (request, profile).
+  defp replayed_prompt(set, request_id, profile) do
     retracted = retracted_ids(set)
 
     case Enum.find(set, fn {id, {claims, _sig}} ->
            not MapSet.member?(retracted, id) and
              kind(claims) == "sessionId" and
              match?(%{type: "PromptAssembled"}, Schema.resolve(claims)) and
-             match?({:delta, ^request_id, _ctx}, pointer(claims, "requestRef"))
+             match?({:delta, ^request_id, _ctx}, pointer(claims, "requestRef")) and
+             profile_key_matches?(claims, profile)
          end) do
       {_id, {claims, _sig}} ->
         case pointer(claims, "content") do
@@ -279,6 +313,16 @@ defmodule Kyber.Agent.Engine do
 
       nil ->
         :none
+    end
+  end
+
+  # the N2 key matrix: keyed==keyed on the same name matches; keyed vs
+  # unkeyed is a MISS in both directions; both unkeyed matches.
+  defp profile_key_matches?(claims, boot_profile) do
+    case pointer(claims, "profile") do
+      {:string, ^boot_profile} -> true
+      nil -> boot_profile == nil
+      _other -> false
     end
   end
 
@@ -510,7 +554,8 @@ defmodule Kyber.Agent.Engine do
               session_id,
               memory_ids,
               state.window,
-              Prompt.prompt_text(set, prompt_id)
+              Prompt.prompt_text(set, prompt_id),
+              state.boot
             )
         },
         tool_id: tool_id,
