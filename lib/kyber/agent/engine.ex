@@ -504,7 +504,14 @@ defmodule Kyber.Agent.Engine do
           prompt_id: prompt_id,
           session_id: session_id,
           memory_ids: memory_ids,
-          messages: Prompt.assemble(set, session_id, memory_ids, state.window)
+          messages:
+            Prompt.assemble(
+              set,
+              session_id,
+              memory_ids,
+              state.window,
+              Prompt.prompt_text(set, prompt_id)
+            )
         },
         tool_id: tool_id,
         args: call.args

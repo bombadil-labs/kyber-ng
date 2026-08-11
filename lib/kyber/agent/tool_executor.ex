@@ -41,7 +41,7 @@ defmodule Kyber.Agent.ToolExecutor do
   """
 
   alias Kyber.{Gather, Schema, Wire}
-  alias Kyber.Agent.{Action, Events, Memory, Policy}
+  alias Kyber.Agent.{Action, Events, Memory, Policy, Skill}
   alias Kyber.Agent.Action.Gate
 
   @doc "The stub registry: `tool:echo` answers its args."
@@ -109,6 +109,59 @@ defmodule Kyber.Agent.ToolExecutor do
             }
           },
           "required" => ["entity"]
+        }
+      }
+    }
+  end
+
+  @doc """
+  The skill-tool registry listing (T14f D7): `skill.set` / `skill.retract` /
+  `skill.read` for `tool_specs`/`tool_key_map` ONLY — the gate fires on
+  tool_id membership regardless of registry origin (the url/memory policy
+  layers abstain on skill ids by membership), and the executor resolves
+  reads in the dedicated `run` clause over the handler's store snapshot.
+  The write tools mint their SkillSet/SkillRetract deltas in the dedicated
+  `write_and_run` clause (D10/M6) — the listing itself carries no store
+  access.
+  """
+  @spec skill_tools(fun()) :: %{String.t() => map()}
+  def skill_tools(_store_fn) do
+    %{
+      "skill.set" => %{
+        description:
+          "Create or update a skill: name, description, body, optional metadata JSON string.",
+        parameters: %{
+          "type" => "object",
+          "properties" => %{
+            "name" => %{"type" => "string", "description" => "The skill name (the aggregate key)."},
+            "description" => %{"type" => "string", "description" => "What the skill is for."},
+            "body" => %{"type" => "string", "description" => "The procedure."},
+            "metadata" => %{
+              "type" => "string",
+              "description" => "Optional JSON-string metadata."
+            }
+          },
+          "required" => ["name", "description", "body"]
+        }
+      },
+      "skill.retract" => %{
+        description: "Remove a skill (a delta-ID-targeted negation of its head set-delta).",
+        parameters: %{
+          "type" => "object",
+          "properties" => %{
+            "name" => %{"type" => "string", "description" => "The skill name to remove."}
+          },
+          "required" => ["name"]
+        }
+      },
+      "skill.read" => %{
+        description: "Read a skill's current view (the fold over its deltas).",
+        parameters: %{
+          "type" => "object",
+          "properties" => %{
+            "name" => %{"type" => "string", "description" => "The skill name to read."}
+          },
+          "required" => ["name"]
         }
       }
     }
@@ -202,16 +255,28 @@ defmodule Kyber.Agent.ToolExecutor do
     end
   end
 
-  # T14c D3: the two policy layers, in pinned order. A layer that does not
-  # gate the tool id abstains (:allow); the first {:refuse, policy, reason,
-  # epoch_id} wins the call's single GateDecision slot.
+  # T14c D3 / T14f L1: the three policy layers, in pinned order. A layer
+  # that does not gate the tool id abstains (:allow); the first {:refuse,
+  # policy, reason, epoch_id} wins the call's single GateDecision slot.
+  # skill_policy is appended LAST — the precedence chain is
+  # regression-frozen and appending is the only order that provably cannot
+  # perturb the existing suite (layers are disjoint by tool id).
   defp policy_verdict(set, tool_id, args) do
+    # url_policy answers the bare {:refuse, reason, epoch_id} (the policy
+    # name is pinned HERE); memory_policy and skill_policy answer the full
+    # {:refuse, policy, reason, epoch_id} and pass through as-is
     case url_policy(set, tool_id, args) do
       {:refuse, reason, epoch_id} ->
         {:refuse, "url_policy", reason, epoch_id}
 
       :allow ->
-        memory_policy(set, tool_id, args)
+        case memory_policy(set, tool_id, args) do
+          {:refuse, _policy, _reason, _epoch_id} = refusal ->
+            refusal
+
+          :allow ->
+            skill_policy(set, tool_id, args)
+        end
     end
   end
 
@@ -246,6 +311,46 @@ defmodule Kyber.Agent.ToolExecutor do
       end
     else
       :allow
+    end
+  end
+
+  # the skill_policy layer (T14f D5/M5), mirroring memory_policy clause for
+  # clause: ungated tool => :allow; ungoverned store => FAIL-CLOSED refusal;
+  # forked epoch => fail closed; undecodable args => the policy layer
+  # abstains (action validation owns it); zero allow_entity pointers => the
+  # check refuses everything. skill.set AND skill.retract are BOTH gated (a
+  # retraction is a write to the same aggregate, N6) and skill.read is
+  # gated like memory.read.
+  defp skill_policy(set, tool_id, args) do
+    if tool_id in Policy.skill_gated_tools() do
+      case Policy.skill_epoch(set) do
+        :none ->
+          {:refuse, "skill_policy", Policy.reason_skill_ungoverned(), nil}
+
+        {:error, :forked} ->
+          {:refuse, "skill_policy", Policy.reason_skill_forked(), nil}
+
+        {:ok, epoch} ->
+          case extract_skill_name(args) do
+            :abstain ->
+              :allow
+
+            {:ok, name} ->
+              case Policy.check_skill(epoch, name) do
+                :allow -> :allow
+                {:refuse, reason} -> {:refuse, "skill_policy", reason, epoch.id}
+              end
+          end
+      end
+    else
+      :allow
+    end
+  end
+
+  defp extract_skill_name(args) do
+    case JSON.decode(args) do
+      {:ok, %{"name" => name}} when is_binary(name) -> {:ok, name}
+      _other -> :abstain
     end
   end
 
@@ -297,11 +402,14 @@ defmodule Kyber.Agent.ToolExecutor do
   defp result_wires(set, seed, ts, call_id, tool_id, args, tools, context) do
     case stored_tool_result(set, call_id) do
       nil ->
-        {result, status} = run(tools, tool_id, args, context, set)
+        # T14f D10/M6: a write tool emits its store delta BEFORE the
+        # ToolResult — wire order [gate_decision, skill_set, tool_result].
+        {write_wires, result, status} =
+          write_and_run(set, seed, ts, call_id, tool_id, args, tools, context)
 
         case Events.tool_result(seed, ts, call_id, result, status) do
-          {:ok, signed} -> [Wire.envelope(signed)]
-          {:error, _reason} -> []
+          {:ok, signed} -> write_wires ++ [Wire.envelope(signed)]
+          {:error, _reason} -> write_wires
         end
 
       {wire, result_id} ->
@@ -313,6 +421,97 @@ defmodule Kyber.Agent.ToolExecutor do
           {:ok, signed} -> [wire, Wire.envelope(signed)]
           {:error, _reason} -> [wire]
         end
+    end
+  end
+
+  # the write path (T14f): skill.set / skill.retract mint their store
+  # deltas and hand back {write_wires, result, status}; every other tool
+  # runs uncapped with no store delta. The mints claim the CALL's
+  # `claims.timestamp` — never a fresh clock — so a crash-window re-fire
+  # re-mints the SAME delta and record-dedupe by content address holds
+  # (M6); a replayed write is absorbed, never re-applied.
+  defp write_and_run(_set, seed, ts, call_id, "skill.set", args, _tools, _context) do
+    case decode_set_args(args) do
+      {:ok, name, description, body, metadata} ->
+        case Events.skill_set(seed, ts, name, description, body, metadata, call_id) do
+          {:ok, signed} -> {[Wire.envelope(signed)], "set skill " <> name, "ok"}
+          {:error, reason} -> {[], "skill set refused: " <> inspect(reason), "error"}
+        end
+
+      {:error, reason} ->
+        {[], reason, "error"}
+    end
+  end
+
+  defp write_and_run(set, seed, ts, _call_id, "skill.retract", args, _tools, _context) do
+    case decode_name(args) do
+      {:ok, name} ->
+        case Skill.view(set, name) do
+          # D8/L5: retract-of-unknown is a RESOLUTION OUTCOME — no negation
+          # is minted (tool-boundary discipline; dangling negations would be
+          # door-admissible but this surface mints none), spelled
+          # {"", "unknown_entity"}
+          :not_found ->
+            {[], "", "unknown_entity"}
+
+          {:ok, view} ->
+            # the negation targets the ORDER-HEAD set-delta — never a name,
+            # never the prior version (no retraction-path rollback)
+            case Events.skill_retract(seed, ts, name, view.head) do
+              {:ok, signed} -> {[Wire.envelope(signed)], "retracted skill " <> name, "ok"}
+              {:error, reason} -> {[], "skill retract refused: " <> inspect(reason), "error"}
+            end
+        end
+
+      {:error, reason} ->
+        {[], reason, "error"}
+    end
+  end
+
+  defp write_and_run(set, _seed, _ts, _call_id, tool_id, args, tools, context) do
+    {result, status} = run(tools, tool_id, args, context, set)
+    {[], result, status}
+  end
+
+  # N1 (T14f): the trim-reject lives at the TOOL BOUNDARY — skill.set
+  # refuses whitespace-only names (reject, never repair; the stored name is
+  # never normalized). "" is refused too (the substrate floor refuses empty
+  # entity ids — same boundary). metadata must be a string when present.
+  defp decode_set_args(args) do
+    case JSON.decode(args) do
+      {:ok, %{"name" => name, "description" => description, "body" => body} = map}
+      when is_binary(name) and is_binary(description) and is_binary(body) ->
+        cond do
+          String.trim(name) == "" ->
+            {:error, "skill name must not be whitespace-only"}
+
+          true ->
+            case map do
+              %{"metadata" => metadata} when is_binary(metadata) ->
+                {:ok, name, description, body, metadata}
+
+              %{"metadata" => nil} ->
+                # JSON null decodes to nil — an explicit null is an absent
+                # optional, not a malformed one
+                {:ok, name, description, body, nil}
+
+              %{"metadata" => _non_string} ->
+                {:error, "malformed action arguments: " <> args}
+
+              _no_metadata ->
+                {:ok, name, description, body, nil}
+            end
+        end
+
+      _other ->
+        {:error, "malformed action arguments: " <> args}
+    end
+  end
+
+  defp decode_name(args) do
+    case JSON.decode(args) do
+      {:ok, %{"name" => name}} when is_binary(name) -> {:ok, name}
+      _other -> {:error, "malformed action arguments: " <> args}
     end
   end
 
@@ -390,6 +589,25 @@ defmodule Kyber.Agent.ToolExecutor do
     end
   end
 
+  # T14f: "skill.read" resolves in a DEDICATED run clause over the handler's
+  # :store snapshot — the fold IS the answer (a skill is a view, never a
+  # blob). A live fold renders deterministically; an unknown OR retracted
+  # skill resolves {"", "unknown_entity"} (D8 — retracted ≡ never-existed
+  # at this surface, a resolution outcome, never a refusal; the gate runs
+  # strictly BEFORE resolution).
+  defp run_uncapped(_tools, "skill.read", args, _context, store_set) do
+    case JSON.decode(args) do
+      {:ok, %{"name" => name}} when is_binary(name) ->
+        case Skill.view(store_set, name) do
+          :not_found -> {"", "unknown_entity"}
+          {:ok, view} -> {render_view(view), "ok"}
+        end
+
+      _other ->
+        {"malformed action arguments: " <> args, "error"}
+    end
+  end
+
   defp run_uncapped(tools, tool_id, args, context, _store_set) do
     case Map.fetch(tools, tool_id) do
       {:ok, fun} when is_function(fun, 1) ->
@@ -424,6 +642,19 @@ defmodule Kyber.Agent.ToolExecutor do
       :error ->
         {"unknown tool " <> tool_id, "unknown_tool"}
     end
+  end
+
+  # the fold rendered deterministically for the tool surface — the model
+  # reads the whole current view (no wall-clock, no raw stream)
+  defp render_view(view) do
+    JSON.encode!(%{
+      "name" => view.name,
+      "description" => view.description,
+      "body" => view.body,
+      "metadata" => view.metadata,
+      "version" => view.version,
+      "head" => view.head
+    })
   end
 
   # action args are the arguments JSON object; anything else is a recorded

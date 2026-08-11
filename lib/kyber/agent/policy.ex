@@ -39,6 +39,22 @@ defmodule Kyber.Agent.Policy do
   @reason_memory_ungoverned "memory_policy: no governing epoch (fail closed)"
   @reason_url_ungoverned "url_policy: no governing epoch (fail closed)"
 
+  # T14f D5/M5: the skill family — a THIRD governance family over the same
+  # Policy claim vocabulary, reusing the memory-family `allow_entity`
+  # context (ZERO Policy genesis change; the family name "skill"
+  # disambiguates skill entities from memory entities). Fail-closed from
+  # birth like the memory family; the allowlist-refusal arm has its OWN
+  # reason string (check_memory/2 would answer the memory_policy dialect).
+  # One allowlist governs all three surfaces (set/retract/read/lens — L3);
+  # the "writable" context is stripped at epoch compile (policy.ex keeps
+  # only the entity id).
+  @skill_family "skill"
+  @skill_gated_tools ["skill.set", "skill.retract", "skill.read"]
+
+  @reason_skill_entity "skill_policy: skill not allowed by the current epoch"
+  @reason_skill_forked "skill_policy: epoch forked (fail closed)"
+  @reason_skill_ungoverned "skill_policy: no governing epoch (fail closed)"
+
   @type epoch :: %{
           id: String.t(),
           allow_hosts: [String.t()],
@@ -78,6 +94,42 @@ defmodule Kyber.Agent.Policy do
 
   @spec reason_url_ungoverned() :: String.t()
   def reason_url_ungoverned, do: @reason_url_ungoverned
+
+  @spec skill_family() :: String.t()
+  def skill_family, do: @skill_family
+
+  @spec skill_gated_tools() :: [String.t()]
+  def skill_gated_tools, do: @skill_gated_tools
+
+  @spec reason_skill_entity() :: String.t()
+  def reason_skill_entity, do: @reason_skill_entity
+
+  @spec reason_skill_forked() :: String.t()
+  def reason_skill_forked, do: @reason_skill_forked
+
+  @spec reason_skill_ungoverned() :: String.t()
+  def reason_skill_ungoverned, do: @reason_skill_ungoverned
+
+  @doc "The current skill-family epoch: `:none`, `{:error, :forked}`, or `{:ok, epoch}`."
+  @spec skill_epoch(map()) :: {:ok, epoch()} | :none | {:error, :forked}
+  def skill_epoch(set), do: current(set, @skill_family)
+
+  @doc """
+  The exact skill check: `:allow` iff the name rides the epoch's
+  `allow_entity` list, else the pinned refusal reason. NO downcase — skill
+  names are content-derived, case is not a DNS-class equivalence (the lens
+  exact-name tier is case-sensitive too, L2).
+  """
+  @spec check_skill(epoch(), String.t()) :: :allow | {:refuse, String.t()}
+  def check_skill(epoch, name) do
+    if name in epoch.allow_entities,
+      do: :allow,
+      else: {:refuse, @reason_skill_entity}
+  end
+
+  @doc "True iff the epoch allows the skill name — `check_skill/2` as a predicate."
+  @spec matches_skill?(epoch(), String.t()) :: boolean()
+  def matches_skill?(epoch, name), do: check_skill(epoch, name) == :allow
 
   @doc "The current memory-family epoch: `:none`, `{:error, :forked}`, or `{:ok, epoch}`."
   @spec memory_epoch(map()) :: {:ok, epoch()} | :none | {:error, :forked}

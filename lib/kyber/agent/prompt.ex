@@ -28,7 +28,8 @@ defmodule Kyber.Agent.Prompt do
   included (legacy).
   """
 
-  alias Kyber.Agent.{ContextBuilder, Memory, Policy}
+  alias Kyber.Agent.{ContextBuilder, Memory, Policy, Skill}
+  alias Kyber.Agent.Memory.Assoc
 
   @system_prompt "You are kyber, an agent living in a claims substrate. " <>
                    "Ground your answer in the conversation and memory notes provided. " <>
@@ -48,7 +49,7 @@ defmodule Kyber.Agent.Prompt do
   emission).
   """
   @spec assemble(Kyber.DeltaSet.t(), String.t(), [String.t()], non_neg_integer()) :: [map()]
-  def assemble(set, session_id, memory_ids, window \\ 8) do
+  def assemble(set, session_id, memory_ids, window \\ 8, prompt_text \\ nil) do
     turns = ContextBuilder.conversation(set, session_id)
     {elided, windowed} = ContextBuilder.window(turns, window)
 
@@ -65,18 +66,121 @@ defmodule Kyber.Agent.Prompt do
           {:string, content} <- [pointer(claims, "content")],
           do: %{"role" => "system", "content" => "Summary of earlier turns: " <> content}
 
+    skill_notes = skill_notes(set, prompt_text)
+
     elision_note =
       case elided do
         [] -> []
         turns -> [%{"role" => "system", "content" => "#{length(turns)} earlier turns elided."}]
       end
 
+    # the pinned order: system -> memory_notes -> summary_notes ->
+    # skill_notes -> elision -> turns (M3)
     [%{"role" => "system", "content" => @system_prompt}] ++
       memory_notes ++
       summary_notes ++
+      skill_notes ++
       elision_note ++
       Enum.map(windowed, &%{"role" => &1.role, "content" => &1.content})
   end
+
+  @doc """
+  Resolve the request's own promptRef'd delta content — the lens's
+  PROMPT-RELATIVE query text (M3): the engine supplies the request's own
+  prompt pointer's content, never the conversation tail (a resumed request
+  would match the wrong turn). `nil` when the prompt delta is absent from
+  the set — the lens then contributes nothing (fail-closed).
+  """
+  @spec prompt_text(Kyber.DeltaSet.t(), String.t()) :: String.t() | nil
+  def prompt_text(set, prompt_id) do
+    case Map.get(set, prompt_id) do
+      {claims, _sig} ->
+        case pointer(claims, "content") do
+          {:string, content} -> content
+          _other -> nil
+        end
+
+      nil ->
+        nil
+    end
+  end
+
+  # ------------------------------------------------ the skill lens (T14f D6)
+
+  # the cap VALUES are pins (M4): 4 skills AND 8192 RENDERED note bytes,
+  # skip-and-continue
+  @skill_cap 4
+  @skill_note_bytes 8192
+
+  # the fail-closed lens (D6/N2): ungoverned AND forked epochs contribute NO
+  # skills (L8 — the asymmetry with the memory gather's fail-open :none arm
+  # is pinned; the two arms never unify); NO GateDecision is minted (the
+  # lens is prompt assembly, not a gate). No prompt text => no skills ride.
+  defp skill_notes(_set, nil), do: []
+
+  defp skill_notes(set, prompt_text) when is_binary(prompt_text) do
+    case Policy.skill_epoch(set) do
+      {:ok, epoch} -> ranked_skill_notes(set, epoch, prompt_text)
+      _none_or_forked -> []
+    end
+  end
+
+  defp ranked_skill_notes(set, epoch, prompt_text) do
+    query_digests = MapSet.new(Assoc.digests(prompt_text))
+
+    set
+    |> Skill.views()
+    |> Enum.filter(&Policy.matches_skill?(epoch, &1.name))
+    |> Enum.flat_map(fn view ->
+      exact = String.contains?(prompt_text, view.name)
+      shared = shared_digests(query_digests, view)
+
+      # the exact-name tier is case-sensitive (L2); a mis-cased mention
+      # falls through to the digest tier (which downcases) — intended
+      if exact or shared >= 1 do
+        [%{exact: exact, shared: shared, view: view}]
+      else
+        []
+      end
+    end)
+    |> Enum.sort_by(fn %{exact: exact, shared: shared, view: view} ->
+      # M1: exact-name tier first, then -shared_digest_count, ties on the
+      # content-derived name — total and deterministic
+      {if(exact, do: 0, else: 1), -shared, view.name}
+    end)
+    |> select_notes(%{count: 0, bytes: 0}, [])
+    |> Enum.map(&%{"role" => "system", "content" => &1})
+  end
+
+  # the shared-digest count over the VIEW's name+description (D6: salience
+  # over the views, never the raw streams; one tokenizer discipline —
+  # Assoc.digests is CALLED, never re-implemented)
+  defp shared_digests(query_digests, view) do
+    view
+    |> digest_source()
+    |> Assoc.digests()
+    |> Enum.count(&MapSet.member?(query_digests, &1))
+  end
+
+  defp digest_source(view), do: view.name <> " " <> view.description
+
+  # M4: SKIP-AND-CONTINUE — a ranked skill that would blow either cap is
+  # omitted entirely (never truncated), and SMALLER later skills may still
+  # fit (stop-at-first-overflow rejected); 8192 counts the RENDERED note
+  # bytes (the "Skill: <name>" prefix + description + body)
+  defp select_notes([], _state, acc), do: Enum.reverse(acc)
+
+  defp select_notes([%{view: view} | rest], %{count: count, bytes: bytes}, acc) do
+    note = "Skill: " <> view.name <> "\n" <> view.description <> "\n" <> view.body
+    note_bytes = byte_size(note)
+
+    if count < @skill_cap and bytes + note_bytes <= @skill_note_bytes do
+      select_notes(rest, %{count: count + 1, bytes: bytes + note_bytes}, [note | acc])
+    else
+      select_notes(rest, %{count: count, bytes: bytes}, acc)
+    end
+  end
+
 
   @doc """
   The canonical prompt bytes: stdlib `JSON.encode!` of the bare

@@ -104,6 +104,18 @@ defmodule Kyber.Schema.Genesis do
      requires: [{"entity", "entity"}, {"content", "string"}], many: [{"source", "delta"}]},
     {"MemoryEdited",
      requires: [{"edits", "delta"}, {"content", "string"}], optional: [{"reason", "string"}]},
+    # T14f (H5): the skill aggregate — a skill is a VIEW over its delta
+    # stream, never a blob. The full-set SkillSet carries the whole property
+    # set (name rides as the `skill` entity aggregate key; description/body
+    # ride as strings; metadata is an optional JSON string; source is the
+    # optional provenance pointer to the triggering ToolCall). SkillRetract
+    # is the delta-ID-targeted negation of the order-head set-delta
+    # (retraction-is-negation; liveness is recursive-existential — see
+    # Kyber.Agent.Skill)
+    {"SkillSet",
+     requires: [{"skill", "entity"}, {"description", "string"}, {"body", "string"}],
+     optional: [{"metadata", "string"}, {"source", "delta"}]},
+    {"SkillRetract", requires: [{"skill", "entity"}, {"negates", "delta"}]},
 
     # The T10 infra events (spec/01-events.md §2), named into the vocabulary.
     {"MessageReceived",
