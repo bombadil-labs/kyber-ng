@@ -36,7 +36,7 @@ defmodule Kyber.Agent.Prompt do
   included (legacy).
   """
 
-  alias Kyber.Agent.{ContextBuilder, Identity, Memory, Policy, Profile, Skill}
+  alias Kyber.Agent.{ContextBuilder, Digest, Identity, Liveness, Memory, Policy, Profile, Skill, Standing}
   alias Kyber.Agent.Memory.Assoc
 
   @system_prompt "You are kyber, an agent living in a claims substrate. " <>
@@ -78,18 +78,37 @@ defmodule Kyber.Agent.Prompt do
       for note <- Identity.block(set, operator_author, profile_view),
           do: %{"role" => "system", "content" => note}
 
+    # T14h: the always-on block — computed BEFORE the gather so the standing
+    # dedup (N1) reads the POST-CAP rendered standing entities (M7). The
+    # block takes NO prompt_text input (AC1 by construction); the slot is
+    # AFTER identity, BEFORE memory_notes.
+    {always_on_notes, standing_entities} = always_on_notes(set, session_id, profile_view)
+
     memory_notes =
-      for id <- gather_ids(set, memory_ids, profile_view),
+      for id <- gather_ids(set, memory_ids, profile_view, standing_entities),
           {claims, _sig} <- [Map.get(set, id)],
           {:string, content} <- [pointer(claims, "content")],
           do: %{"role" => "system", "content" => "Memory: " <> content}
 
+    # T14h (A5 hardening): the summary gather is LIVENESS-FILTERED (the
+    # shared recursive-existential oracle, author-blind — M6) and
+    # `{ts, id}`-tie-broken (the probe-proven hash-map-order bug on
+    # tied-ts stores), then capped 4096 skip-whole (M3). The liveness +
+    # tie-break legs change bytes ONLY where today is buggy (AC-recorded);
+    # the cap is the suite-probed safe bound.
     summary_notes =
-      for {_id, {claims, _sig}} <- Enum.sort_by(set, fn {_id, {c, _s}} -> c.timestamp end),
-          declared_type(claims) == "ConversationSummary",
-          match?({:entity, ^session_id, _}, pointer(claims, "sessionId")),
-          {:string, content} <- [pointer(claims, "content")],
-          do: %{"role" => "system", "content" => "Summary of earlier turns: " <> content}
+      set
+      |> Enum.filter(fn {id, {claims, _sig}} ->
+        declared_type(claims) == "ConversationSummary" and
+          match?({:entity, ^session_id, _}, pointer(claims, "sessionId")) and
+          Liveness.live?(set, id, fn _claims -> true end)
+      end)
+      |> Enum.sort_by(fn {id, {claims, _sig}} -> {claims.timestamp, id} end)
+      |> select_summary_notes(0, [])
+      |> Enum.map(fn {_id, {claims, _sig}} ->
+        {:string, content} = pointer(claims, "content")
+        %{"role" => "system", "content" => "Summary of earlier turns: " <> content}
+      end)
 
     skill_notes = skill_notes(set, prompt_text, profile_view)
 
@@ -99,11 +118,12 @@ defmodule Kyber.Agent.Prompt do
         turns -> [%{"role" => "system", "content" => "#{length(turns)} earlier turns elided."}]
       end
 
-    # the pinned order (T14g G3 — the T14f M3 parent pin, byte-for-byte):
-    # system -> IDENTITY -> memory_notes -> summary_notes -> skill_notes ->
-    # elision -> turns
+    # the pinned order (T14g G3 + T14h H3 — the T14f M3 parent pin,
+    # byte-for-byte): system -> IDENTITY -> always-on -> memory_notes ->
+    # summary_notes -> skill_notes -> elision -> turns
     [%{"role" => "system", "content" => @system_prompt}] ++
       identity_notes ++
+      always_on_notes ++
       memory_notes ++
       summary_notes ++
       skill_notes ++
@@ -253,6 +273,107 @@ defmodule Kyber.Agent.Prompt do
 
   def decode(_), do: {:error, :malformed}
 
+  # ------------------------------------------------ the always-on block (T14h)
+
+  # H3: the THIRD budget — 4096 TOTAL rendered bytes, disjoint from the
+  # identity block's 8192 and the skill lens's 8192, never pooled. Claim
+  # order (M1): Standing first, Trajectory second, Open last — the header
+  # order, each section claiming against the 4096 in sequence.
+  @always_on_cap 4096
+
+  # M3: the A5 summary cap — SKIP-WHOLE 4096 (the suite-probed safe bound:
+  # engine_test.exs:205's window-lens test needs ~80 bytes of headroom).
+  @summary_cap 4096
+
+  # the always-on block: {notes, standing_entities} — the notes render in
+  # the pinned header order; standing_entities is the POST-CAP rendered
+  # standing set (M7 — the dedup's input). Absence, never an empty header.
+  defp always_on_notes(set, session_id, profile_view) do
+    {standing_note, standing_entities, budget} = standing_section(Standing.fold(set, profile_view))
+    {trajectory_note, budget} = trajectory_section(Digest.head(set, session_id), budget)
+    open_note = open_section(Standing.open(set, session_id), budget)
+
+    {Enum.reject([standing_note, trajectory_note, open_note], &is_nil/1), standing_entities}
+  end
+
+  # SKIP-WHOLE (H3 — standing is independent items; greed is fine): a line
+  # that would blow the cap is omitted ENTIRELY, smaller later lines still
+  # fit; standing renders in {ts, id} ASCENDING order (M7).
+  defp standing_section(items) do
+    {lines, entities} =
+      Enum.reduce(items, {[], []}, fn item, {lines, entities} ->
+        line = "- " <> item.entity <> ": " <> item.content
+
+        if byte_size(render_section("Standing:", lines ++ [line])) <= @always_on_cap do
+          {lines ++ [line], entities ++ [item.entity]}
+        else
+          {lines, entities}
+        end
+      end)
+
+    case lines do
+      [] ->
+        {nil, [], @always_on_cap}
+
+      _ ->
+        content = render_section("Standing:", lines)
+        {%{"role" => "system", "content" => content}, entities, @always_on_cap - byte_size(content)}
+    end
+  end
+
+  # the trajectory = the digest head's content, ONE message (the mint's
+  # contiguous-stop already bounded it at 2048); at read the whole section
+  # claims the remaining budget — omit-whole when it would not fit.
+  defp trajectory_section(:none, budget), do: {nil, budget}
+
+  defp trajectory_section({:ok, content}, budget) do
+    note = render_section("Trajectory:", [content])
+
+    if byte_size(note) <= budget do
+      {%{"role" => "system", "content" => note}, budget - byte_size(note)}
+    else
+      {nil, budget}
+    end
+  end
+
+  # CONTIGUOUS-STOP over the pinned {ts, id} ASCENDING order (M1): a hole
+  # in a thread list lies about open work — never skip-whole; the sequence
+  # stops at the first line that would blow the remaining budget.
+  defp open_section(threads, budget) do
+    lines =
+      Enum.reduce_while(threads, [], fn thread, acc ->
+        line = if thread.waiting, do: "- " <> thread.content <> " (tool waiting)", else: "- " <> thread.content
+
+        if byte_size(render_section("Open:", acc ++ [line])) <= budget do
+          {:cont, acc ++ [line]}
+        else
+          {:halt, acc}
+        end
+      end)
+
+    case lines do
+      [] -> nil
+      _ -> %{"role" => "system", "content" => render_section("Open:", lines)}
+    end
+  end
+
+  defp render_section(header, lines), do: header <> "\n" <> Enum.join(lines, "\n")
+
+  # M3: the A5 summary cap — SKIP-WHOLE over the RENDERED note bytes
+  # ("Summary of earlier turns: " <> content)
+  defp select_summary_notes([], _bytes, acc), do: Enum.reverse(acc)
+
+  defp select_summary_notes([{_id, {claims, _sig}} = element | rest], bytes, acc) do
+    {:string, content} = pointer(claims, "content")
+    note_bytes = byte_size("Summary of earlier turns: " <> content)
+
+    if bytes + note_bytes <= @summary_cap do
+      select_summary_notes(rest, bytes + note_bytes, [element | acc])
+    else
+      select_summary_notes(rest, bytes, acc)
+    end
+  end
+
   # ------------------------------------------------------- the D4 filter
 
   # the call-less gate: epoch-filter the gather's memory ids BEFORE any
@@ -262,6 +383,24 @@ defmodule Kyber.Agent.Prompt do
   # legacy behavior); under ANY active profile the epoch source is the
   # profile's families (UNION, M3) and an ungoverned union governs NOTHING
   # (omit-all — the AC2 leak through the gather is closed).
+  # T14h (N1/M7): the standing dedup rides OUTSIDE the epoch arms — a
+  # memory id whose chain resolves to an entity ALREADY RENDERED standing
+  # (POST-CAP) is dropped from the gather: standing wins. A standing line
+  # dropped by the 4096 skip-whole never drops its memory note (the entity
+  # never vanishes from the prompt entirely).
+  defp gather_ids(set, memory_ids, profile_view, standing_entities) do
+    memories = Memory.resolve_set(set)
+
+    set
+    |> gather_ids(memory_ids, profile_view)
+    |> Enum.reject(fn id ->
+      case entity_for(memories, id) do
+        nil -> false
+        entity_id -> entity_id in standing_entities
+      end
+    end)
+  end
+
   defp gather_ids(set, memory_ids, nil), do: gather_ids(set, memory_ids, Policy.memory_epoch(set))
 
   defp gather_ids(set, memory_ids, %{name: _name} = profile_view) do
@@ -296,6 +435,61 @@ defmodule Kyber.Agent.Prompt do
       nil -> nil
     end
   end
+
+  # ------------------------------------------------- the replay key (N2/H3)
+
+  @doc """
+  The replay key's MATERIAL (T14h N2/H3): `nil` for profile-less boots
+  (T14g M4 — profile-less mints stay byte-identical, no new pointers);
+  otherwise `%{profile: name, roster: <canonical JSON of the SORTED
+  {family, epoch-id} pairs>, head: <ProfileSet head id | nil>}`. The
+  roster covers the profile's NAMED families, each epoch id resolved via
+  `Policy.current/2` — never the union epoch's `nil` id (profile.ex:140:
+  the union epoch has `id: nil`, so any key reading "the epoch id" is
+  unimplementable and rotation-blind). The key rides ONLY under a profile;
+  the digest id is NEVER the key.
+  """
+  @spec replay_key(Kyber.DeltaSet.t(), {String.t() | nil, String.t() | nil}) :: map() | nil
+  def replay_key(_set, {nil, _operator_author}), do: nil
+
+  def replay_key(set, {profile_name, operator_author})
+      when is_binary(profile_name) and is_binary(operator_author) do
+    case Profile.resolve(set, operator_author, profile_name) do
+      {:ok, view} ->
+        roster =
+          for family <- view.families do
+            epoch_id =
+              case Policy.current(set, family) do
+                {:ok, epoch} -> epoch.id
+                _none_or_forked -> nil
+              end
+
+            {family, epoch_id}
+          end
+
+        # canonical JSON of the SORTED pairs — arrays, never tuples (JSON
+        # cannot encode Elixir tuples)
+        roster_json =
+          roster
+          |> Enum.sort()
+          |> Enum.map(fn {family, epoch_id} -> [family, epoch_id] end)
+          |> JSON.encode!()
+
+        %{profile: profile_name, roster: roster_json, head: view.head}
+
+      :not_found ->
+        %{profile: profile_name, roster: "[]", head: nil}
+    end
+  end
+
+  # the nil-operator-seed leg under a bound profile: fail-closed, no view —
+  # the key is still deterministic (an empty material keys nothing verifiable
+  # and matches itself on re-boot)
+  def replay_key(_set, {profile_name, _nil_author}) when is_binary(profile_name) do
+    %{profile: profile_name, roster: JSON.encode!([]), head: nil}
+  end
+
+  def replay_key(_set, _boot), do: nil
 
   # ----------------------------------------------------- the boot context
 

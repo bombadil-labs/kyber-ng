@@ -98,7 +98,13 @@ defmodule Kyber.Schema.Genesis do
      # optional `profile` string role, emitted ONLY under a profile
      # (profile-less mints stay byte-identical); keyed-vs-unkeyed is a MISS,
      # never a cross-serve (the matrix is closed both ways)
-     optional: [{"profile", "string"}]},
+     # T14h (N5/H3): the replay key EXTENDS to the (profile, sorted
+     # {family, epoch-id} roster + ProfileSet head id) material — the
+     # optional `replayKey` delta role points at the epoch key-material
+     # delta, emitted ONLY under a profile (profile-less mints stay
+     # byte-identical); a claim keyed without the material is a MISS under a
+     # profiled boot (the roster cannot be verified — the rotation door)
+     optional: [{"profile", "string"}, {"replayKey", "delta"}]},
     # T14c (D5): the operator-key boot attestation — the operator's key
     # attests the agent's boot, an explicit store-visible participant
     {"BootAttestation",
@@ -145,6 +151,21 @@ defmodule Kyber.Schema.Genesis do
     {"ProfileSet",
      requires: [{"profile", "entity"}, {"rules", "string"}],
      many: [{"rides", "entity"}, {"allow_tool", "string"}, {"families", "string"}]},
+    # T14h (N5): the always-on context family — StandingDigest is the
+    # trajectory view (sessionId FIRST — the kind-marker grammar: routes to
+    # no subscription and matches no lens — the digest-of-digest exclusion;
+    # `covers` = the POST-CAP covered deltas, M8); StandingFlag is the
+    # salience marker (the `standing` kind marker routes to no subscription;
+    # unflag = negate the flag, retraction-is-negation); EpochKeyMaterial is
+    # the replay key's material (the profile's sorted {family, epoch-id}
+    # roster as canonical JSON + the ProfileSet head id — H3)
+    {"StandingDigest",
+     requires: [{"sessionId", "entity"}, {"content", "string"}],
+     many: [{"covers", "delta"}]},
+    {"StandingFlag", requires: [{"standing", "entity"}]},
+    {"EpochKeyMaterial",
+     requires: [{"profile", "string"}, {"roster", "string"}],
+     optional: [{"head", "delta"}]},
 
     # The T10 infra events (spec/01-events.md §2), named into the vocabulary.
     {"MessageReceived",

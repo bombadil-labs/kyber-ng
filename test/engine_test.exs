@@ -193,6 +193,8 @@ defmodule Kyber.Agent.EngineTest do
     request = request_inference(store, engine, prompt)
     sink_typed("ResponseDelta")
     sink_typed("MessageSent")
+    # T14h: the answer path's zero-charge StandingDigest emission
+    sink_typed("StandingDigest")
     assert_receive {:llm_request, _body}
 
     # the crash-window re-fire: the SAME request routed again
