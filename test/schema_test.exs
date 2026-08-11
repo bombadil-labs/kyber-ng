@@ -204,7 +204,14 @@ defmodule Kyber.SchemaTest do
           {&Events.prompt_annotated/4, "PromptAnnotated", {@seed, @ts, id64("77"), "a note"}},
           {&Events.llm_response/4, "LlmResponse", {@seed, @ts, id64("77"), "the answer"}},
           {&Events.tool_exec/6, "ToolInvoked",
-           {@seed, @ts, id64("77"), "tool:grep", "{}", "3 matches"}}
+           {@seed, @ts, id64("77"), "tool:grep", "{}", "3 matches"}},
+          # T14f (H5): the skill builders against the SkillSet/SkillRetract
+          # schemas — the fold only sees typed deltas, so schema drift would
+          # blind it silently
+          {&Kyber.Agent.Events.skill_set/7, "SkillSet",
+           {@seed, @ts, "greet", "Greet", "say hello", "{}", id64("99")}},
+          {&Kyber.Agent.Events.skill_retract/4, "SkillRetract",
+           {@seed, @ts, "greet", id64("99")}}
         ] do
       {:ok, {claims, _sig}} = apply(emitter, Tuple.to_list(args))
 

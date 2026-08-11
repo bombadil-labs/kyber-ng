@@ -185,6 +185,55 @@ defmodule Kyber.Agent.Events do
   end
 
   @doc """
+  `SkillSet` — one full-set skill write (T14f D1): the WHOLE property set
+  (name/description/body) plus optional `metadata` (a JSON string) and an
+  optional `source` provenance pointer (the triggering `ToolCall`'s id —
+  `{:delta, call, "triggered"}`, the MemoryEntity precedent). The name rides
+  as the aggregate key (`{:entity, name, "skills"}` — content-derived
+  identity). A skill is NOT a delta — it is a VIEW over its delta stream, so
+  a `SkillSet` supersedes the previous full-set delta of the same name
+  whole-set (H6): an ABSENT optional role is CLEARED. `ts` is the triggering
+  delta's `claims.timestamp` (the call's), never a fresh clock (M6 — a
+  crash-window re-fire must re-mint the SAME delta so record-dedupe holds).
+  """
+  @spec skill_set(
+          String.t(),
+          number(),
+          String.t(),
+          String.t(),
+          String.t(),
+          String.t() | nil,
+          String.t() | nil
+        ) :: {:ok, signed()} | {:error, term()}
+  def skill_set(seed, ts, name, description, body, metadata \\ nil, source \\ nil) do
+    build(seed, ts, "SkillSet", [
+      %{role: "skill", target: {:entity, name, "skills"}},
+      %{role: "description", target: {:string, description}},
+      %{role: "body", target: {:string, body}},
+      if(metadata, do: [%{role: "metadata", target: {:string, metadata}}], else: []),
+      if(source, do: [%{role: "source", target: {:delta, source, "triggered"}}], else: [])
+    ])
+  end
+
+  @doc """
+  `SkillRetract` — a delta-ID-targeted negation of a skill's order-head
+  set-delta (T14f D4/H2): retraction-is-negation, never delete-a-blob; the
+  grammar has no name form, so the fold's liveness is recursive-existential
+  through the whole negation chain (restore = retract the retraction; a
+  non-head retraction is a silent no-op). The `negates` target is the head
+  `SkillSet`'s content id. `ts` is the triggering call's `claims.timestamp`
+  (M6).
+  """
+  @spec skill_retract(String.t(), number(), String.t(), String.t()) ::
+          {:ok, signed()} | {:error, term()}
+  def skill_retract(seed, ts, name, head_id) do
+    build(seed, ts, "SkillRetract", [
+      %{role: "skill", target: {:entity, name, "skills"}},
+      %{role: "negates", target: {:delta, head_id, "retracted"}}
+    ])
+  end
+
+  @doc """
   `PromptAssembled` — the prompt-as-delta claim (T14c D1): the assembled
   prompt the model SAW, answered as a store delta. EXACTLY three pointers,
   `sessionId` FIRST (the kind-marker grammar — `"sessionId"` routes to no
@@ -220,6 +269,29 @@ defmodule Kyber.Agent.Events do
     build(seed, ts, "Policy", [
       %{role: "policy", target: {:entity, "memory", "epoch"}},
       Enum.map(allow_entities, &%{role: "allow_entity", target: {:entity, &1, "readable"}}),
+      if(supersedes,
+        do: [%{role: "supersedes", target: {:delta, supersedes, "superseded"}}],
+        else: []
+      )
+    ])
+  end
+
+  @doc """
+  `Policy` — the skill-family governance epoch (T14f D5): the memory-family
+  pattern over the `{:entity, "skill", "epoch"}` target, the allow-list
+  riding `allow_entity` roles (`{:entity, name, "writable"}` — the context
+  is stripped at epoch compile; ONE allowlist governs all three skill
+  surfaces, L3). ZERO Policy genesis change — the `allow_entity` role
+  already exists; the family name disambiguates skill entities from memory
+  entities. The epoch's `ts` is caller-derived (the operator's store clock,
+  never wall-clock in the decision surface).
+  """
+  @spec skill_policy(String.t(), number(), [String.t()], String.t() | nil) ::
+          {:ok, signed()} | {:error, term()}
+  def skill_policy(seed, ts, allow_names, supersedes \\ nil) do
+    build(seed, ts, "Policy", [
+      %{role: "policy", target: {:entity, "skill", "epoch"}},
+      Enum.map(allow_names, &%{role: "allow_entity", target: {:entity, &1, "writable"}}),
       if(supersedes,
         do: [%{role: "supersedes", target: {:delta, supersedes, "superseded"}}],
         else: []

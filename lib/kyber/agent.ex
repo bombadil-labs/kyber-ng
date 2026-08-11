@@ -12,7 +12,7 @@ defmodule Kyber.Agent do
   chain is the state).
   """
 
-  alias Kyber.{Gather, Keys}
+  alias Kyber.{DurableStore, Gather, Keys}
   alias Kyber.Agent.{Action, ContextBuilder, Engine, LlmHandler, MemoryPort, ToolExecutor}
   alias Kyber.Agent.Action.Gate
 
@@ -73,12 +73,26 @@ defmodule Kyber.Agent do
     end
   end
 
-  # a workspace boot opts into the real action registry; without one the
-  # T11b stub tools stay the default (A/B behind the one `:tools` seam)
+  # a workspace boot opts into the real action registry AND the memory +
+  # skill tool surfaces (T14f D9/H4): the ATTACH surface is the only
+  # workspace-aware surface in the repo — a workspace attach boot sees
+  # `memory.read` and the skill tools by default; the stub remains the
+  # no-workspace default (A/B behind the one `:tools` seam). The url/memory
+  # policy layers abstain on skill ids by membership and the registry keys
+  # don't collide (Action.registry() is fs/sh/http), so the merge's blast
+  # radius is clean. Both boot paths still default to `Gate.new()` —
+  # fail-closed on every call (L7).
   defp default_tools(opts) do
     case Keyword.get(opts, :workspace) do
-      nil -> ToolExecutor.stub_tools()
-      _workspace -> Action.registry()
+      nil ->
+        ToolExecutor.stub_tools()
+
+      _workspace ->
+        store_fn = fn -> DurableStore.set() end
+
+        Action.registry()
+        |> Map.merge(ToolExecutor.memory_tools(store_fn))
+        |> Map.merge(ToolExecutor.skill_tools(store_fn))
     end
   end
 
