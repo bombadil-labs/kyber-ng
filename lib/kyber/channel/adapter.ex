@@ -383,7 +383,20 @@ defmodule Kyber.Channel.Adapter do
         content = d["content"] || ""
         ts = snowflake_ts(snowflake)
 
-        case Events.message_received(state.seed, ts, message_id, channel, session, content) do
+        # T14j (C2): the Discord-user attribution mints at ingest — the
+        # `discord:user:<id>` STRING pointer (string-kind BY PIN). A missing
+        # OR whitespace-only author id mints nil (fail-closed; the /7 nil
+        # arm omits the pointer entirely, byte-identical to the legacy /6).
+        discord_user =
+          case author["id"] do
+            id when is_binary(id) ->
+              if String.trim(id) == "", do: nil, else: "discord:user:" <> id
+
+            _missing ->
+              nil
+          end
+
+        case Events.message_received(state.seed, ts, message_id, channel, session, content, discord_user) do
           {:ok, signed} ->
             case DurableStore.append(Wire.envelope(signed)) do
               :ok -> state

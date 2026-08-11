@@ -197,8 +197,12 @@ defmodule Kyber.SchemaTest do
     # the emitter's role set minus the declaration, and the emitted claims
     # validate typed as-is.
     for {emitter, type, args} <- [
-          {&Events.message_received/6, "MessageReceived",
-           {@seed, @ts, "msg:1", "channel:cli", "session:1", "hello"}},
+          # T14j (C2): the evolved schema's drift-proof entry rides /7 with a
+          # NON-nil discord_user — the regen is EXERCISED, never decorative
+          # (a /6 entry against the evolved schema fails the role-set
+          # equality below); the value is string-kind BY PIN
+          {&Events.message_received/7, "MessageReceived",
+           {@seed, @ts, "msg:1", "channel:cli", "session:1", "hello", "discord:user:12345"}},
           {&Events.message_sent/6, "MessageSent",
            {@seed, @ts, id64("77"), "msg:2", "channel:cli", "hi back"}},
           {&Events.prompt_annotated/4, "PromptAnnotated", {@seed, @ts, id64("77"), "a note"}},

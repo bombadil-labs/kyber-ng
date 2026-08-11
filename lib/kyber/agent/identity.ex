@@ -24,7 +24,9 @@ defmodule Kyber.Agent.Identity do
   rendered bytes, skip-and-continue per primitive (a primitive that would
   blow the bound is omitted ENTIRELY, never truncated), NEVER windowed. An
   unknown kind string or a whitespace-only kind/id is FOLD-INERT (closed
-  set, reject-never-repair; N3).
+  set, reject-never-repair; N3). The cap is an OPERATOR CONSTANT — named
+  in the LENS BUDGET REGISTRY (Prompt's moduledoc, T14j C4), never read
+  from the store.
   """
 
   alias Kyber.{DeltaSet, Schema}

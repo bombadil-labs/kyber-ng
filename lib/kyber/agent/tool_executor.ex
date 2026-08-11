@@ -41,12 +41,24 @@ defmodule Kyber.Agent.ToolExecutor do
   """
 
   alias Kyber.{Gather, Schema, Wire}
-  alias Kyber.Agent.{Action, Events, Memory, Policy, Profile, Skill}
+  alias Kyber.Agent.{Action, Events, Memory, Policy, Profile, Skill, Tools}
   alias Kyber.Agent.Action.Gate
 
   @doc "The stub registry: `tool:echo` answers its args."
   @spec stub_tools() :: %{String.t() => (String.t() -> String.t())}
   def stub_tools, do: %{"tool:echo" => fn args -> args end}
+
+  @doc """
+  T14j (C1): the workspace-aware default — the ONE implementation lives at
+  `Kyber.Agent.Tools.default_tools/1` (the completion gate's
+  `lib/kyber/agent/tools.ex`); this executor surface is the spec-cited
+  consumer home (reactor.ex:451/:503/:510) and delegates. Returns the
+  `{tools, context}` TUPLE; absent `:workspace` => stub tools + `%{}`
+  context, byte-identical; explicit `:tools`/`:context` win (M1); the
+  tools value is ALWAYS a MAP (M5).
+  """
+  @spec default_tools(keyword()) :: {map(), map()}
+  def default_tools(opts), do: Tools.default_tools(opts)
 
   @doc """
   OpenAI function specs for the registry (native tool calling, B's
@@ -541,6 +553,14 @@ defmodule Kyber.Agent.ToolExecutor do
   # refuses whitespace-only names (reject, never repair; the stored name is
   # never normalized). "" is refused too (the substrate floor refuses empty
   # entity ids — same boundary). metadata must be a string when present.
+  # T14j (C5/M6): the degenerate-short-name class — the boundary refuses
+  # names under N = 4 BYTES POST-TRIM (`byte_size(String.trim(name))`; the
+  # assoc.ex ≥4-byte token floor is the derivation anchor — the boundary and
+  # the tokenizer speak the same units). The STORED name is never
+  # normalized: a whitespace-padded name is refused at the boundary (1
+  # trimmed byte), never rewritten.
+  @min_name_bytes 4
+
   defp decode_set_args(args) do
     case JSON.decode(args) do
       {:ok, %{"name" => name, "description" => description, "body" => body} = map}
@@ -548,6 +568,9 @@ defmodule Kyber.Agent.ToolExecutor do
         cond do
           String.trim(name) == "" ->
             {:error, "skill name must not be whitespace-only"}
+
+          byte_size(String.trim(name)) < @min_name_bytes ->
+            {:error, "skill name must be at least #{@min_name_bytes} bytes after trimming"}
 
           true ->
             case map do
@@ -758,8 +781,13 @@ defmodule Kyber.Agent.ToolExecutor do
     end)
   end
 
-  # the bounded store walk stays deterministic under map ordering
-  defp by_timestamp(set), do: Enum.sort_by(set, fn {_id, {claims, _sig}} -> claims.timestamp end)
+  # the bounded store walk stays deterministic under map ordering. T14j
+  # (NEW-1 / R1-C): the read is {ts, id}-TIE-BROKEN — ts-only first-match is
+  # nondeterministic under the >32-entry filler regime (hash-map order
+  # decides tied-ts records); {ts, id} is the substrate's total order, so
+  # the dedupe read is replica-identical.
+  defp by_timestamp(set),
+    do: Enum.sort_by(set, fn {id, {claims, _sig}} -> {claims.timestamp, id} end)
 
   defp description(_key, %{description: description}), do: description
 
