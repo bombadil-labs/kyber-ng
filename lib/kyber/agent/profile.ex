@@ -35,7 +35,7 @@ defmodule Kyber.Agent.Profile do
   omit-all when other families are clean, and never fail-open).
   """
 
-  alias Kyber.{DeltaSet, Schema}
+  alias Kyber.{DeltaSet, Keys, Schema}
   alias Kyber.Agent.{Liveness, Policy}
 
   @type view :: %{
@@ -143,4 +143,70 @@ defmodule Kyber.Agent.Profile do
   # the H2c author filter: ProfileSet declarations carry the SAME filter as
   # identity primitives (an agent cannot declare profiles out-of-band)
   defp author_filter(operator_author), do: fn claims -> claims.author == operator_author end
+
+  # ------------------------------------------------------- the boot context
+
+  @doc """
+  The ONE boot-context resolution (T14i H7/H8 — shared by `Kyber.Agent.attach/1`,
+  the reactor's engine construction, and the channel daemon's boot guard; T14g
+  R1/G5): derive the boot tuple `{profile | nil, operator_author | nil}` from
+  the `:profile` and `:operator_seed` opts. The operator_author is derived ONCE
+  from the seed — `author_for_seed(nil)` RAISES, so the nil-seed leg never calls
+  it. A `:profile` name resolves against the boot-constant author's ProfileSet
+  stream; unresolvable (unknown OR whitespace-only (M7) OR no operator seed to
+  attest with) refuses LOUDLY with `{:error, {:unknown_profile, name}}` — the
+  `{_name, nil}` refusal — never a silent fallback to a profile-less boot.
+  """
+  @spec boot_context(keyword()) :: {:ok, {String.t() | nil, String.t() | nil}} | {:error, term()}
+  def boot_context(opts) do
+    profile = Keyword.get(opts, :profile)
+    operator_seed = Keyword.get(opts, :operator_seed)
+
+    case {profile, operator_seed} do
+      {nil, _seed} ->
+        {:ok, {nil, maybe_author(operator_seed)}}
+
+      {_name, nil} ->
+        {:error, {:unknown_profile, profile}}
+
+      {name, seed} ->
+        author = Keys.author_for_seed(seed)
+
+        case resolve(store_set(), author, name) do
+          {:ok, _view} -> {:ok, {name, author}}
+          :not_found -> {:error, {:unknown_profile, name}}
+        end
+    end
+  end
+
+  @doc """
+  The ONE construction-time capability intersect (T14i H8 — the shared helper
+  extracted from attach's private `profile_tools/2`, agent.ex:127-137; T14g
+  G6/L1): under a profile the registry is `Map.take(registry, allow_tool)` —
+  NARROWS only; a tool absent from the boot registry cannot be conjured.
+  Consumed by BOTH `Agent.attach/1` AND the reactor's engine construction
+  (reactor.ex:441) — never two intersects, never a private duplicate.
+  Profile-less boots pass through.
+  """
+  @spec intersect_tools(map(), {String.t() | nil, String.t() | nil}) :: map()
+  def intersect_tools(tools, {nil, _author}), do: tools
+
+  def intersect_tools(tools, {name, author}) do
+    case resolve(store_set(), author, name) do
+      {:ok, view} -> Map.take(tools, view.allow_tool)
+      # unreachable at boot (boot_context already refused); fail-closed
+      # if the fold changed under us
+      :not_found -> %{}
+    end
+  end
+
+  defp maybe_author(nil), do: nil
+  defp maybe_author(seed), do: Keys.author_for_seed(seed)
+
+  defp store_set do
+    case Process.whereis(Kyber.DurableStore) do
+      nil -> %{}
+      _pid -> Kyber.DurableStore.set()
+    end
+  end
 end

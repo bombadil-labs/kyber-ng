@@ -31,7 +31,7 @@ defmodule Kyber.Agent.Reactor do
   use GenServer
 
   alias Kyber.{DurableStore, Keys, Wire}
-  alias Kyber.Agent.{ContextBuilder, Engine, Events, LlmHandler, MemoryPort, ToolExecutor}
+  alias Kyber.Agent.{ContextBuilder, Engine, Events, LlmHandler, MemoryPort, Profile, ToolExecutor}
   alias Kyber.Agent.Action.Gate
   alias Rhizomatic.Delta
 
@@ -145,9 +145,14 @@ defmodule Kyber.Agent.Reactor do
     seed = Keyword.fetch!(opts, :seed)
     engine_opts = Keyword.get(opts, :engine, :none)
 
-    with {:ok, engine} <- start_engine(seed, engine_opts),
+    # T14i (H7/H8): the ONE boot-context resolution (the shared helper — the
+    # SAME refusal attach uses): {profile, nil} refuses loudly, an unknown
+    # profile name refuses loudly; the boot tuple feeds the engine's `:boot`
+    # opt AND the construction-time capability intersect (reactor.ex:441).
+    with {:ok, boot} <- Profile.boot_context(opts),
+         {:ok, engine} <- start_engine(seed, engine_opts, boot),
          {:ok, builder} <- builder_for(seed, engine_opts),
-         {:ok, executor} <- executor_for(seed, engine_opts),
+         {:ok, executor} <- executor_for(seed, engine_opts, boot),
          :ok <- attest_boot(opts, seed) do
       # the handlers (pin 6, module functions of (delta, ctx)) reach the
       # state-dependent machinery through the reactor's own process
@@ -434,11 +439,16 @@ defmodule Kyber.Agent.Reactor do
   # pin 6/H6: the hosted engine — constructed at reactor init from the
   # engine boot opt; sink omitted => the reactor's own emission path (direct
   # DurableStore.append, never Daemon.emit); notify defaults to the reactor
-  defp start_engine(_seed, :none), do: {:ok, nil}
+  defp start_engine(_seed, :none, _boot), do: {:ok, nil}
 
-  defp start_engine(seed, opts) when is_list(opts) do
+  defp start_engine(seed, opts, boot) when is_list(opts) do
     with {:ok, llm} <- llm_for(seed, opts) do
-      tools = Keyword.get(opts, :tools, ToolExecutor.stub_tools())
+      # T14i (H8 — the FOURTH touchpoint): the capability intersect is
+      # consumed at the ENGINE CONSTRUCTION — the SINGLE `tools` var is
+      # narrowed by the shared helper BEFORE tool_specs/tool_key_map, so
+      # profile-excluded tools are neither advertised nor executable (the
+      # enforcement spelling is the executor's "unknown tool").
+      tools = opts |> Keyword.get(:tools, ToolExecutor.stub_tools()) |> Profile.intersect_tools(boot)
 
       engine_opts = [
         name: nil,
@@ -447,7 +457,10 @@ defmodule Kyber.Agent.Reactor do
         tool_keys: ToolExecutor.tool_key_map(tools),
         store: &DurableStore.set/0,
         sink: Keyword.get(opts, :sink, &DurableStore.append/1),
-        notify: Keyword.get(opts, :notify, self())
+        notify: Keyword.get(opts, :notify, self()),
+        # T14g (R1): the ONE boot context {profile | nil, operator_author |
+        # nil} — the engine's assemble site is profile-aware under a profile
+        boot: boot
       ]
 
       case Engine.start_link(engine_opts) do
@@ -480,18 +493,25 @@ defmodule Kyber.Agent.Reactor do
   end
 
   # the tool path (the existing pure executor handler — hosted, never rebuilt)
-  defp executor_for(seed, :none) do
+  defp executor_for(seed, :none, _boot) do
     {:ok, ToolExecutor.handler(seed: seed, store: &DurableStore.set/0)}
   end
 
-  defp executor_for(seed, opts) when is_list(opts) do
+  defp executor_for(seed, opts, boot) when is_list(opts) do
+    # T14i (H8): the SAME narrowed `tools` var feeds the executor registry —
+    # a one-sided intersect would leave profile-excluded tools executable
+    tools = opts |> Keyword.get(:tools, ToolExecutor.stub_tools()) |> Profile.intersect_tools(boot)
+
     {:ok,
      ToolExecutor.handler(
        seed: seed,
-       tools: Keyword.get(opts, :tools, ToolExecutor.stub_tools()),
+       tools: tools,
        gate: Keyword.get(opts, :gate, Gate.new()),
        context: Keyword.get(opts, :context, %{}),
-       store: &DurableStore.set/0
+       store: &DurableStore.set/0,
+       # T14g (M2): the boot context threads into the tool-side policy
+       # layers too — profile-aware epochs under a profile
+       boot: boot
      )}
   end
 
