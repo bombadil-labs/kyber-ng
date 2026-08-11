@@ -109,8 +109,15 @@ defmodule Kyber.Schema.Genesis do
     # attests the agent's boot, an explicit store-visible participant
     {"BootAttestation",
      requires: [{"operator", "entity"}, {"agent", "entity"}, {"boot", "delta"}]},
+    # T14j (C3): the summary carries the PROFILE dimension explicitly — the
+    # optional `profile` string role (the T14g profile name) keys the
+    # (session, profile) gather; emitted ONLY under a profile (profile-less
+    # mints stay byte-identical). The summary note rides the profile key the
+    # way the PromptAssembled replay key does.
     {"ConversationSummary",
-     requires: [{"sessionId", "entity"}, {"content", "string"}], many: [{"covers", "delta"}]},
+     requires: [{"sessionId", "entity"}, {"content", "string"}],
+     many: [{"covers", "delta"}],
+     optional: [{"profile", "string"}]},
     {"MemoryEntity",
      requires: [{"entity", "entity"}, {"content", "string"}], many: [{"source", "delta"}]},
     {"MemoryEdited",
@@ -168,6 +175,14 @@ defmodule Kyber.Schema.Genesis do
      optional: [{"head", "delta"}]},
 
     # The T10 infra events (spec/01-events.md §2), named into the vocabulary.
+    # T14j (C2): the Discord-user attribution — the OPTIONAL `discordUser`
+    # STRING role (value `"discord:user:" <> author_id`, string-kind BY PIN:
+    # the T14i L2 bare-`discord:` rejection governs ENTITY ids only, never
+    # string roles). The role name is `discordUser` — NEVER `author`, which
+    # the compiler's resolved-pointer merge would silently overwrite the
+    # signer with on every resolved MessageReceived (the merge-over
+    # citation). Attribution is DATA, never a decision surface: the folds
+    # render nothing new.
     {"MessageReceived",
      requires: [
        {"received", "entity"},
@@ -175,7 +190,8 @@ defmodule Kyber.Schema.Genesis do
        {"by", "entity"},
        {"content", "string"},
        {"session", "entity"}
-     ]},
+     ],
+     optional: [{"discordUser", "string"}]},
     {"PromptAnnotated", requires: [{"annotates", "delta"}, {"notes", "string"}]},
     {"LlmResponse",
      requires: [{"responds", "delta"}, {"content", "string"}, {"usage", "entity"}]},

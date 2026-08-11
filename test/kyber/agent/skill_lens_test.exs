@@ -213,17 +213,19 @@ defmodule Kyber.Agent.SkillLensTest do
   end
 
   test "M4: the skill cap is 4 — the fifth ranked skill never rides" do
-    {e_id, e} = epoch(["s1", "s2", "s3", "s4", "s5"])
+    # the names ride ABOVE the T14j N=4 floor (sub-4 names are lens-inert by
+    # construction — the count-cap witness must not trip the floor)
+    {e_id, e} = epoch(["skill1", "skill2", "skill3", "skill4", "skill5"])
     pairs =
       for n <- 1..5 do
-        {_id, pair} = skill("s#{n}", "x", "y")
+        {_id, pair} = skill("skill#{n}", "x", "y")
         pair
       end
 
-    {_t_id, t} = turn("s1 s2 s3 s4 s5", @ts)
+    {_t_id, t} = turn("skill1 skill2 skill3 skill4 skill5", @ts)
     set = set_of([e | pairs] ++ [t])
 
-    messages = Prompt.assemble(set, @session, [], 8, "s1 s2 s3 s4 s5")
+    messages = Prompt.assemble(set, @session, [], 8, "skill1 skill2 skill3 skill4 skill5")
     assert length(skill_notes(messages)) == 4
   end
 

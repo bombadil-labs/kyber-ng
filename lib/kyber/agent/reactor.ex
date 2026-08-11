@@ -448,7 +448,13 @@ defmodule Kyber.Agent.Reactor do
       # narrowed by the shared helper BEFORE tool_specs/tool_key_map, so
       # profile-excluded tools are neither advertised nor executable (the
       # enforcement spelling is the executor's "unknown tool").
-      tools = opts |> Keyword.get(:tools, ToolExecutor.stub_tools()) |> Profile.intersect_tools(boot)
+      # T14j (C1): the workspace-aware default — the ONE tuple-returning
+      # helper (explicit :tools/:context win (M1); absent :workspace =>
+      # stub, byte-identical); the intersect narrows AFTER the seam. The
+      # engine consumes only the tools half (the context rides the
+      # executor, reactor.ex executor_for).
+      {tools, _context} = ToolExecutor.default_tools(opts)
+      tools = Profile.intersect_tools(tools, boot)
 
       engine_opts = [
         name: nil,
@@ -500,14 +506,19 @@ defmodule Kyber.Agent.Reactor do
   defp executor_for(seed, opts, boot) when is_list(opts) do
     # T14i (H8): the SAME narrowed `tools` var feeds the executor registry —
     # a one-sided intersect would leave profile-excluded tools executable
-    tools = opts |> Keyword.get(:tools, ToolExecutor.stub_tools()) |> Profile.intersect_tools(boot)
+    # T14j (C1): BOTH halves of the workspace-aware default are consumed
+    # here — the tools (the registry) AND the context (the executor's
+    # context-parity half; an unthreaded context answers the fs/sh
+    # arg-error-string class, never real content).
+    {tools, context} = ToolExecutor.default_tools(opts)
+    tools = Profile.intersect_tools(tools, boot)
 
     {:ok,
      ToolExecutor.handler(
        seed: seed,
        tools: tools,
        gate: Keyword.get(opts, :gate, Gate.new()),
-       context: Keyword.get(opts, :context, %{}),
+       context: context,
        store: &DurableStore.set/0,
        # T14g (M2): the boot context threads into the tool-side policy
        # layers too — profile-aware epochs under a profile

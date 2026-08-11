@@ -145,14 +145,28 @@ defmodule Kyber.Agent.Events do
     ])
   end
 
-  @doc "`ConversationSummary` — a lens artifact covering elided turns."
-  @spec conversation_summary(String.t(), number(), String.t(), String.t(), [String.t()]) ::
-          {:ok, signed()} | {:error, term()}
-  def conversation_summary(seed, ts, session_id, content, covers) do
+  @doc """
+  `ConversationSummary` — a lens artifact covering elided turns. T14j (C3):
+  the summary rides the PROFILE key — the optional `profile` string role
+  (the T14g profile name) emits ONLY under a profile (profile-less mints
+  stay byte-identical; `nil` omits the pointer entirely). The (session,
+  profile) key is the gather's filter: keyed-vs-unkeyed is a MISS, never a
+  cross-serve.
+  """
+  @spec conversation_summary(
+          String.t(),
+          number(),
+          String.t(),
+          String.t(),
+          [String.t()],
+          String.t() | nil
+        ) :: {:ok, signed()} | {:error, term()}
+  def conversation_summary(seed, ts, session_id, content, covers, profile \\ nil) do
     build(seed, ts, "ConversationSummary", [
       %{role: "sessionId", target: {:entity, session_id, "summaries"}},
       %{role: "content", target: {:string, content}},
-      Enum.map(covers, &%{role: "covers", target: {:delta, &1, "summarized"}})
+      Enum.map(covers, &%{role: "covers", target: {:delta, &1, "summarized"}}),
+      if(profile, do: [%{role: "profile", target: {:string, profile}}], else: [])
     ])
   end
 

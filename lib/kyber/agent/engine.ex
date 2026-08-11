@@ -25,7 +25,7 @@ defmodule Kyber.Agent.Engine do
 
   alias Kyber.{DurableStore, Schema, Wire}
   alias Rhizomatic.Delta
-  alias Kyber.Agent.{ContextBuilder, Digest, Events, LlmHandler, Prompt, ToolExecutor}
+  alias Kyber.Agent.{ContextBuilder, Digest, Events, Liveness, LlmHandler, Prompt, ToolExecutor}
 
   @default_window 8
 
@@ -694,7 +694,8 @@ defmodule Kyber.Agent.Engine do
   defp maybe_summarize(turn, set, ts, state) do
     turns = ContextBuilder.conversation(set, turn.session_id)
 
-    if length(turns) > 2 * state.window and not summarized?(set, turn.session_id) do
+    if length(turns) > 2 * state.window and
+         not summarized?(set, turn.session_id, elem(state.boot, 0)) do
       {elided, _kept} = Enum.split(turns, length(turns) - state.window)
       covered = Enum.map(elided, & &1.id)
 
@@ -718,11 +719,24 @@ defmodule Kyber.Agent.Engine do
     state
   end
 
-  defp summarized?(set, session_id) do
-    Enum.any?(set, fn {_id, {claims, _sig}} ->
+  # T14j (C3): (session, profile)-scoped AND liveness-aware (NEW-4 — the
+  # pre-slice oracle was retraction-blind: a negated summary still counted).
+  # The profile arg comes from the boot tuple (profile-less boots pass nil —
+  # nil == nil matches unkeyed summaries only, never keyed ones).
+  defp summarized?(set, session_id, profile_name) do
+    Enum.any?(set, fn {id, {claims, _sig}} ->
       declared_type(claims) == "ConversationSummary" and
-        match?({:entity, ^session_id, _ctx}, pointer(claims, "sessionId"))
+        match?({:entity, ^session_id, _ctx}, pointer(claims, "sessionId")) and
+        summary_profile(claims) == profile_name and
+        Liveness.live?(set, id, fn _claims -> true end)
     end)
+  end
+
+  defp summary_profile(claims) do
+    case pointer(claims, "profile") do
+      {:string, profile} -> profile
+      _none -> nil
+    end
   end
 
   # the no-sleep observation seam: tests (and the CLI's narrate mode) get a

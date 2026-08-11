@@ -34,6 +34,30 @@ defmodule Kyber.Agent.Prompt do
   over the edit chain. Under a governing epoch an id in NO resolvable
   chain is omitted (unprovable => fail-closed); under `:none` it is
   included (legacy).
+
+  ## Lens budget registry (T14j C4 — N4 governance)
+
+  The lens caps are OPERATOR CONSTANTS — compile-time module attributes,
+  changed by code review + rebuild, NEVER read from the store (a hostile
+  store must never widen a cap). The registry names all FIVE lens caps:
+
+  - identity block: 8192 rendered bytes (``Identity.@block_cap``,
+    identity.ex — the always-on block's FIRST slot)
+  - always-on block: 4096 rendered bytes (``@always_on_cap``, this module —
+    standing/trajectory/open, disjoint from identity)
+  - summary notes: 4096 rendered bytes (``@summary_cap``, this module —
+    skip-whole)
+  - skill notes: 4 skills (``@skill_cap``, this module — skip-and-continue)
+  - skill notes: 8192 rendered bytes (``@skill_note_bytes``, this module)
+
+  The two DISPATCH budgets are DELIBERATELY out-of-scope (N3): the
+  reactor's per-turn dispatch cap 32 (``Reactor.@default_cap``) and the
+  conversation window 8 (``ContextBuilder.window/2`` — the engine's
+  ``@default_window``) govern DISPATCHING and WINDOWING, never lens bytes —
+  they pool with no lens section. Per-section accounting (M7): each
+  rendered section's bytes sit under ITS OWN cap while all sections
+  coexist; a section over its cap is cut at ITS cap, never borrowing
+  another section's budget.
   """
 
   alias Kyber.Agent.{ContextBuilder, Digest, Identity, Liveness, Memory, Policy, Profile, Skill, Standing}
@@ -96,11 +120,17 @@ defmodule Kyber.Agent.Prompt do
     # tied-ts stores), then capped 4096 skip-whole (M3). The liveness +
     # tie-break legs change bytes ONLY where today is buggy (AC-recorded);
     # the cap is the suite-probed safe bound.
+    # T14j (C3): the gather is (session, PROFILE)-scoped — the summary
+    # carries the profile key (the T14g profile name) and the filter is
+    # nil == nil: an unkeyed legacy summary serves a {nil, nil} boot ONLY;
+    # a keyed summary serves ONLY its own profile. AC-recorded byte delta:
+    # "profiled boots no longer serve legacy unkeyed summaries".
     summary_notes =
       set
       |> Enum.filter(fn {id, {claims, _sig}} ->
         declared_type(claims) == "ConversationSummary" and
           match?({:entity, ^session_id, _}, pointer(claims, "sessionId")) and
+          summary_profile(claims) == profile_name and
           Liveness.live?(set, id, fn _claims -> true end)
       end)
       |> Enum.sort_by(fn {id, {claims, _sig}} -> {claims.timestamp, id} end)
@@ -159,6 +189,12 @@ defmodule Kyber.Agent.Prompt do
   @skill_cap 4
   @skill_note_bytes 8192
 
+  # T14j (C5): the N=4 name floor — the tool boundary AND the lens share
+  # the SAME constant (the assoc.ex >=4-byte token floor is the derivation
+  # anchor; the boundary measures byte_size of the POST-TRIM name, the
+  # stored name is never normalized)
+  @min_name_bytes 4
+
   # the fail-closed lens (D6/N2): ungoverned AND forked epochs contribute NO
   # skills (L8 — the asymmetry with the memory gather's fail-open :none arm
   # is pinned; the two arms never unify); NO GateDecision is minted (the
@@ -194,8 +230,24 @@ defmodule Kyber.Agent.Prompt do
     set
     |> Skill.views()
     |> Enum.filter(&Policy.matches_skill?(epoch, &1.name))
+    # T14j (C5): the read-side twin — out-of-band sub-floor names (hand-
+    # crafted store state; the door refuses only "") are LENS-INERT: the
+    # N=4 boundary and the tokenizer speak the same units, and a sub-4 name
+    # is digest-blind (Assoc.digests == []) so the exact tier is its only
+    # path — the floor makes it permanently inert.
+    |> Enum.filter(&(byte_size(String.trim(&1.name)) >= @min_name_bytes))
     |> Enum.flat_map(fn view ->
-      exact = String.contains?(prompt_text, view.name)
+      # T14j (C5/H1): the exact-name tier is the boundary-anchored
+      # case-sensitive literal lookaround (L2 preserved): the name is
+      # Regex.escape'd BEFORE interpolation — "foo.bar" matches "see
+      # foo.bar here" and NEVER "see foo bar here" or "fooXbar"; a
+      # single- AND multi-token name both ride whole-token only.
+      exact =
+        Regex.match?(
+          ~r/(?<![A-Za-z0-9])#{Regex.escape(view.name)}(?![A-Za-z0-9])/,
+          prompt_text
+        )
+
       shared = shared_digests(query_digests, view)
 
       # the exact-name tier is case-sensitive (L2); a mis-cased mention
@@ -529,5 +581,15 @@ defmodule Kyber.Agent.Prompt do
       %{role: "type", target: {:entity, name, _ctx}} -> name
       _other -> nil
     end)
+  end
+
+  # the summary's profile key: the optional `profile` string role — nil for
+  # unkeyed (legacy) summaries; the gather's (session, profile) filter
+  # compares nil == nil, so keyed-vs-unkeyed is a MISS, never a cross-serve
+  defp summary_profile(claims) do
+    case pointer(claims, "profile") do
+      {:string, profile} -> profile
+      _none -> nil
+    end
   end
 end
