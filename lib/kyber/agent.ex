@@ -41,16 +41,14 @@ defmodule Kyber.Agent do
 
     with {:ok, seed} <- Keys.load_agent_seed(keyring_dir),
          {:ok, llm} <- llm_handler(opts, seed),
-         {:ok, boot} <- boot_context(opts) do
+         {:ok, boot} <- Profile.boot_context(opts) do
       memory = Keyword.get(opts, :memory, {MemoryPort.Stub, %{}})
-      tools = Keyword.get(opts, :tools, default_tools(opts))
-      # T14g (G6/L1): the profile's capability subset NARROWS the registry —
-      # Map.take(registry, allow_tool) on the SINGLE `tools` var feeding
-      # BOTH the engine specs AND the executor registry (a one-sided
-      # intersect either advertises dead tools or leaves profile-excluded
-      # tools executable); the boot gate is preserved (agent.ex:67) — a
-      # profile can never conjure an allow via Gate.new.
-      tools = profile_tools(tools, boot)
+      # T14g (G6/L1) + T14i (H8): the profile's capability subset NARROWS
+      # the registry — the ONE shared intersect helper (extracted from this
+      # module's private profile_tools/2) on the SINGLE `tools` var feeding
+      # BOTH the engine specs AND the executor registry; the boot gate is
+      # preserved — a profile can never conjure an allow via Gate.new.
+      tools = opts |> Keyword.get(:tools, default_tools(opts)) |> Profile.intersect_tools(boot)
 
       {:ok, engine} =
         Engine.start_link(
@@ -88,60 +86,6 @@ defmodule Kyber.Agent do
         )
 
       {:ok, engine, Engine.resume(engine)}
-    end
-  end
-
-  # T14g (R1/G5): derive the ONE boot context {profile | nil, operator_author
-  # | nil} at attach. The operator_author is derived ONCE from the
-  # :operator_seed — author_for_seed(nil) RAISES, so the nil-seed leg never
-  # calls it: no operator seed => operator_author nil => no identity block,
-  # never a crash (fail-closed). A :profile name resolves against the
-  # boot-constant author's ProfileSet stream; unresolvable (unknown OR
-  # whitespace-only (M7) OR no operator seed to attest with) refuses LOUDLY
-  # with {:error, {:unknown_profile, name}} — no silent fallback to a
-  # profile-less boot (that is the leak).
-  defp boot_context(opts) do
-    profile = Keyword.get(opts, :profile)
-    operator_seed = Keyword.get(opts, :operator_seed)
-
-    case {profile, operator_seed} do
-      {nil, _seed} ->
-        {:ok, {nil, maybe_author(operator_seed)}}
-
-      {_name, nil} ->
-        {:error, {:unknown_profile, profile}}
-
-      {name, seed} ->
-        author = Keys.author_for_seed(seed)
-
-        case Profile.resolve(store_set(), author, name) do
-          {:ok, _view} -> {:ok, {name, author}}
-          :not_found -> {:error, {:unknown_profile, name}}
-        end
-    end
-  end
-
-  # the G6 construction-time intersect: under a profile the registry is
-  # Map.take(registry, allow_tool) — NARROWS only; a tool absent from the
-  # boot registry cannot be conjured. Profile-less boots pass through.
-  defp profile_tools(tools, {nil, _author}), do: tools
-
-  defp profile_tools(tools, {name, author}) do
-    case Profile.resolve(store_set(), author, name) do
-      {:ok, view} -> Map.take(tools, view.allow_tool)
-      # unreachable at attach (boot_context already refused); fail-closed
-      # if the fold changed under us
-      :not_found -> %{}
-    end
-  end
-
-  defp maybe_author(nil), do: nil
-  defp maybe_author(seed), do: Keys.author_for_seed(seed)
-
-  defp store_set do
-    case Process.whereis(Kyber.DurableStore) do
-      nil -> %{}
-      _pid -> Kyber.DurableStore.set()
     end
   end
 

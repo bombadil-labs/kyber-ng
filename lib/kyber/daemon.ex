@@ -56,6 +56,7 @@ defmodule Kyber.Daemon do
   use GenServer
 
   alias Kyber.{AgentLoop, DeltaSet, DurableStore, Gather, Keys, Log, Store, Wire}
+  alias Kyber.Agent.Profile
   alias Rhizomatic.Delta
 
   @default_tick_ms 250
@@ -151,8 +152,15 @@ defmodule Kyber.Daemon do
 
     with :ok <- guard_store(),
          :ok <- guard_log(log_path),
+         # T14i (H7): the channel daemon consumes the SAME boot_context/1
+         # helper as attach — `--profile` with an absent/unnamed
+         # operator-seed env REFUSES boot ({:error, {:unknown_profile,
+         # name}}), never a silent profile-less render with keyed claims
+         # minting (AC3)
+         :ok <- guard_profile(opts),
          {:ok, seed} <- ensure_agent_seed(keyring_dir),
-         :ok <- take_lock(log_path) do
+         :ok <- take_lock(log_path),
+         {:ok, channel_socket} <- start_channel_socket(opts, log_path) do
       Process.flag(:trap_exit, true)
       {:ok, gather} = start_gather()
 
@@ -180,6 +188,9 @@ defmodule Kyber.Daemon do
         pulse_only: Keyword.get(opts, :pulse_only, []),
         narrate: Keyword.get(opts, :narrate, false),
         loop: loop,
+        channel_socket: channel_socket,
+        reactor: nil,
+        adapter: nil,
         fired: 0,
         persisted: 0,
         pulsed: 0,
@@ -201,9 +212,13 @@ defmodule Kyber.Daemon do
                # module name so the pin-1 cast reaches it; its lifetime IS
                # the daemon's (never in the app tree, application.ex
                # untouched)
-               {:ok, reactor} <- start_reactor(reactor_opts(opts, seed)) do
-            schedule(Map.put(state, :reactor, reactor))
-            {:ok, Map.put(state, :reactor, reactor)}
+               {:ok, reactor} <- start_reactor(reactor_opts(opts, seed)),
+               # T14i (H9): the gateway adapter — daemon-owned like the
+               # socket, one per boot, never in the app tree
+               {:ok, adapter} <- start_gateway(state, opts) do
+            state = %{state | reactor: reactor, adapter: adapter}
+            schedule(state)
+            {:ok, state}
           else
             {:error, reason} -> {:stop, reason}
           end
@@ -243,11 +258,24 @@ defmodule Kyber.Daemon do
   # the reactor is link-coupled exactly like the gather: an abnormal death
   # stops the daemon (the supervisor's :transient restart re-inits both)
   def handle_info({:EXIT, pid, reason}, %{reactor: pid} = state), do: {:stop, reason, state}
+  # the gateway adapter is link-coupled the same way (T14i H9)
+  def handle_info({:EXIT, pid, reason}, %{adapter: pid} = state), do: {:stop, reason, state}
   def handle_info({:EXIT, _pid, _reason}, state), do: {:noreply, state}
 
   @impl true
   def terminate(_reason, state) do
     File.rm(state.lock)
+
+    # T14i (H2): the stale <log>.sock is removed under the held lock before
+    # bind AND here — a kill -9 leaves the file behind and the next boot's
+    # bind fails :eaddrinuse (only File.rm unblocks)
+    if is_pid(state.channel_socket) and Process.alive?(state.channel_socket) do
+      case :sys.get_state(state.channel_socket) do
+        %{path: path} -> File.rm(path)
+        _other -> :ok
+      end
+    end
+
     :ok
   end
 
@@ -537,7 +565,11 @@ defmodule Kyber.Daemon do
       budget_cap: Keyword.get(opts, :budget_cap, 32),
       engine: Keyword.get(opts, :engine, :none),
       test_pid: Keyword.get(opts, :test_pid),
-      operator_seed: Keyword.get(opts, :operator_seed)
+      operator_seed: Keyword.get(opts, :operator_seed),
+      # T14i (D3 — the threading): :profile rides the same whitelist into
+      # Reactor.start_link, where the boot_context helper resolves the
+      # engine's :boot tuple and the H8 intersect
+      profile: Keyword.get(opts, :profile)
     ]
   end
 
@@ -577,6 +609,89 @@ defmodule Kyber.Daemon do
 
       :absent ->
         :ok
+    end
+  end
+
+  # ------------------------------------------------------------------ T14i
+
+  # H7: the channel daemon boot consumes the SAME boot_context/1 helper as
+  # attach (agent.ex:103; {_name, nil} -> {:error, {:unknown_profile, name}}):
+  # `--profile` with an absent/unnamed operator-seed env REFUSES boot; an
+  # unknown profile name refuses with the same reason.
+  defp guard_profile(opts) do
+    case Profile.boot_context(
+           profile: Keyword.get(opts, :profile),
+           operator_seed: Keyword.get(opts, :operator_seed)
+         ) do
+      {:ok, _boot} -> :ok
+      {:error, _reason} = err -> err
+    end
+  end
+
+  # D6/H2: the daemon-owned channel socket. Under the HELD lock the stale
+  # <log>.sock is File.rm'd BEFORE bind (a kill -9 leaves it behind and the
+  # next bind fails :eaddrinuse — only File.rm unblocks); :default resolves
+  # to <log>.sock (the discovery file IS the socket); nil = disabled.
+  defp start_channel_socket(opts, log_path) do
+    case Keyword.get(opts, :channel_socket) do
+      nil ->
+        {:ok, nil}
+
+      :default ->
+        do_start_channel_socket(log_path <> ".sock", opts)
+
+      path when is_binary(path) ->
+        do_start_channel_socket(path, opts)
+    end
+  end
+
+  defp do_start_channel_socket(path, opts) do
+    File.rm(path)
+
+    case Kyber.Channel.Socket.start_link(
+           socket_path: path,
+           log_path: Application.get_env(:kyber, :log_path),
+           operator_seed: Keyword.get(opts, :operator_seed)
+         ) do
+      {:ok, pid} -> {:ok, pid}
+      {:error, reason} -> {:error, {:channel_socket, reason}}
+    end
+  end
+
+  # H9: the gateway adapter — daemon-owned, one per boot, never in the app
+  # tree. The per-server seed derives from the operator seed (M4); the token
+  # rides the delivery seam as a CLOSURE (M12 — outside inspectable state);
+  # a gateway without an operator seed is fail-closed (the CLI's
+  # profile-mandatory refusal already guards the surface).
+  defp start_gateway(_state, opts) do
+    case Keyword.get(opts, :gateway) do
+      nil ->
+        {:ok, nil}
+
+      gw ->
+        operator_seed = Keyword.get(opts, :operator_seed)
+
+        if is_nil(operator_seed) do
+          {:error, {:unknown_profile, Keyword.get(opts, :profile)}}
+        else
+          server_id = Keyword.fetch!(gw, :server_id)
+          server_seed = Keys.derive_seed(operator_seed, "kyber:discord-server:" <> server_id)
+
+          adapter_opts = [
+            server: server_id,
+            seed: server_seed,
+            token_holder: Keyword.get(gw, :token, fn -> nil end),
+            intents: Keyword.get(gw, :intents, 33_280),
+            url: Keyword.get(gw, :url, "wss://gateway.discord.gg/?v=10&encoding=json"),
+            transport: {Kyber.Channel.Transport.Ws, %{}},
+            delivery: {Kyber.Channel.Delivery.Httpc, %{}}
+          ]
+
+          case Kyber.Channel.Adapter.start_link(adapter_opts) do
+            {:ok, pid} -> {:ok, pid}
+            {:error, reason} -> {:error, reason}
+          end
+        end
     end
   end
 

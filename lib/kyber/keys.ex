@@ -107,6 +107,22 @@ defmodule Kyber.Keys do
     "ed25519:" <> pub_hex
   end
 
+  @doc """
+  Derive a per-server seed (T14i M4 — the pinned pure deterministic KDF):
+  `:crypto.hash(:sha256, master_bytes <> <<0>> <> context_bytes)`, raw
+  master bytes, a 0x00 separator, UTF-8 context bytes, lowercase hex output.
+  Portable, zero new key files: two servers derive distinct authors, the
+  same server re-derives the same author across boots. The context spelling
+  is pinned in the channel adapter moduledoc:
+  `"kyber:discord-server:" <> server_id`.
+  """
+  @spec derive_seed(String.t(), String.t()) :: String.t()
+  def derive_seed(master_seed_hex, context) when is_binary(context) do
+    master = seed_bytes!(master_seed_hex)
+    derived = :crypto.hash(:sha256, master <> <<0>> <> context)
+    Base.encode16(derived, case: :lower)
+  end
+
   @doc "Sign validated claims with the seed — wraps `Rhizomatic.Signer.sign/2`."
   @spec sign(Rhizomatic.Delta.claims(), String.t()) :: {:ok, String.t()} | {:error, term()}
   def sign(claims, seed_hex) do
