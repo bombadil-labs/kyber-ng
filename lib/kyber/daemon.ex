@@ -96,6 +96,19 @@ defmodule Kyber.Daemon do
   """
   @spec boot(keyword()) :: {:ok, pid()} | {:error, term()}
   def boot(opts) do
+    # T15 (AC1): thread the boot system_prompt into app env so
+    # Prompt.system_prompt/0 (assembly path) agrees with LlmHandler
+    # (gather path) — both must carry the same persona for a coherent
+    # agent. Only override when explicitly supplied; otherwise the pinned
+    # kyber default stands. Loop-agnostic: applies to :ack and :reactor.
+    case Keyword.get(opts, :system_prompt) do
+      sp when is_binary(sp) and sp != "" ->
+        Application.put_env(:kyber, :system_prompt, sp)
+
+      _ ->
+        :ok
+    end
+
     if Process.whereis(Kyber.Supervisor) do
       case Supervisor.start_child(Kyber.Supervisor, spec(opts)) do
         {:ok, pid} -> {:ok, pid}

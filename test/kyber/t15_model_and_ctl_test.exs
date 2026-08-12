@@ -86,6 +86,42 @@ defmodule Kyber.T15ModelAndCtlTest do
       end
       refute Kyber.Agent.Prompt.system_prompt() == "OVERRIDE PROMPT"
     end
+
+    test "Daemon.boot(system_prompt:) threads the persona into Prompt.system_prompt/0 (AC1, P5)" do
+      uniq = "#{System.os_time()}-#{System.unique_integer([:positive])}"
+      key_dir = Path.join(System.tmp_dir!(), "kyber-t15-sp-key-#{uniq}")
+      File.mkdir_p!(key_dir)
+      :ok = Keys.import_human_seed(@seed, key_dir)
+      log_path = Path.join([System.tmp_dir!(), "kyber-t15-sp-log-#{uniq}", "store.jsonl"])
+      File.mkdir_p!(Path.dirname(log_path))
+
+      config_log_path = Application.get_env(:kyber, :log_path)
+      Application.put_env(:kyber, :log_path, log_path)
+      prev_sp = Application.get_env(:kyber, :system_prompt)
+      {:ok, _} = Application.ensure_all_started(:kyber)
+      Daemon.stop()
+
+      on_exit(fn ->
+        Daemon.stop()
+        Application.stop(:kyber)
+        Application.put_env(:kyber, :log_path, config_log_path)
+        if prev_sp == nil, do: Application.delete_env(:kyber, :system_prompt),
+          else: Application.put_env(:kyber, :system_prompt, prev_sp)
+        File.rm_rf(key_dir)
+        File.rm_rf(Path.dirname(log_path))
+      end)
+
+      {:ok, _pid} =
+        Daemon.boot(
+          keyring_dir: key_dir,
+          loop: :ack,
+          narrate: false,
+          channel_socket: :default,
+          system_prompt: "You are Wisp, a twitchy scout."
+        )
+
+      assert Kyber.Agent.Prompt.system_prompt() == "You are Wisp, a twitchy scout."
+    end
   end
 
   describe "ctl client over the channel socket (AC3)" do
