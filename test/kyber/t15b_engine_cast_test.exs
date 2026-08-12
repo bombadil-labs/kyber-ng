@@ -107,4 +107,34 @@ defmodule Kyber.T15bEngineCastTest do
       assert answered
     end
   end
+
+  describe "default-boot handler resolves non-nil LLM defaults (T15b regression)" do
+    # ADLC adversarial review (P5, PR #5) caught: Reactor.llm_for/2 passed
+    # `base_url: nil` etc. when opts omitted those keys, which overrode
+    # LlmHandler.new's @base_url/@model/@system_prompt fallbacks — breaking
+    # default `kyber daemon` boots (nil base_url/model/system_prompt).
+    test "absent model/base_url/system_prompt fall back to LlmHandler defaults" do
+      {:ok, handler} = Kyber.Agent.Reactor.llm_for(@seed, [api_key: "test-key-not-real"])
+
+      refute is_nil(handler.base_url)
+      refute is_nil(handler.model)
+      refute is_nil(handler.system_prompt)
+      # the defaults must be the kyber substrate persona, not nil/empty
+      assert handler.base_url == "https://api.moonshot.ai/v1"
+      assert handler.model == "kimi-k3"
+      assert handler.system_prompt =~ "claims substrate"
+    end
+
+    test "explicit model/base_url override the defaults (no regression)" do
+      {:ok, handler} =
+        Kyber.Agent.Reactor.llm_for(@seed,
+          api_key: "test-key-not-real",
+          model: "deepseek/deepseek-v4-flash-0731",
+          base_url: "https://inference-api.nousresearch.com/v1"
+        )
+
+      assert handler.model == "deepseek/deepseek-v4-flash-0731"
+      assert handler.base_url == "https://inference-api.nousresearch.com/v1"
+    end
+  end
 end

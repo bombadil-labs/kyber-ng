@@ -484,10 +484,16 @@ defmodule Kyber.Agent.Reactor do
   def llm_for(seed, opts) do
     case Keyword.get(opts, :llm) do
       %LlmHandler{} = llm -> {:ok, llm}
-      nil -> LlmHandler.new(seed: seed, api_key: Keyword.get(opts, :api_key),
-                            base_url: Keyword.get(opts, :base_url),
-                            model: Keyword.get(opts, :model),
-                            system_prompt: Keyword.get(opts, :system_prompt))
+      nil ->
+        # Only forward optional keys that are actually present. Absent keys
+        # are dropped so LlmHandler.new's @base_url/@model/@system_prompt
+        # fallbacks apply; passing `base_url: nil` would override them.
+        llm_opts =
+          opts
+          |> Keyword.take([:api_key, :base_url, :model, :system_prompt])
+          |> Enum.reject(fn {_k, v} -> is_nil(v) end)
+
+        LlmHandler.new([seed: seed] ++ llm_opts)
     end
   end
 
