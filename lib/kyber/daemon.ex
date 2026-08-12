@@ -1,4 +1,5 @@
 defmodule Kyber.Daemon do
+  require Logger
   @moduledoc """
   The long-lived process (T10): an agent actually living in the claims
   substrate. The daemon boots against the app-configured store, watches the
@@ -223,14 +224,10 @@ defmodule Kyber.Daemon do
           # the two-boot AC5 companion holds). M2: retraction-detection (a
           # negates pointer targeting the seed id) is the gate's closing
           # mechanism — the reactor reads it from store state.
+          reactor_opts = reactor_opts(opts, seed)
+
           with :ok <- assert_oracle_seed(state, opts),
-               # H3: the reactor is started BY the daemon — linked
-               # immediately after the store is confirmed (guard_store
-               # above), before any dispatch can occur; registered under the
-               # module name so the pin-1 cast reaches it; its lifetime IS
-               # the daemon's (never in the app tree, application.ex
-               # untouched)
-               {:ok, reactor} <- start_reactor(reactor_opts(opts, seed)),
+               {:ok, reactor} <- start_reactor(reactor_opts),
                # T15: the federation peer — opens a TCP listener so a sibling
                # agent (e.g. Liet) can import Wisp's signed claims. Only when
                # --peer-port is supplied; absent = no listener (the default).
@@ -599,6 +596,34 @@ defmodule Kyber.Daemon do
         explicit -> explicit
       end
 
+    # engine may be {:error, reason} if LlmHandler construction failed (e.g.
+    # no api key resolved from --api-key-env). Rather than booting a reactor
+    # with a dead engine that silently answers nothing, we still boot but
+    # warn LOUDLY so the operator knows the daemon cannot actually run the
+    # model. See ADLC P5 (PR #5), round 4 medium-severity finding: the prior
+    # :none path was silent. Fail-fast (returning {:error, :no_api_key}) would
+    # break the many degraded-reactor boots used to exercise the socket /
+    # attestation paths; a loud warning keeps the suite honest without that
+    # blast radius.
+    engine =
+      case engine do
+        {:error, :no_api_key} ->
+          Logger.warning(
+            "kyber: daemon booting :reactor loop without an api key — the engine " <>
+              "is disabled and the model will not run. Pass --api-key-env (or " <>
+              "engine: in opts) to enable inference."
+          )
+
+          :none
+
+        {:error, other} ->
+          Logger.warning("kyber: engine construction failed (#{inspect(other)}); reactor boots without a model")
+          :none
+
+        ok ->
+          ok
+      end
+
     [
       seed: seed,
       budget_cap: Keyword.get(opts, :budget_cap, 32),
@@ -620,12 +645,13 @@ defmodule Kyber.Daemon do
   end
 
   # builds the engine opt list [llm: llm, tools: []] from daemon llm opts.
-  # Returns :none only if LlmHandler construction fails (shouldn't — it
-  # always constructs, defaulting to k3).
+  # Returns {:error, reason} if LlmHandler construction fails (e.g. no
+  # api key), so the caller can fail the boot loudly instead of starting a
+  # reactor with a dead engine.
   defp build_daemon_engine(seed, llm_opts) do
     case Kyber.Agent.Reactor.llm_for(seed, llm_opts) do
       {:ok, llm} -> [llm: llm, tools: []]
-      {:error, _} -> :none
+      {:error, reason} -> {:error, reason}
     end
   end
 

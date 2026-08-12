@@ -205,32 +205,28 @@ defmodule Kyber.Channel.Socket do
   defp recent?(ts, now) when is_number(ts), do: now - ts <= @dup_window_ms
   defp recent?(_ts, _now), do: false
 
-  # true iff the MessageReceived `msg_id` has been answered: an
-  # InferenceRequested points back at it (promptRef) AND a ResponseDelta
-  # points back at that inference (requestRef). The chain is two hops
-  # (MessageReceived -> InferenceRequested -> ResponseDelta). We match by
-  # pointer role+target, NOT first-pointer order — a valid delta may ship its
-  # pointers in any order.
+  # true iff the MessageReceived `msg_id` has been answered: at least one
+  # InferenceRequested for it (promptRef -> msg_id) has a corresponding
+  # ResponseDelta (requestRef -> that inference). We scan ALL inference
+  # requests for the message (not just the first map match) so that a
+  # failed-then-retried attempt still counts as answered, and the result
+  # is independent of DurableStore.set/0's unordered iteration. The chain
+  # is two hops (MessageReceived -> InferenceRequested -> ResponseDelta),
+  # matched by pointer role+target, not first-pointer order. See ADLC P5
+  # (PR #5), round 4 high-severity finding.
   defp message_answered?(set, msg_id) do
-    with {:ok, inference_id} <- inference_for_message(set, msg_id) do
-      inference_answered?(set, inference_id)
-    else
-      _ -> false
-    end
+    Enum.any?(set, fn {inf_id, {claims, _sig}} ->
+      inference_requested?(claims) and
+        delta_id(pointer_target(claims, "promptRef")) == msg_id and
+        inference_answered?(set, inf_id)
+    end)
   end
 
-  defp inference_for_message(set, msg_id) do
-    Enum.find_value(set, fn {id, {claims, _sig}} ->
-      if delta_id(pointer_target(claims, "promptRef")) == msg_id do
-        id
-      else
-        nil
-      end
+  defp inference_requested?(claims) do
+    Enum.any?(claims.pointers, fn
+      %{role: "type", target: {:entity, "InferenceRequested", _ctx}} -> true
+      _other -> false
     end)
-    |> case do
-      nil -> :none
-      id -> {:ok, id}
-    end
   end
 
   defp inference_answered?(set, inference_id) do

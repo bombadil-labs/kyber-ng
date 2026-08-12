@@ -172,6 +172,54 @@ defmodule Kyber.T15ModelAndCtlTest do
     end
   end
 
+  describe "reactor boot warns (not silent) without an api key (P5 round-4 medium fix)" do
+    test "Daemon.boot(loop: :reactor) with no resolvable key logs a loud warning" do
+      uniq = "#{System.os_time()}-#{System.unique_integer([:positive])}"
+      key_dir = Path.join(System.tmp_dir!(), "kyber-t15-nokey-key-#{uniq}")
+      log_dir = Path.join(System.tmp_dir!(), "kyber-t15-nokey-log-#{uniq}")
+      File.mkdir_p!(key_dir)
+      File.mkdir_p!(log_dir)
+      :ok = Keys.import_human_seed(@seed, key_dir)
+      log_path = Path.join(log_dir, "store.jsonl")
+
+      config_log_path = Application.get_env(:kyber, :log_path)
+      Application.put_env(:kyber, :log_path, log_path)
+      {:ok, _} = Application.ensure_all_started(:kyber)
+      Daemon.stop()
+
+      on_exit(fn ->
+        Daemon.stop()
+        Application.stop(:kyber)
+        Application.put_env(:kyber, :log_path, config_log_path)
+        File.rm_rf(key_dir)
+        File.rm_rf(log_dir)
+      end)
+
+      # api_key: nil is passed explicitly so Reactor.llm_for/2 cannot build an
+      # LlmHandler (strict api_key requirement). The daemon must still boot
+      # but emit a LOUD warning rather than silently running a dead engine.
+      # (Fail-fast would break the suite's many degraded-reactor boots used to
+      # exercise the socket / attestation paths; a warning keeps the operator
+      # informed without that blast radius.)
+      import ExUnit.CaptureLog
+
+      log =
+        capture_log(fn ->
+          assert {:ok, _pid} =
+                   Daemon.boot(
+                     keyring_dir: key_dir,
+                     loop: :reactor,
+                     narrate: false,
+                     channel_socket: :default,
+                     api_key: nil
+                   )
+        end)
+
+      assert log =~ "without an api key",
+             "expected a loud warning when booting :reactor without an api key"
+    end
+  end
+
   describe "ctl client over the channel socket (AC3)" do
     setup do
       uniq = "#{System.os_time()}-#{System.unique_integer([:positive])}"

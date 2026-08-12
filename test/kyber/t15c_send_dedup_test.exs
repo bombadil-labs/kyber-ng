@@ -19,6 +19,19 @@ defmodule Kyber.T15cSendDedupTest do
   @seed String.duplicate("ab", 32)
   @content "T15C_DEDUP_MARKER"
 
+  # module-level capture http for the retry-then-answer test (define at the
+  # top so it is always compiled, unlike a defmodule nested in a test body)
+  defmodule T15cCaptureHttpR do
+    @behaviour Kyber.Agent.HttpClient
+    @impl true
+    def post(_url, _headers, _body, %{reply_to: pid}) do
+      send(pid, {:t15cR_called, self()})
+      receive do: (:t15cR_proceed -> :ok)
+      send(pid, {:t15cR_replied, self()})
+      {:ok, %{status: 200, body: JSON.encode!(%{"choices" => [%{"message" => %{"content" => "ok"}}]})}}
+    end
+  end
+
   describe "re-sent identical operator message is collapsed (AC1)" do
     test "duplicate before reply collapses; re-ask after reply is allowed" do
       uniq = "#{System.os_time()}-#{System.unique_integer([:positive])}"
@@ -171,6 +184,82 @@ defmodule Kyber.T15cSendDedupTest do
 
       after_count = length(Regex.scan(~r/"MessageReceived"/, File.read!(log_path)))
       assert after_count == before + 1, "stale failed-turn message must be re-sendable (not collapsed)"
+    end
+  end
+
+  describe "retry-then-answer does NOT drop a re-send (P5 round-4 high fix)" do
+    @tag :capture_log
+    test "a message with a failed inference + a succeeded retry is answered (not collapsed)" do
+      uniq = "#{System.os_time()}-#{System.unique_integer([:positive])}"
+      key_dir = Path.join(System.tmp_dir!(), "kyber-t15c-key-#{uniq}")
+      log_dir = Path.join(System.tmp_dir!(), "kyber-t15c-log-#{uniq}")
+      File.mkdir_p!(key_dir)
+      File.mkdir_p!(log_dir)
+      :ok = Keys.import_human_seed(@seed, key_dir)
+      log_path = Path.join(log_dir, "store.jsonl")
+      socket_path = log_path <> ".sock"
+
+      {:ok, llm} =
+        LlmHandler.new(seed: @seed, api_key: "test-key-not-real",
+          http: {T15cCaptureHttpR, %{reply_to: self()}})
+
+      config_log_path = Application.get_env(:kyber, :log_path)
+      Application.put_env(:kyber, :log_path, log_path)
+      {:ok, _} = Application.ensure_all_started(:kyber)
+      Daemon.stop()
+
+      on_exit(fn ->
+        Daemon.stop()
+        Application.stop(:kyber)
+        Application.put_env(:kyber, :log_path, config_log_path)
+        File.rm_rf(key_dir)
+        File.rm_rf(log_dir)
+      end)
+
+      {:ok, _pid} =
+        Daemon.boot(
+          keyring_dir: key_dir,
+          loop: :reactor,
+          oracle_seed: :present,
+          operator_seed: @seed,
+          channel_socket: :default,
+          engine: [llm: llm, tools: []]
+        )
+
+      Process.sleep(200)
+
+      ts = System.system_time(:millisecond)
+      msg_id = "msg:retry-R"
+      inf1 = "inf:retry-1"
+      inf2 = "inf:retry-2"
+
+      {:ok, signed_msg} =
+        Kyber.Events.message_received(@seed, ts, msg_id, "channel:tui", "session:tui", @content)
+      wire_msg = Kyber.Wire.envelope(signed_msg)
+      msg_real_id = wire_msg["id"]
+      :ok = Kyber.DurableStore.append(wire_msg)
+
+      {:ok, signed_inf1} =
+        Kyber.Agent.Events.inference_requested(@seed, ts, "deepseek", "session:tui", "conv:1", msg_real_id, [])
+      :ok = Kyber.DurableStore.append(Kyber.Wire.envelope(signed_inf1))
+
+      {:ok, signed_inf2} =
+        Kyber.Agent.Events.inference_requested(@seed, ts, "deepseek", "session:tui", "conv:1", msg_real_id, [])
+      # capture the content-derived delta id from the wire envelope so the
+      # ResponseDelta's requestRef can point at it
+      wire_inf2 = Kyber.Wire.envelope(signed_inf2)
+      inf2_id = wire_inf2["id"]
+      :ok = Kyber.DurableStore.append(wire_inf2)
+
+      {:ok, signed_resp} =
+        Kyber.Agent.Events.response_delta(@seed, ts, inf2_id, 1, "the answer", [])
+      :ok = Kyber.DurableStore.append(Kyber.Wire.envelope(signed_resp))
+
+      before = length(Regex.scan(~r/"MessageReceived"/, File.read!(log_path)))
+      assert {:ok, %{"ok" => true}} = TUI.send_message(socket_path, @content)
+      after_count = length(Regex.scan(~r/"MessageReceived"/, File.read!(log_path)))
+      assert after_count == before + 1,
+             "message with failed-then-succeeded inference must be treated as answered (re-send allowed)"
     end
   end
 end
