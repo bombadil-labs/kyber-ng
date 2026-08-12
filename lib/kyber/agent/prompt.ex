@@ -67,9 +67,17 @@ defmodule Kyber.Agent.Prompt do
                    "Ground your answer in the conversation and memory notes provided. " <>
                    "Use the provided tools when they help."
 
-  @doc "The system prompt — relocated here with `build_messages/4` (the engine references it)."
+  @doc """
+  The system prompt (T15): an app-env override `:kyber, :system_prompt` wins
+  when set, otherwise the pinned kyber substrate default. The engine's
+  assemble path references this; the LlmHandler carries its OWN system prompt
+  for the gather path — both must agree for a coherent persona, so a single
+  boot opt threads to both.
+  """
   @spec system_prompt() :: String.t()
-  def system_prompt, do: @system_prompt
+  def system_prompt do
+    Application.get_env(:kyber, :system_prompt, @system_prompt)
+  end
 
   @doc """
   Assemble the message list for one request from store state: conversation

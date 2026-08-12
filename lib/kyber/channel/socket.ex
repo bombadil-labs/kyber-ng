@@ -140,19 +140,114 @@ defmodule Kyber.Channel.Socket do
         {:reply, {:error, :no_operator_seed}, state}
 
       seed ->
-        ts = 1.0 * System.system_time(:millisecond)
-        {message_id, state} = next_tui_id(state, ts)
-
-        case Events.message_received(seed, ts, message_id, "channel:tui", "session:tui", content) do
-          {:ok, signed} ->
-            case DurableStore.append(Wire.envelope(signed)) do
-              :ok -> {:reply, :ok, state}
-              {:error, _reason} -> {:reply, {:error, :malformed}, state}
-            end
-
-          {:error, _reason} ->
-            {:reply, {:error, :malformed}, state}
+        # T15c: collapse a re-sent operator message whose content matches an
+        # UNANSWERED MessageReceived already in the store. A bare retry / double
+        # tap would otherwise mint a distinct claim (M10) and spawn a fresh
+        # turn — the "triple-send" artifact. An answered message (Wisp has
+        # replied) is NOT a duplicate, so a legitimate re-ask still works.
+        dup = open_duplicate?(content)
+        if dup do
+          {:reply, :ok, state}
+        else
+          mint_and_append(seed, content, state)
         end
+    end
+  end
+
+  # mint a message_received delta and append it; returns {:reply, :ok, state}
+  # on success, {:reply, {:error, :malformed}, state} otherwise.
+  defp mint_and_append(seed, content, state) do
+    ts = 1.0 * System.system_time(:millisecond)
+    {message_id, state} = next_tui_id(state, ts)
+
+    case Events.message_received(seed, ts, message_id, "channel:tui", "session:tui", content) do
+      {:ok, signed} ->
+        case DurableStore.append(Wire.envelope(signed)) do
+          :ok -> {:reply, :ok, state}
+          {:error, _reason} -> {:reply, {:error, :malformed}, state}
+        end
+
+      {:error, _reason} ->
+        {:reply, {:error, :malformed}, state}
+    end
+  end
+
+  # true iff a MessageReceived delta with `content` exists in the store and
+  # has NOT yet been answered (no ResponseDelta/requestRef points at it).
+  defp open_duplicate?(content) do
+    set = DurableStore.set()
+
+    Enum.any?(set, fn {id, {claims, _sig}} ->
+      message_received?(claims) and content_of(claims) == content and
+        not message_answered?(set, id)
+    end)
+  end
+
+  # true iff the MessageReceived `msg_id` has been answered: an
+  # InferenceRequested points back at it (promptRef) AND a ResponseDelta
+  # points back at that inference (requestRef). The chain is two hops
+  # (MessageReceived -> InferenceRequested -> ResponseDelta). We match by
+  # pointer role+target, NOT first-pointer order — a valid delta may ship its
+  # pointers in any order.
+  defp message_answered?(set, msg_id) do
+    with {:ok, inference_id} <- inference_for_message(set, msg_id) do
+      inference_answered?(set, inference_id)
+    else
+      _ -> false
+    end
+  end
+
+  defp inference_for_message(set, msg_id) do
+    Enum.find_value(set, fn {id, {claims, _sig}} ->
+      if delta_id(pointer_target(claims, "promptRef")) == msg_id do
+        id
+      else
+        nil
+      end
+    end)
+    |> case do
+      nil -> :none
+      id -> {:ok, id}
+    end
+  end
+
+  defp inference_answered?(set, inference_id) do
+    Enum.any?(set, fn {_id, {claims, _sig}} ->
+      response_delta?(claims) and delta_id(pointer_target(claims, "requestRef")) == inference_id
+    end)
+  end
+
+  defp response_delta?(claims) do
+    Enum.any?(claims.pointers, fn
+      %{role: "type", target: {:entity, "ResponseDelta", _ctx}} -> true
+      _other -> false
+    end)
+  end
+
+  # a delta pointer target decodes to {:delta, id, ctx} (or {:delta, id});
+  # return just the id so callers compare order/arity-independently.
+  defp delta_id({:delta, id, _ctx}), do: id
+  defp delta_id({:delta, id}), do: id
+  defp delta_id(_), do: nil
+
+  defp pointer_target(claims, role) do
+    case Enum.find(claims.pointers, fn %{role: r} -> r == role; _ -> false end) do
+      %{target: target} -> target
+      _ -> nil
+    end
+  end
+
+  defp message_received?(claims) do
+    Enum.any?(claims.pointers, fn
+      %{role: "type", target: {:entity, "MessageReceived", _ctx}} -> true
+      _other -> false
+    end)
+  end
+
+  defp content_of(claims) do
+    case Enum.find(claims.pointers, fn %{role: "content"} -> true; _ -> false end) do
+      %{target: {:string, text}} -> text
+      _ -> nil
     end
   end
 

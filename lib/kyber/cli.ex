@@ -49,6 +49,8 @@ defmodule Kyber.CLI do
     send <host> <port>                     Federation.export -> the peer; prints its status line; exit 0
     tui [--log <path>] [--socket <path>]   non-booting client: connect to a running daemon's channel
                                            socket, stream the log tail, send operator messages; blocks
+    ctl --log <path> <send|status|tail|tick> [msg]   non-interactive control client over the
+                                           daemon's channel socket; exit-coded; never boots :kyber
     discord --server <id> --token-env <VAR> [daemon opts]
                                            boot the channel daemon + the Discord gateway (profile
                                            MANDATORY; the token env NAME only, never a value); blocks
@@ -146,6 +148,10 @@ defmodule Kyber.CLI do
   defp command_class(["help"]), do: {:usage, 0}
   defp command_class(["help" | _rest]), do: {:usage, 2}
   defp command_class(["tui" | _rest]), do: :no_boot
+  # T15: `ctl` is a non-booting client like `tui` — its --log rides AFTER the
+  # command (M14), so it must NOT trip the stray-log rejection that the :run
+  # class applies. Route it to :no_boot so run/1 dispatches it directly.
+  defp command_class(["ctl" | _rest]), do: :no_boot
   defp command_class(_command), do: :run
 
   defp boot_and_run(command_argv, log_path) do
@@ -269,7 +275,57 @@ defmodule Kyber.CLI do
     case parse_tui(argv) do
       {:ok, opts} -> cmd_tui(opts)
       {:error, :usage} -> {:error, :usage, @usage}
-      :not_tui -> run_discord(argv)
+      :not_tui -> run_ctl(argv)
+    end
+  end
+
+  # T15: the `ctl` control client — a non-interactive, exit-coded operator
+  # surface over the daemon's channel socket (the SAME JSONL protocol the TUI
+  # and Discord gateway speak). `ctl` never boots :kyber.
+  defp run_ctl(argv) do
+    case parse_ctl(argv) do
+      {:ok, opts} -> cmd_ctl(opts)
+      {:error, :usage} -> {:error, :usage, @usage}
+      :not_ctl -> run_discord(argv)
+    end
+  end
+
+  defp parse_ctl(["ctl" | rest]), do: ctl_opts(rest, %{log: nil, socket: nil, verb: nil, content: nil})
+  defp parse_ctl(_argv), do: :not_ctl
+
+  defp ctl_opts([], %{verb: nil} = _opts), do: {:error, :usage}
+  defp ctl_opts([], opts), do: {:ok, opts}
+  defp ctl_opts(["--log", path | rest], %{log: nil} = opts), do: ctl_opts(rest, %{opts | log: path})
+  defp ctl_opts(["--socket", path | rest], %{socket: nil} = opts), do: ctl_opts(rest, %{opts | socket: path})
+  defp ctl_opts(["send", content | rest], %{verb: nil} = opts), do: ctl_opts(rest, %{opts | verb: "send", content: content})
+  defp ctl_opts(["status" | rest], %{verb: nil} = opts), do: ctl_opts(rest, %{opts | verb: "status"})
+  defp ctl_opts(["tail" | rest], %{verb: nil} = opts), do: ctl_opts(rest, %{opts | verb: "tail"})
+  defp ctl_opts(["tick" | rest], %{verb: nil} = opts), do: ctl_opts(rest, %{opts | verb: "tick"})
+  defp ctl_opts(_other, _opts), do: {:error, :usage}
+
+  defp cmd_ctl(opts) do
+    log_path = opts.log || default_log_path()
+    socket_path = opts.socket || log_path <> ".sock"
+
+    case Kyber.CLI.TUI.connect(socket_path) do
+      {:ok, socket} ->
+        :gen_tcp.close(socket)
+
+        result =
+          case opts.verb do
+            "send" -> Kyber.CLI.TUI.send_message(socket_path, opts.content)
+            "status" -> Kyber.CLI.TUI.status(socket_path)
+            "tail" -> Kyber.CLI.TUI.request(socket_path, %{"verb" => "tail"})
+            "tick" -> Kyber.CLI.TUI.tick(socket_path)
+          end
+
+        case result do
+          {:ok, map} -> {:ok, inspect(map)}
+          {:error, reason} -> {:error, format_error(reason)}
+        end
+
+      {:error, _reason} ->
+        {:error, "daemon not running on #{socket_path}"}
     end
   end
 
@@ -352,7 +408,17 @@ defmodule Kyber.CLI do
         loop: nil,
         profile: nil,
         operator_seed_env: nil,
-        channel_socket: nil
+        channel_socket: nil,
+        # T15: model/provider identity for the engine (default k3, overridden
+        # for isolated sibling agents like Wisp). api_key is an ENV NAME
+        # (never a value on argv — ps-visible), resolved at boot like
+        # --operator-seed-env.
+        model: nil,
+        base_url: nil,
+        api_key_env: nil,
+        system_prompt: nil,
+        peer_port: nil,
+        oracle_seed: :absent
       },
       extra
     )
@@ -418,6 +484,31 @@ defmodule Kyber.CLI do
     end
   end
 
+  # T15: model/provider identity flags for an isolated sibling agent.
+  defp daemon_opts(["--model", m | rest], %{model: nil} = opts) when m != "",
+    do: daemon_opts(rest, %{opts | model: m})
+  defp daemon_opts(["--base-url", u | rest], %{base_url: nil} = opts) when u != "",
+    do: daemon_opts(rest, %{opts | base_url: u})
+  # api_key is an ENV NAME (never a value on argv — ps-visible); resolved at boot
+  defp daemon_opts(["--api-key-env", var | rest], %{api_key_env: nil} = opts) when var != "",
+    do: daemon_opts(rest, %{opts | api_key_env: var})
+  defp daemon_opts(["--system-prompt", p | rest], %{system_prompt: nil} = opts) when p != "",
+    do: daemon_opts(rest, %{opts | system_prompt: p})
+  defp daemon_opts(["--peer-port", p | rest], %{peer_port: nil} = opts) do
+    case Integer.parse(p) do
+      {port, ""} when port > 0 and port < 65536 -> daemon_opts(rest, %{opts | peer_port: port})
+      _ -> {:error, :usage}
+    end
+  end
+
+  # T15: oracle seed presence — :present makes the reactor's own signing
+  # seed available so the prompt gate (oracle_gate) allows dispatch; :absent
+  # (default) keeps a bare daemon refuse-only.
+  defp daemon_opts(["--oracle-seed", "present" | rest], opts),
+    do: daemon_opts(rest, %{opts | oracle_seed: :present})
+  defp daemon_opts(["--oracle-seed", "absent" | rest], opts),
+    do: daemon_opts(rest, %{opts | oracle_seed: :absent})
+
   defp daemon_opts(_other, _opts), do: {:error, :usage}
 
   # boot the daemon into the supervision tree and hand main/1 the blocking
@@ -426,6 +517,8 @@ defmodule Kyber.CLI do
   defp cmd_daemon(opts) do
     case resolve_operator_seed(opts) do
       {:ok, operator_seed} ->
+        # T15: resolve the model identity (env NAME -> value, never on argv)
+        api_key = resolve_env_value(opts.api_key_env)
         boot_opts =
           [
             keyring_dir: opts.keyring,
@@ -434,7 +527,13 @@ defmodule Kyber.CLI do
             loop: opts.loop || :ack,
             profile: opts.profile,
             operator_seed: operator_seed,
-            channel_socket: opts.channel_socket
+            channel_socket: opts.channel_socket,
+            api_key: api_key,
+            base_url: opts.base_url,
+            model: opts.model,
+            system_prompt: opts.system_prompt,
+            peer_port: opts.peer_port,
+            oracle_seed: opts.oracle_seed || :absent
           ] ++
             if(opts.tick_ms, do: [tick_ms: opts.tick_ms], else: [])
 
@@ -472,6 +571,12 @@ defmodule Kyber.CLI do
         end
     end
   end
+
+  # T15: generic ENV-NAME -> VALUE resolver for the model api key. An unset or
+  # empty env yields nil (the handler refuses a missing key); the value NEVER
+  # rides argv. Mirrors resolve_operator_seed's ps-safety posture.
+  defp resolve_env_value(nil), do: nil
+  defp resolve_env_value(var) when is_binary(var), do: System.get_env(var)
 
   # -------------------------------------------------------------- T14i
 

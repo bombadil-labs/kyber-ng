@@ -213,6 +213,10 @@ defmodule Kyber.Daemon do
                # the daemon's (never in the app tree, application.ex
                # untouched)
                {:ok, reactor} <- start_reactor(reactor_opts(opts, seed)),
+               # T15: the federation peer — opens a TCP listener so a sibling
+               # agent (e.g. Liet) can import Wisp's signed claims. Only when
+               # --peer-port is supplied; absent = no listener (the default).
+               {:ok, _peer} <- start_peer(opts),
                # T14i (H9): the gateway adapter — daemon-owned like the
                # socket, one per boot, never in the app tree
                {:ok, adapter} <- start_gateway(state, opts) do
@@ -560,17 +564,51 @@ defmodule Kyber.Daemon do
   # hex — the daemon loads no keyring itself) rides the same whitelist,
   # which would otherwise drop the opt before Reactor.start_link.
   defp reactor_opts(opts, seed) do
+    llm_opts = [
+      api_key: Keyword.get(opts, :api_key),
+      base_url: Keyword.get(opts, :base_url),
+      model: Keyword.get(opts, :model),
+      system_prompt: Keyword.get(opts, :system_prompt)
+    ]
+
+    # an explicit engine: opt (e.g. a test-injected stub) wins; otherwise
+    # build one from the daemon's llm opts so a :reactor boot actually runs
+    # the model (defaulting to :none here would leave delegate_to_engine
+    # with a nil engine and never call the model).
+    engine =
+      case Keyword.get(opts, :engine) do
+        nil -> build_daemon_engine(seed, llm_opts)
+        explicit -> explicit
+      end
+
     [
       seed: seed,
       budget_cap: Keyword.get(opts, :budget_cap, 32),
-      engine: Keyword.get(opts, :engine, :none),
+      engine: engine,
       test_pid: Keyword.get(opts, :test_pid),
       operator_seed: Keyword.get(opts, :operator_seed),
       # T14i (D3 — the threading): :profile rides the same whitelist into
       # Reactor.start_link, where the boot_context helper resolves the
       # engine's :boot tuple and the H8 intersect
-      profile: Keyword.get(opts, :profile)
+      profile: Keyword.get(opts, :profile),
+      # T15: model/provider identity for an isolated sibling agent (Wisp).
+      # llm_for/2 threads these to LlmHandler.new; absent => k3 defaults.
+      api_key: Keyword.get(opts, :api_key),
+      base_url: Keyword.get(opts, :base_url),
+      model: Keyword.get(opts, :model),
+      system_prompt: Keyword.get(opts, :system_prompt),
+      peer_port: Keyword.get(opts, :peer_port)
     ]
+  end
+
+  # builds the engine opt list [llm: llm, tools: []] from daemon llm opts.
+  # Returns :none only if LlmHandler construction fails (shouldn't — it
+  # always constructs, defaulting to k3).
+  defp build_daemon_engine(seed, llm_opts) do
+    case Kyber.Agent.Reactor.llm_for(seed, llm_opts) do
+      {:ok, llm} -> [llm: llm, tools: []]
+      {:error, _} -> :none
+    end
   end
 
   defp start_reactor(opts) do
@@ -584,6 +622,16 @@ defmodule Kyber.Daemon do
 
       {:error, reason} ->
         {:error, reason}
+    end
+  end
+
+  # T15: federation peer — opens a TCP listener (Kyber.Peer) when --peer-port
+  # is set, so a sibling agent can import this one's signed claims. Absent
+  # port => no listener (the default; most boots don't federate).
+  defp start_peer(opts) do
+    case Keyword.get(opts, :peer_port) do
+      nil -> {:ok, nil}
+      port when is_integer(port) -> Kyber.Peer.start_link(port: port)
     end
   end
 

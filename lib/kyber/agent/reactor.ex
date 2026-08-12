@@ -476,10 +476,18 @@ defmodule Kyber.Agent.Reactor do
     end
   end
 
-  defp llm_for(seed, opts) do
+  # Builds the engine's LLM handler from daemon-supplied opts (model /
+  # base_url / api_key / system_prompt). Exposed so Daemon.boot can wire a
+  # real engine for a :reactor loop (it must not default to :none — that
+  # leaves delegate_to_engine with a nil engine and the model is never
+  # called). Absent opts => k3 defaults inside LlmHandler.new.
+  def llm_for(seed, opts) do
     case Keyword.get(opts, :llm) do
       %LlmHandler{} = llm -> {:ok, llm}
-      nil -> LlmHandler.new(seed: seed, api_key: Keyword.get(opts, :api_key))
+      nil -> LlmHandler.new(seed: seed, api_key: Keyword.get(opts, :api_key),
+                            base_url: Keyword.get(opts, :base_url),
+                            model: Keyword.get(opts, :model),
+                            system_prompt: Keyword.get(opts, :system_prompt))
     end
   end
 
