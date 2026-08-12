@@ -106,7 +106,12 @@ defmodule Kyber.Daemon do
         Application.put_env(:kyber, :system_prompt, sp)
 
       _ ->
-        :ok
+        # no explicit persona: clear any prior boot's override so the pinned
+        # kyber default is restored (prevents a previous agent's persona
+        # leaking into a default boot in the same BEAM).
+        if Application.get_env(:kyber, :system_prompt) do
+          Application.delete_env(:kyber, :system_prompt)
+        end
     end
 
     if Process.whereis(Kyber.Supervisor) do

@@ -122,6 +122,54 @@ defmodule Kyber.T15ModelAndCtlTest do
 
       assert Kyber.Agent.Prompt.system_prompt() == "You are Wisp, a twitchy scout."
     end
+
+    test "a default boot after a persona boot restores the kyber default (P5 fix)" do
+      uniq = "#{System.os_time()}-#{System.unique_integer([:positive])}"
+      key_dir = Path.join(System.tmp_dir!(), "kyber-t15-spreset-key-#{uniq}")
+      File.mkdir_p!(key_dir)
+      :ok = Keys.import_human_seed(@seed, key_dir)
+      log_path = Path.join([System.tmp_dir!(), "kyber-t15-spreset-log-#{uniq}", "store.jsonl"])
+      File.mkdir_p!(Path.dirname(log_path))
+
+      config_log_path = Application.get_env(:kyber, :log_path)
+      Application.put_env(:kyber, :log_path, log_path)
+      {:ok, _} = Application.ensure_all_started(:kyber)
+      Daemon.stop()
+
+      on_exit(fn ->
+        Daemon.stop()
+        Application.stop(:kyber)
+        Application.put_env(:kyber, :log_path, config_log_path)
+        Application.delete_env(:kyber, :system_prompt)
+        File.rm_rf(key_dir)
+        File.rm_rf(Path.dirname(log_path))
+      end)
+
+      # first boot: Wisp persona
+      {:ok, _} =
+        Daemon.boot(
+          keyring_dir: key_dir,
+          loop: :ack,
+          narrate: false,
+          channel_socket: :default,
+          system_prompt: "You are Wisp, a twitchy scout."
+        )
+
+      assert Kyber.Agent.Prompt.system_prompt() == "You are Wisp, a twitchy scout."
+
+      # second boot: default (no persona) — must NOT leak the Wisp persona
+      Daemon.stop()
+
+      {:ok, _} =
+        Daemon.boot(
+          keyring_dir: key_dir,
+          loop: :ack,
+          narrate: false,
+          channel_socket: :default
+        )
+
+      assert Kyber.Agent.Prompt.system_prompt() =~ "claims substrate"
+    end
   end
 
   describe "ctl client over the channel socket (AC3)" do
@@ -178,6 +226,24 @@ defmodule Kyber.T15ModelAndCtlTest do
       result = TUI.send_message(ctx.socket_path, "hello wisp")
       assert match?({:ok, %{"error" => "no_operator_seed"}}, result) or
              match?({:ok, %{"ok" => true}}, result)
+    end
+
+    @tag :ctl_binary
+    test "ctl binary exits non-zero when the daemon returns an error (AC3, P5 fix)", ctx do
+      {:ok, _pid} =
+        Daemon.boot(
+          keyring_dir: ctx.key_dir,
+          loop: :ack,
+          narrate: false,
+          channel_socket: :default
+        )
+
+      Process.sleep(200)
+
+      escript = Path.join([File.cwd!(), "kyber"])
+      {_out, exit_code} = System.cmd("escript", [escript, "ctl", "--log", ctx.log_path, "send", "hello wisp"])
+      # a daemon that answers no_operator_seed must make the CLI fail, not exit 0
+      assert exit_code != 0
     end
   end
 end

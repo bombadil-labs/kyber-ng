@@ -198,7 +198,7 @@ defmodule Kyber.Channel.Socket do
 
     Enum.any?(set, fn {id, {claims, _sig}} ->
       message_received?(claims) and content_of(claims) == content and
-        not message_answered?(set, id) and recent?(claims.timestamp, now)
+        recent?(claims.timestamp, now) and not message_answered?(set, id)
     end)
   end
 

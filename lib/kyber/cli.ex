@@ -320,8 +320,19 @@ defmodule Kyber.CLI do
           end
 
         case result do
-          {:ok, map} -> {:ok, inspect(map)}
-          {:error, reason} -> {:error, format_error(reason)}
+          {:ok, map} ->
+            # A daemon response carrying an "error" key is a failed request,
+            # not success — surface it as an error so the CLI exits non-zero
+            # (AC3: ctl exits 0/1). Otherwise the calling automation cannot
+            # tell a rejected command from a successful one.
+            if Map.get(map, "error") do
+              {:error, format_error(map["error"])}
+            else
+              {:ok, inspect(map)}
+            end
+
+          {:error, reason} ->
+            {:error, format_error(reason)}
         end
 
       {:error, _reason} ->
