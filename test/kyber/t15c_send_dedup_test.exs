@@ -103,4 +103,74 @@ defmodule Kyber.T15cSendDedupTest do
       assert length(Regex.scan(~r/"MessageReceived"/, store)) == 2
     end
   end
+
+  describe "stale failed-turn MessageReceived does NOT block re-send (P5 fix)" do
+    @tag :capture_log
+    test "an unanswered message whose inference failed/timeout is re-sendable" do
+      uniq = "#{System.os_time()}-#{System.unique_integer([:positive])}"
+      key_dir = Path.join(System.tmp_dir!(), "kyber-t15c-key-#{uniq}")
+      log_dir = Path.join(System.tmp_dir!(), "kyber-t15c-log-#{uniq}")
+      File.mkdir_p!(key_dir)
+      File.mkdir_p!(log_dir)
+      :ok = Keys.import_human_seed(@seed, key_dir)
+      log_path = Path.join(log_dir, "store.jsonl")
+      socket_path = log_path <> ".sock"
+
+      defmodule T15cCaptureHttp2 do
+        @behaviour Kyber.Agent.HttpClient
+        @impl true
+        def post(_url, _headers, _body, %{reply_to: pid}) do
+          send(pid, {:t15c2_called, self()})
+          receive do: (:t15c2_proceed -> :ok)
+          send(pid, {:t15c2_replied, self()})
+          {:ok, %{status: 200, body: JSON.encode!(%{"choices" => [%{"message" => %{"content" => "ok"}}]})}}
+        end
+      end
+
+      {:ok, llm} =
+        LlmHandler.new(seed: @seed, api_key: "test-key-not-real", http: {T15cCaptureHttp2, %{reply_to: self()}})
+
+      config_log_path = Application.get_env(:kyber, :log_path)
+      Application.put_env(:kyber, :log_path, log_path)
+      {:ok, _} = Application.ensure_all_started(:kyber)
+      Daemon.stop()
+
+      on_exit(fn ->
+        Daemon.stop()
+        Application.stop(:kyber)
+        Application.put_env(:kyber, :log_path, config_log_path)
+        File.rm_rf(key_dir)
+        File.rm_rf(log_dir)
+      end)
+
+      {:ok, _pid} =
+        Daemon.boot(
+          keyring_dir: key_dir,
+          loop: :reactor,
+          oracle_seed: :present,
+          operator_seed: @seed,
+          channel_socket: :default,
+          engine: [llm: llm, tools: []]
+        )
+
+      Process.sleep(200)
+
+      # Simulate a FAILED prior turn: a stale (> window) unanswered
+      # MessageReceived with identical content, as if the inference crashed /
+      # timed out and never wrote a ResponseDelta. ADLC P5 flagged that the
+      # old dedup would swallow all future identical re-sends forever.
+      stale_ts = System.system_time(:millisecond) - 60_000
+      {:ok, signed} = Kyber.Events.message_received(@seed, stale_ts, "msg:stale-t15c", "channel:tui", "session:tui", @content)
+      :ok = Kyber.DurableStore.append(Kyber.Wire.envelope(signed))
+
+      before = length(Regex.scan(~r/"MessageReceived"/, File.read!(log_path)))
+
+      # the re-send MUST NOT be collapsed (the stale one is not "open")
+      assert {:ok, %{"ok" => true}} = TUI.send_message(socket_path, @content)
+      assert_receive {:t15c2_called, _}, 30_000
+
+      after_count = length(Regex.scan(~r/"MessageReceived"/, File.read!(log_path)))
+      assert after_count == before + 1, "stale failed-turn message must be re-sendable (not collapsed)"
+    end
+  end
 end

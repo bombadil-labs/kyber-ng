@@ -1,4 +1,11 @@
 defmodule Kyber.Channel.Socket do
+  # T15c: a re-sent operator message is collapsed only if the matching
+  # unanswered MessageReceived is RECENT (within this window). A stale
+  # unanswered one (inference failed / timed out — no ResponseDelta) is NOT
+  # treated as a duplicate, so the operator can re-send and retry. See ADLC
+  # P5 (PR #5).
+  @dup_window_ms 30_000
+
   @moduledoc """
   The daemon-owned channel socket (T14i D6): a stdlib UNIX-domain socket
   `{:local, <log>.sock}` with a PINNED JSONL line frame, owned by the daemon
@@ -140,11 +147,18 @@ defmodule Kyber.Channel.Socket do
         {:reply, {:error, :no_operator_seed}, state}
 
       seed ->
-        # T15c: collapse a re-sent operator message whose content matches an
-        # UNANSWERED MessageReceived already in the store. A bare retry / double
-        # tap would otherwise mint a distinct claim (M10) and spawn a fresh
-        # turn — the "triple-send" artifact. An answered message (Wisp has
-        # replied) is NOT a duplicate, so a legitimate re-ask still works.
+        # T15c: collapse a re-sent operator message whose content matches a
+        # RECENT (within @dup_window_ms) UNANSWERED MessageReceived already in
+        # the store. A bare retry / double-tap would otherwise mint a distinct
+        # claim (M10) and spawn a fresh turn — the "triple-send" artifact. An
+        # answered message (Wisp has replied) is NOT a duplicate, so a
+        # legitimate re-ask still works.
+        #
+        # ADLC P5 (PR #5) catch: the dedup must be time-bounded. An unanswered
+        # MessageReceived whose inference FAILED (network error / timeout /
+        # rate-limit — no ResponseDelta ever lands) must not block identical
+        # re-sends forever. A stale (> window) unanswered one is treated as a
+        # failed turn and is re-sendable; only fresh double-taps collapse.
         dup = open_duplicate?(content)
         if dup do
           {:reply, :ok, state}
@@ -172,16 +186,24 @@ defmodule Kyber.Channel.Socket do
     end
   end
 
-  # true iff a MessageReceived delta with `content` exists in the store and
-  # has NOT yet been answered (no ResponseDelta/requestRef points at it).
+  # true iff a RECENT (within @dup_window_ms) MessageReceived delta with
+  # `content` exists in the store and has NOT yet been answered (no
+  # ResponseDelta/requestRef points at it). The window bounds the collapse:
+  # a stale unanswered MessageReceived (the inference failed / timed out, so
+  # no ResponseDelta ever landed) is NOT treated as a duplicate, so the
+  # operator can re-send and retry. See ADLC P5 (PR #5).
   defp open_duplicate?(content) do
     set = DurableStore.set()
+    now = System.system_time(:millisecond)
 
     Enum.any?(set, fn {id, {claims, _sig}} ->
       message_received?(claims) and content_of(claims) == content and
-        not message_answered?(set, id)
+        not message_answered?(set, id) and recent?(claims.timestamp, now)
     end)
   end
+
+  defp recent?(ts, now) when is_number(ts), do: now - ts <= @dup_window_ms
+  defp recent?(_ts, _now), do: false
 
   # true iff the MessageReceived `msg_id` has been answered: an
   # InferenceRequested points back at it (promptRef) AND a ResponseDelta
