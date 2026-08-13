@@ -1,5 +1,6 @@
 defmodule Kyber.Daemon do
   require Logger
+
   @moduledoc """
   The long-lived process (T10): an agent actually living in the claims
   substrate. The daemon boots against the app-configured store, watches the
@@ -617,7 +618,10 @@ defmodule Kyber.Daemon do
           :none
 
         {:error, other} ->
-          Logger.warning("kyber: engine construction failed (#{inspect(other)}); reactor boots without a model")
+          Logger.warning(
+            "kyber: engine construction failed (#{inspect(other)}); reactor boots without a model"
+          )
+
           :none
 
         ok ->
