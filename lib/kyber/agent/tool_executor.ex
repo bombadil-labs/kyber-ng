@@ -41,7 +41,7 @@ defmodule Kyber.Agent.ToolExecutor do
   """
 
   alias Kyber.{Gather, Schema, Wire}
-  alias Kyber.Agent.{Action, Events, Memory, Policy, Profile, Skill, Tools}
+  alias Kyber.Agent.{Action, Config, Events, Memory, Policy, Profile, Skill, Tools}
   alias Kyber.Agent.Action.Gate
 
   @doc "The stub registry: `tool:echo` answers its args."
@@ -174,6 +174,39 @@ defmodule Kyber.Agent.ToolExecutor do
             "name" => %{"type" => "string", "description" => "The skill name to read."}
           },
           "required" => ["name"]
+        }
+      }
+    }
+  end
+
+  @doc """
+  The self-config tool listing (T17 AC5/AC9): `self_config.set` for
+  `tool_specs`/`tool_key_map` ONLY — the write itself lives in the
+  dedicated `write_and_run` clause, where the grant (`self_config: true`
+  on the live fold), the base_url refusal (P0 — set AND unset), and the
+  AC17 door all run BEFORE any mint. The agent name rides in the handler
+  `:context` (`%{agent: name}`), not in the listing.
+  """
+  @spec self_config_tools(String.t()) :: %{String.t() => map()}
+  def self_config_tools(agent) when is_binary(agent) do
+    %{
+      "self_config.set" => %{
+        description:
+          "Update your own agent configuration (#{agent}). fields is an object over " <>
+            "#{Enum.join(Enum.map(Config.fields(), &Atom.to_string/1), ", ")} plus an " <>
+            "optional \"unset\" list of field names. base_url is operator-only. " <>
+            "Secret fields take env NAMES, never key values.",
+        parameters: %{
+          "type" => "object",
+          "properties" => %{
+            "fields" => %{
+              "type" => "object",
+              "description" =>
+                "The field changes: string values per field name, plus optional " <>
+                  "\"unset\": [field names]."
+            }
+          },
+          "required" => ["fields"]
         }
       }
     }
@@ -544,9 +577,83 @@ defmodule Kyber.Agent.ToolExecutor do
     end
   end
 
+  # T17 AC5/AC9 — the agent's own (opt-in) write path onto its AgentSet
+  # stream. The boundary contract, in order: base_url is refused ALWAYS
+  # (set AND unset — the proxy-exfiltration P0, checked before the grant so
+  # the refusal names the operator regardless); the grant (`self_config:
+  # true` on the LIVE fold) is checked at call time, not boot time; the
+  # AC17 door (Config.validate_fields — secret shapes, unknown fields)
+  # runs before any mint. A refusal mints NO delta. The mint claims the
+  # CALL's timestamp (M6 crash-window dedupe) and the AGENT's seed — the
+  # delta folds only while the grant is live (prospective, negatable).
+  defp write_and_run(set, seed, ts, _call_id, "self_config.set", args, _tools, context) do
+    with {:agent, agent} when is_binary(agent) <- {:agent, context[:agent]},
+         {:ok, fields} <- decode_self_config_args(args),
+         :ok <- refuse_agent_base_url(fields),
+         :ok <- self_config_granted(set, agent),
+         :ok <- door(fields) do
+      case Events.agent_set(seed, ts, agent, fields) do
+        {:ok, signed} -> {[Wire.envelope(signed)], "updated config for " <> agent, "ok"}
+        {:error, reason} -> {[], "self_config refused: " <> inspect(reason), "error"}
+      end
+    else
+      {:agent, _missing} -> {[], "self_config.set requires an agent context", "error"}
+      {:error, reason} -> {[], reason, "error"}
+    end
+  end
+
   defp write_and_run(set, _seed, _ts, _call_id, tool_id, args, tools, context) do
     {result, status} = run(tools, tool_id, args, context, set)
     {[], result, status}
+  end
+
+  defp decode_self_config_args(args) do
+    with {:ok, %{"fields" => raw}} when is_map(raw) <- JSON.decode(args),
+         {:ok, fields} <- atomize_self_config_fields(raw) do
+      {:ok, fields}
+    else
+      {:error, reason} when is_binary(reason) -> {:error, reason}
+      _other -> {:error, "malformed action arguments: " <> args}
+    end
+  end
+
+  defp atomize_self_config_fields(raw) do
+    Enum.reduce_while(raw, {:ok, %{}}, fn
+      {"unset", names}, {:ok, acc} when is_list(names) ->
+        {:cont, {:ok, Map.put(acc, :unset, names)}}
+
+      {"unset", _malformed}, {:ok, _acc} ->
+        {:halt, {:error, "unset must be a list of field names"}}
+
+      {name, value}, {:ok, acc} ->
+        case Enum.find(Config.fields(), &(Atom.to_string(&1) == name)) do
+          nil -> {:halt, {:error, "unknown field: " <> name}}
+          field -> {:cont, {:ok, Map.put(acc, field, value)}}
+        end
+    end)
+  end
+
+  defp refuse_agent_base_url(fields) do
+    if Map.has_key?(fields, :base_url) or "base_url" in Map.get(fields, :unset, []) do
+      {:error, "base_url is operator-attested — only the operator can set or unset it"}
+    else
+      :ok
+    end
+  end
+
+  defp self_config_granted(set, agent) do
+    case Config.resolve(set, agent) do
+      {:ok, %{self_config: true}} -> :ok
+      _other -> {:error, "no live self_config grant for " <> agent}
+    end
+  end
+
+  defp door(fields) do
+    case Config.validate_fields(fields) do
+      :ok -> :ok
+      {:error, {_kind, field, message}} -> {:error, "#{field}: #{message}"}
+      {:error, reason} -> {:error, inspect(reason)}
+    end
   end
 
   # N1 (T14f): the trim-reject lives at the TOOL BOUNDARY — skill.set

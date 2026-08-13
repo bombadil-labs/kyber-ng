@@ -1,0 +1,29 @@
+{
+  "permissions": {
+    "defaultMode": "acceptEdits",
+    "allow": [
+      "Read",
+      "Edit",
+      "Write",
+      "Bash(mix test:*)",
+      "Bash(mix test *)",
+      "Bash(mix test)",
+      "Bash(mix compile)",
+      "Bash(mix format *)",
+      "Bash(mix format --check-formatted *)",
+      "Bash(mix escript.build)",
+      "Bash(git status *)",
+      "Bash(git diff *)",
+      "Bash(git diff --stat *)",
+      "Bash(mkdir -p *)",
+      "Bash(rm -f *)"
+    ],
+    "deny": [
+      "Bash(git commit *)",
+      "Bash(git push *)",
+      "Bash(git checkout -b *)",
+      "Bash(git merge *)",
+      "Bash(gh pr *)"
+    ]
+  }
+}

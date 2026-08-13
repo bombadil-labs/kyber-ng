@@ -12,9 +12,11 @@ defmodule Kyber.Channel.Socket do
   (started under the held lock after the stale-sock reclaim, H2). The
   discovery file IS the socket — no port file exists.
 
-  **The verb set (M7/M8, pinned):** `tail` / `send` / `status` / `tick`.
+  **The verb set (M7/M8, pinned):** `tail` / `send` / `status` / `tick` /
+  `set-config` (T17 AC9).
   Requests are `{"verb":"tail"}`, `{"verb":"send","content":"<text>"}`,
-  `{"verb":"status"}`, `{"verb":"tick"}`; responses are `{"ok":true}` or
+  `{"verb":"status"}`, `{"verb":"tick"}`,
+  `{"verb":"set-config","name":"<agent>","fields":{...}}`; responses are `{"ok":true}` or
   `{"error":"<spelling>"}` with error spellings `no_operator_seed` /
   `unknown_profile` / `malformed`. `tail` is NOT a content stream: the
   socket carries only NEW-LINE NOTIFICATIONS (`{"newline": n}` as the log's
@@ -53,6 +55,8 @@ defmodule Kyber.Channel.Socket do
   use GenServer
 
   alias Kyber.{DurableStore, Events, Log, Wire}
+  alias Kyber.Agent.Config
+  alias Kyber.Agent.Events, as: AgentEvents
 
   @accept_timeout 100
   @recv_timeout 5_000
@@ -164,6 +168,26 @@ defmodule Kyber.Channel.Socket do
           {:reply, :ok, state}
         else
           mint_and_append(seed, content, state)
+        end
+    end
+  end
+
+  @impl true
+  def handle_call({:set_config, name, fields}, _from, state) do
+    # T17 AC9: the same M5 gate as send — the daemon's boot operator seed
+    # signs the AgentSet, an explicit nil check before any mint
+    case state.operator_seed do
+      nil ->
+        {:reply, {:error, :no_operator_seed}, state}
+
+      seed ->
+        ts = 1.0 * System.system_time(:millisecond)
+
+        with {:ok, signed} <- AgentEvents.agent_set(seed, ts, name, fields),
+             :ok <- DurableStore.append(Wire.envelope(signed)) do
+          {:reply, :ok, state}
+        else
+          _refused -> {:reply, {:error, :malformed}, state}
         end
     end
   end
@@ -320,8 +344,52 @@ defmodule Kyber.Channel.Socket do
     respond_and_close(socket, %{"ok" => true})
   end
 
+  # T17 AC9: `set-config` — operator-attested AgentSet writes over the served
+  # channel. The door (AC17: Config.validate_fields — env-NAME-or-ciphertext
+  # secrets, secret-shape scans on soul/system_prompt) runs handler-side
+  # BEFORE the mint rides the server; a refusal carries the legible repair
+  # message and no delta is ever appended.
+  defp dispatch_verb(socket, "set-config", %{"name" => name, "fields" => fields}, state)
+       when is_binary(name) and is_map(fields) do
+    with {:ok, parsed} <- parse_config_fields(fields),
+         :ok <- Config.validate_fields(parsed) do
+      case GenServer.call(state.server, {:set_config, name, parsed}) do
+        :ok -> respond_and_close(socket, %{"ok" => true})
+        {:error, spelling} -> respond_and_close(socket, %{"error" => spelling})
+      end
+    else
+      :malformed ->
+        respond_and_close(socket, %{"error" => "malformed"})
+
+      {:error, {_kind, field, message}} ->
+        respond_and_close(socket, %{"error" => "#{field}: #{message}"})
+    end
+  end
+
+  defp dispatch_verb(socket, "set-config", _request, _state) do
+    respond_and_close(socket, %{"error" => "malformed"})
+  end
+
   defp dispatch_verb(socket, _other, _request, _state) do
     respond_and_close(socket, %{"error" => "malformed"})
+  end
+
+  # string keys off the wire -> the AgentSet field vocabulary; an unknown
+  # field is malformed (a plaintext "api_key" can never ride — AC17)
+  defp parse_config_fields(fields) do
+    Enum.reduce_while(fields, {:ok, %{}}, fn
+      {"unset", names}, {:ok, acc} when is_list(names) ->
+        {:cont, {:ok, Map.put(acc, :unset, names)}}
+
+      {key, value}, {:ok, acc} when is_binary(key) ->
+        case Enum.find(Config.fields(), &(Atom.to_string(&1) == key)) do
+          nil -> {:halt, :malformed}
+          field -> {:cont, {:ok, Map.put(acc, field, value)}}
+        end
+
+      _other, _acc ->
+        {:halt, :malformed}
+    end)
   end
 
   # M10: the daemon-side monotonic per-ms seq — two identical sends in the

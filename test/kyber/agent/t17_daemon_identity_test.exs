@@ -1,0 +1,393 @@
+defmodule Kyber.Agent.T17DaemonIdentityTest do
+  @moduledoc """
+  T17 — the daemon's identity layer: hot-swap over the T16 feed (AC10),
+  overrides pinned across re-folds with fold-vs-live status (AC23), the
+  safety harness's explicit failure classifier and bounded agent-only
+  rollback (AC12), the legible missing-key boot refusal (AC18), and
+  boot-time soul minting idempotency (AC6).
+
+  Every store is tmp-only; the operator seed is a test constant; the stub
+  HTTP transport is mode-switched through a public ETS table so a live
+  engine can be made to fail 401 (config-class) or 429 (transient) without
+  any process restart. No `Process.sleep` — status polling rides bounded
+  `Enum.reduce_while` with a timeout-only (clause-free) `receive`.
+  """
+  use ExUnit.Case, async: false
+
+  # engine round-trips under full-suite load exceed ExUnit's 60s default
+  # (same pattern as t15b_engine_cast_test)
+  @moduletag timeout: 300_000
+
+  alias Kyber.{CLI, Daemon, DurableStore, Harness, Keys, Schema, Wire}
+  alias Kyber.Agent.Events, as: AgentEvents
+  alias Kyber.Agent.LlmHandler
+
+  @daemon_seed String.duplicate("ab", 32)
+  @operator_seed String.duplicate("7f", 32)
+  @agent_seed String.duplicate("9c", 32)
+  @key_value "sk-t17-super-secret-value-1234567890"
+  @base_ts 1_754_700_000_000.0
+
+  # the mode-switched stub transport: reads {:mode, _} from a public ETS
+  # table on every call — {:fail, status} answers that HTTP status, anything
+  # else answers a canned 200. Every request body is mirrored to the test.
+  defmodule StubHttp do
+    @behaviour Kyber.Agent.HttpClient
+    @impl true
+    def post(_url, _headers, body, %{reply_to: pid, table: table}) do
+      send(pid, {:t17_llm_body, JSON.decode!(body)})
+
+      case :ets.lookup(table, :mode) do
+        [{:mode, {:fail, status}}] ->
+          {:ok, %{status: status, body: JSON.encode!(%{"error" => "stub refusal"})}}
+
+        _ok ->
+          {:ok,
+           %{
+             status: 200,
+             body: JSON.encode!(%{"choices" => [%{"message" => %{"content" => "stub: ok"}}]})
+           }}
+      end
+    end
+  end
+
+  setup do
+    uniq = "#{System.os_time()}-#{System.unique_integer([:positive])}"
+    key_dir = Path.join(System.tmp_dir!(), "kyber-t17di-key-#{uniq}")
+    log_dir = Path.join(System.tmp_dir!(), "kyber-t17di-log-#{uniq}")
+    File.mkdir_p!(key_dir)
+    File.mkdir_p!(log_dir)
+    :ok = Keys.import_human_seed(@daemon_seed, key_dir)
+    log_path = Path.join(log_dir, "store.jsonl")
+
+    config_log_path = Application.get_env(:kyber, :log_path)
+    Application.put_env(:kyber, :log_path, log_path)
+    {:ok, _} = Application.ensure_all_started(:kyber)
+    Daemon.stop()
+    System.put_env("T17_DI_KEY", @key_value)
+
+    on_exit(fn ->
+      Daemon.stop()
+      Application.stop(:kyber)
+      Application.put_env(:kyber, :log_path, config_log_path)
+      System.delete_env("T17_DI_KEY")
+      System.delete_env("T17_DI_OP")
+      File.rm_rf(key_dir)
+      File.rm_rf(log_dir)
+    end)
+
+    %{key_dir: key_dir, log_path: log_path, log_dir: log_dir}
+  end
+
+  # ------------------------------------------------------------- helpers
+
+  defp append_set!(seed, ts, fields, name \\ "wisp") do
+    {:ok, signed} = AgentEvents.agent_set(seed, ts, name, fields)
+    wire = Wire.envelope(signed)
+    :ok = DurableStore.append(wire)
+    wire["id"]
+  end
+
+  defp stub_llm(table, opts) do
+    {:ok, llm} =
+      LlmHandler.new(
+        [
+          seed: @daemon_seed,
+          api_key: @key_value,
+          http: {StubHttp, %{reply_to: self(), table: table}}
+        ] ++ opts
+      )
+
+    llm
+  end
+
+  defp boot!(key_dir, llm, extra) do
+    {:ok, _pid} =
+      Daemon.boot(
+        [
+          keyring_dir: key_dir,
+          tick_ms: :manual,
+          loop: :reactor,
+          oracle_seed: :present,
+          engine: [llm: llm, tools: []],
+          agent: "wisp",
+          operator_seed: @operator_seed,
+          api_key: @key_value
+        ] ++ extra
+      )
+  end
+
+  defp ingest!(key_dir, n) do
+    {:ok, _id} =
+      Harness.ingest(
+        %{
+          "message_id" => "message:t17di:#{n}",
+          "channel_id" => "channel:t17di",
+          "session_id" => "session:t17di",
+          "content" => "hello #{n}",
+          "ts" => 1_754_710_000_000 + n
+        },
+        key_dir
+      )
+  end
+
+  # the no-sleep poll: bounded attempts, clause-free receive (consumes
+  # nothing from the mailbox), re-checks until the condition holds
+  defp eventually(fun, attempts \\ 240) do
+    Enum.reduce_while(1..attempts, false, fn _, _ ->
+      if fun.() do
+        {:halt, true}
+      else
+        receive do
+        after
+          250 -> :timeout
+        end
+
+        {:cont, false}
+      end
+    end)
+  end
+
+  defp live_model, do: get_in(Daemon.status(), [:config, :live, :model])
+
+  defp retract_targets do
+    for {_id, {claims, _sig}} <- DurableStore.set(),
+        %{type: "AgentRetract", negates: {:delta, target, _ctx}} <- [Schema.resolve(claims)],
+        do: target
+  end
+
+  defp rollback_claims do
+    for {_id, {claims, _sig}} <- DurableStore.set(),
+        %{type: "ConfigRollback"} = resolved <- [Schema.resolve(claims)],
+        do: resolved
+  end
+
+  defp soul_mints do
+    for {id, {claims, _sig}} <- DurableStore.set(),
+        %{type: "IdentitySet", kind: "soul"} <- [Schema.resolve(claims)],
+        do: {id, claims}
+  end
+
+  # ------------------------------------------------------------- the tests
+
+  test "an AgentSet delta hot-swaps the live engine mid-session (AC10)", %{key_dir: key_dir} do
+    table = :ets.new(:t17_stub, [:public])
+    :ets.insert(table, {:mode, :ok})
+
+    append_set!(@operator_seed, @base_ts, %{model: "kimi-base", api_key_env: "T17_DI_KEY"})
+    boot!(key_dir, stub_llm(table, model: "kimi-base"), model: "kimi-base")
+
+    append_set!(@operator_seed, @base_ts + 10, %{model: "kimi-hot"})
+
+    assert eventually(fn -> live_model() == "kimi-hot" end),
+           "the live engine never swapped to kimi-hot (status: #{inspect(Daemon.status())})"
+
+    # the NEXT inference cycle runs the rederived config — no reboot
+    ingest!(key_dir, 1)
+    assert_receive {:t17_llm_body, body}, 60_000
+    assert body["model"] == "kimi-hot"
+  end
+
+  test "a CLI override survives the hot-swap; status shows fold AND live (AC23)", %{
+    key_dir: key_dir
+  } do
+    table = :ets.new(:t17_stub, [:public])
+    :ets.insert(table, {:mode, :ok})
+
+    append_set!(@operator_seed, @base_ts, %{model: "kimi-base", api_key_env: "T17_DI_KEY"})
+
+    boot!(key_dir, stub_llm(table, model: "kimi-k3"),
+      model: "kimi-k3",
+      overrides: [model: "kimi-k3"]
+    )
+
+    # hot-swap an UNRELATED field
+    append_set!(@operator_seed, @base_ts + 10, %{soul: "I am wisp, re-souled."})
+
+    assert eventually(fn ->
+             get_in(Daemon.status(), [:config, :fold, :soul]) == "I am wisp, re-souled."
+           end)
+
+    status = Daemon.status()
+    # the override is re-applied after the re-fold: live stays kimi-k3
+    assert get_in(status, [:config, :live, :model]) == "kimi-k3"
+    # ...and status exposes the fold value DISTINCTLY (never silently agrees)
+    assert get_in(status, [:config, :fold, :model]) == "kimi-base"
+
+    ingest!(key_dir, 1)
+    assert_receive {:t17_llm_body, body}, 60_000
+    assert body["model"] == "kimi-k3"
+  end
+
+  test "N consecutive config-class failures retract the agent's delta (AC12)", %{
+    key_dir: key_dir
+  } do
+    table = :ets.new(:t17_stub, [:public])
+    :ets.insert(table, {:mode, :ok})
+
+    append_set!(@operator_seed, @base_ts, %{
+      model: "kimi-base",
+      api_key_env: "T17_DI_KEY",
+      self_config: "true"
+    })
+
+    boot!(key_dir, stub_llm(table, model: "kimi-base"),
+      model: "kimi-base",
+      test_pid: self(),
+      rollback_threshold: 2
+    )
+
+    # the agent self-configures a broken model (granted by the operator)
+    agent_delta = append_set!(@agent_seed, @base_ts + 10, %{model: "kimi-broken"})
+    assert eventually(fn -> live_model() == "kimi-broken" end)
+
+    # first inference after the self-config delta fails config-class (401)
+    :ets.insert(table, {:mode, {:fail, 401}})
+    ingest!(key_dir, 1)
+    assert_receive {:engine, {:llm_error, {:llm_http, 401, _body}}}, 60_000
+    ingest!(key_dir, 2)
+    assert_receive {:engine, {:llm_error, {:llm_http, 401, _body}}}, 60_000
+
+    # the harness auto-appends the retraction + the ConfigRollback claim
+    assert eventually(fn -> agent_delta in retract_targets() end),
+           "the offending agent delta was never retracted"
+
+    assert [rollback | _rest] = rollback_claims()
+    assert Enum.any?(rollback.offends, &match?({:delta, ^agent_delta, _ctx}, &1))
+
+    # the fold steps back and the LIVE engine follows
+    assert eventually(fn -> live_model() == "kimi-base" end)
+    assert Daemon.status().rollbacks == 1
+  end
+
+  test "transient failures (429) never retract — a brownout destroys no deltas (AC12)", %{
+    key_dir: key_dir
+  } do
+    table = :ets.new(:t17_stub, [:public])
+    :ets.insert(table, {:mode, :ok})
+
+    append_set!(@operator_seed, @base_ts, %{
+      model: "kimi-base",
+      api_key_env: "T17_DI_KEY",
+      self_config: "true"
+    })
+
+    boot!(key_dir, stub_llm(table, model: "kimi-base"),
+      model: "kimi-base",
+      test_pid: self(),
+      rollback_threshold: 2
+    )
+
+    append_set!(@agent_seed, @base_ts + 10, %{model: "kimi-broken"})
+    assert eventually(fn -> live_model() == "kimi-broken" end)
+
+    :ets.insert(table, {:mode, {:fail, 429}})
+    ingest!(key_dir, 1)
+    assert_receive {:engine, {:llm_error, {:llm_http, 429, _body}}}, 60_000
+    ingest!(key_dir, 2)
+    assert_receive {:engine, {:llm_error, {:llm_http, 429, _body}}}, 60_000
+
+    # the status call serializes AFTER the daemon processed both engine
+    # events (the reactor forwards to the daemon BEFORE the test observer)
+    status = Daemon.status()
+    assert status.rollbacks == 0
+    assert retract_targets() == []
+    assert live_model() == "kimi-broken"
+  end
+
+  test "an operator-attested bad delta is detection-only — never auto-retracted (AC12)", %{
+    key_dir: key_dir
+  } do
+    table = :ets.new(:t17_stub, [:public])
+    :ets.insert(table, {:mode, :ok})
+
+    append_set!(@operator_seed, @base_ts, %{model: "kimi-base", api_key_env: "T17_DI_KEY"})
+
+    boot!(key_dir, stub_llm(table, model: "kimi-base"),
+      model: "kimi-base",
+      test_pid: self(),
+      rollback_threshold: 2
+    )
+
+    # the OPERATOR ships the bad config
+    append_set!(@operator_seed, @base_ts + 10, %{model: "kimi-broken"})
+    assert eventually(fn -> live_model() == "kimi-broken" end)
+
+    :ets.insert(table, {:mode, {:fail, 401}})
+    ingest!(key_dir, 1)
+    assert_receive {:engine, {:llm_error, {:llm_http, 401, _body}}}, 60_000
+    ingest!(key_dir, 2)
+    assert_receive {:engine, {:llm_error, {:llm_http, 401, _body}}}, 60_000
+
+    status = Daemon.status()
+    assert status.rollbacks == 0
+    assert retract_targets() == []
+    # no silent operator undo: the operator's config stays live
+    assert live_model() == "kimi-broken"
+  end
+
+  test "boot with the key env unset refuses with the legible repair (AC18)" do
+    uniq = "#{System.os_time()}-#{System.unique_integer([:positive])}"
+    registry = Path.join(System.tmp_dir!(), "kyber-t17di-reg-#{uniq}")
+    File.mkdir_p!(registry)
+    on_exit(fn -> File.rm_rf(registry) end)
+
+    System.put_env("T17_DI_OP", @operator_seed)
+    # genesis validation needs the key env present at new-time
+    System.put_env("DEEPSEEK_API_KEY", "test-key-not-real")
+
+    assert {:ok, _msg} =
+             CLI.run([
+               "agent",
+               "new",
+               "wisp",
+               "--soul",
+               "I am wisp.",
+               "--operator-seed-env",
+               "T17_DI_OP",
+               "--registry",
+               registry
+             ])
+
+    System.delete_env("DEEPSEEK_API_KEY")
+
+    assert {:error, message} = CLI.run(["daemon", "--agent", "wisp", "--registry", registry])
+    # agent name, the env var NAME, an exact repair — never the key value
+    assert message =~ "wisp"
+    assert message =~ "DEEPSEEK_API_KEY"
+    assert message =~ "export"
+    refute message =~ "sk-"
+  end
+
+  test "boot mints identity:soul from the fold exactly once (AC6)", %{key_dir: key_dir} do
+    append_set!(@operator_seed, @base_ts, %{
+      soul: "I am wisp, the quiet sibling.",
+      model: "kimi-base",
+      api_key_env: "T17_DI_KEY"
+    })
+
+    {:ok, _pid} =
+      Daemon.boot(
+        keyring_dir: key_dir,
+        tick_ms: :manual,
+        agent: "wisp",
+        operator_seed: @operator_seed
+      )
+
+    assert [{first_id, claims}] = soul_mints()
+    assert claims.author == Keys.author_for_seed(@operator_seed)
+
+    # a second boot over the same store NEVER re-mints
+    Daemon.stop()
+
+    {:ok, _pid} =
+      Daemon.boot(
+        keyring_dir: key_dir,
+        tick_ms: :manual,
+        agent: "wisp",
+        operator_seed: @operator_seed
+      )
+
+    assert [{^first_id, _claims}] = soul_mints()
+  end
+end

@@ -31,10 +31,10 @@ defmodule Kyber.T15ModelAndCtlTest do
       assert h.system_prompt == "You are Wisp, a twitchy scout."
     end
 
-    test "new/1 defaults to k3 when no override supplied (backward-compatible)" do
+    test "new/1 defaults to deepseek when no override supplied (T17 engine default)" do
       {:ok, h} = LlmHandler.new(seed: @seed, api_key: @api_key)
-      assert h.base_url == "https://api.moonshot.ai/v1"
-      assert h.model == "kimi-k3"
+      assert h.base_url == "https://api.deepseek.com/v1"
+      assert h.model == "deepseek-v4-flash"
       assert h.system_prompt =~ "claims substrate"
     end
 

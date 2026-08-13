@@ -31,7 +31,10 @@ defmodule Kyber.CLI do
   never a crash.
   """
 
-  alias Kyber.{Daemon, DurableStore, Federation, Harness, Migration, Peer, Vault}
+  alias Kyber.{Daemon, DeltaSet, DurableStore, Federation, Harness, Migration, Peer, Vault}
+  alias Kyber.{Keys, Log, Schema, Store, Wire}
+  alias Kyber.Agent.{Config, Secrets}
+  alias Kyber.Agent.Events, as: AgentEvents
 
   @usage """
   kyber [--log <path>] <command> [args]
@@ -51,9 +54,31 @@ defmodule Kyber.CLI do
                                            socket, stream the log tail, send operator messages; blocks
     ctl --log <path> <send|status|tail|tick> [msg]   non-interactive control client over the
                                            daemon's channel socket; exit-coded; never boots :kyber
+    ctl --log <path> set-config <name> <json>   append an operator-attested AgentSet delta over the
+                                           served channel (daemon-signed; door-validated)
     discord --server <id> --token-env <VAR> [daemon opts]
                                            boot the channel daemon + the Discord gateway (profile
                                            MANDATORY; the token env NAME only, never a value); blocks
+    agent new <name> --soul <text> [--model ..] [--base-url ..] [--api-key-env NAME]
+              [--operator-seed-env NAME] [--registry <dir>] [--force]
+                                           create an agent: store + genesis (deepseek fallback) delta +
+                                           the operator's seed delta; writes the registry pointer; never boots
+    agent list | show <name>               fold the AgentSet stream and print it (no boot)
+    agent set <name> --<field> <value> ... | set-soul <name> <text> | unset <name> <field>
+                                           append an operator-attested AgentSet delta (only changed
+                                           fields; re-asserting the current value is a no-op).
+                                           --api-key (bare) reads the key from STDIN and stores it
+                                           encrypted; a key VALUE on argv is refused (ps-visible)
+    agent retract <name> <delta-id>        negate a delta; the fold steps back per field
+    agent rekey <name> --new-seed-env NAME re-encrypt {enc} values under a rotated operator seed
+    agent tombstone <name> <delta-id> --field <f> [--rotated <note>]
+                                           the leaked-secret runbook: retract the offending delta,
+                                           append a SecretTombstone claim recording the exposure,
+                                           then ROTATE the credential itself (the store is append-only
+                                           and federates — a leaked value must be considered burned)
+    daemon --agent <name> [--registry <dir>] [daemon opts]
+                                           boot from the registry pointer: store -> fold -> boot opts;
+                                           CLI flags override the fold (overrides never append deltas)
     help | (no args)                       this text; exit 0
     <unknown> | help <extra>               this text; exit 2
   """
@@ -99,6 +124,12 @@ defmodule Kyber.CLI do
       {:no_boot, command_argv, _log_path} ->
         command_argv |> run() |> print_and_halt()
 
+      # T17: a recognized boot command whose pre-boot resolution failed (a
+      # missing --agent pointer) — the clean one-liner, exit 1, NO boot
+      {:fail, message} ->
+        IO.puts(message)
+        System.halt(1)
+
       {:usage, exit_code} ->
         IO.puts(@usage)
         System.halt(exit_code)
@@ -114,10 +145,27 @@ defmodule Kyber.CLI do
   # boot flag, so its validation cannot wait for run/1.
   defp preflight(argv) do
     case parse_daemon(argv) do
-      {:ok, opts} -> {:ok, argv, opts.log}
-      {:error, :usage} -> {:usage, 2}
-      :not_daemon -> preflight_command(argv)
+      {:ok, opts} ->
+        # T17: `daemon --agent <name>` boots on the POINTER's log path —
+        # resolved HERE, pre-boot, so the baked ~/.kyber default is never
+        # opened when the pointer is missing or malformed.
+        case daemon_boot_log(opts) do
+          {:ok, log} -> {:ok, argv, log}
+          {:error, reason} -> {:fail, format_error(reason)}
+        end
+
+      {:error, :usage} ->
+        {:usage, 2}
+
+      :not_daemon ->
+        preflight_command(argv)
     end
+  end
+
+  defp daemon_boot_log(%{agent: nil} = opts), do: {:ok, opts.log}
+
+  defp daemon_boot_log(opts) do
+    with {:ok, pointer} <- agent_read_pointer(opts), do: {:ok, pointer.log_path}
   end
 
   defp preflight_command(argv) do
@@ -152,6 +200,10 @@ defmodule Kyber.CLI do
   # command (M14), so it must NOT trip the stray-log rejection that the :run
   # class applies. Route it to :no_boot so run/1 dispatches it directly.
   defp command_class(["ctl" | _rest]), do: :no_boot
+  # T17: the agent verbs open the store file directly (Log + Store.admit) —
+  # booting :kyber would put a second DurableStore on a possibly-live log
+  # (the N1 trap) AND touch the real ~/.kyber on the baked config path.
+  defp command_class(["agent" | _rest]), do: :no_boot
   defp command_class(_command), do: :run
 
   defp boot_and_run(command_argv, log_path) do
@@ -286,21 +338,57 @@ defmodule Kyber.CLI do
     case parse_ctl(argv) do
       {:ok, opts} -> cmd_ctl(opts)
       {:error, :usage} -> {:error, :usage, @usage}
-      :not_ctl -> run_discord(argv)
+      :not_ctl -> run_agent(argv)
     end
   end
 
-  defp parse_ctl(["ctl" | rest]), do: ctl_opts(rest, %{log: nil, socket: nil, verb: nil, content: nil})
+  # T17: the `agent` verbs — the operator's no-boot mutation surface over an
+  # agent's AgentSet store (see the "agent" section below)
+  defp run_agent(argv) do
+    case parse_agent(argv) do
+      {:ok, opts} -> cmd_agent(opts)
+      {:error, :usage} -> {:error, :usage, @usage}
+      {:error, reason} -> {:error, format_error(reason)}
+      :not_agent -> run_discord(argv)
+    end
+  end
+
+  defp parse_ctl(["ctl" | rest]),
+    do: ctl_opts(rest, %{log: nil, socket: nil, verb: nil, content: nil})
+
   defp parse_ctl(_argv), do: :not_ctl
 
   defp ctl_opts([], %{verb: nil} = _opts), do: {:error, :usage}
   defp ctl_opts([], opts), do: {:ok, opts}
-  defp ctl_opts(["--log", path | rest], %{log: nil} = opts), do: ctl_opts(rest, %{opts | log: path})
-  defp ctl_opts(["--socket", path | rest], %{socket: nil} = opts), do: ctl_opts(rest, %{opts | socket: path})
-  defp ctl_opts(["send", content | rest], %{verb: nil} = opts), do: ctl_opts(rest, %{opts | verb: "send", content: content})
-  defp ctl_opts(["status" | rest], %{verb: nil} = opts), do: ctl_opts(rest, %{opts | verb: "status"})
+
+  defp ctl_opts(["--log", path | rest], %{log: nil} = opts),
+    do: ctl_opts(rest, %{opts | log: path})
+
+  defp ctl_opts(["--socket", path | rest], %{socket: nil} = opts),
+    do: ctl_opts(rest, %{opts | socket: path})
+
+  defp ctl_opts(["send", content | rest], %{verb: nil} = opts),
+    do: ctl_opts(rest, %{opts | verb: "send", content: content})
+
+  defp ctl_opts(["status" | rest], %{verb: nil} = opts),
+    do: ctl_opts(rest, %{opts | verb: "status"})
+
   defp ctl_opts(["tail" | rest], %{verb: nil} = opts), do: ctl_opts(rest, %{opts | verb: "tail"})
   defp ctl_opts(["tick" | rest], %{verb: nil} = opts), do: ctl_opts(rest, %{opts | verb: "tick"})
+
+  # T17 AC9: `set-config <name> <json-object>` — the fields JSON is decoded
+  # at parse time so malformed argv is a usage error, never a socket round
+  # trip; the daemon-side door (AC17) still validates every field
+  defp ctl_opts(["set-config", name, json | rest], %{verb: nil} = opts) do
+    case JSON.decode(json) do
+      {:ok, fields} when is_map(fields) ->
+        ctl_opts(rest, %{opts | verb: "set-config", content: {name, fields}})
+
+      _not_an_object ->
+        {:error, :usage}
+    end
+  end
+
   defp ctl_opts(_other, _opts), do: {:error, :usage}
 
   defp cmd_ctl(opts) do
@@ -317,6 +405,7 @@ defmodule Kyber.CLI do
             "status" -> Kyber.CLI.TUI.status(socket_path)
             "tail" -> Kyber.CLI.TUI.request(socket_path, %{"verb" => "tail"})
             "tick" -> Kyber.CLI.TUI.tick(socket_path)
+            "set-config" -> ctl_set_config(socket_path, opts.content)
           end
 
         case result do
@@ -337,6 +426,671 @@ defmodule Kyber.CLI do
 
       {:error, _reason} ->
         {:error, "daemon not running on #{socket_path}"}
+    end
+  end
+
+  defp ctl_set_config(socket_path, {name, fields}) do
+    Kyber.CLI.TUI.request(socket_path, %{
+      "verb" => "set-config",
+      "name" => name,
+      "fields" => fields
+    })
+  end
+
+  # ------------------------------------------------------------------ agent
+
+  # T17: the genesis default layer — always the FIRST delta `agent new`
+  # appends, so the deepseek fallback is already in the stream (D7: a
+  # default is just an earlier delta; later deltas override; retraction
+  # steps back onto it).
+  @agent_genesis %{
+    base_url: "https://api.deepseek.com/v1",
+    model: "deepseek-v4-flash",
+    api_key_env: "DEEPSEEK_API_KEY",
+    oracle_seed: "absent",
+    loop: "reactor",
+    channel_socket: "default",
+    self_config: "false"
+  }
+
+  # field flags -> the AgentSet field vocabulary (door-validated before any
+  # delta is built)
+  @agent_flag_fields %{
+    "--soul" => :soul,
+    "--model" => :model,
+    "--base-url" => :base_url,
+    "--api-key-env" => :api_key_env,
+    "--system-prompt" => :system_prompt,
+    "--profile" => :profile,
+    "--loop" => :loop,
+    "--oracle-seed" => :oracle_seed,
+    "--channel-socket" => :channel_socket,
+    "--self-config" => :self_config
+  }
+
+  defp parse_agent(["agent" | rest]), do: agent_verb(rest)
+  defp parse_agent(_argv), do: :not_agent
+
+  defp agent_verb(["new", name | rest]), do: agent_named(name, rest, :new)
+  defp agent_verb(["list" | rest]), do: agent_opts(rest, agent_base(:list, nil))
+  defp agent_verb(["show", name | rest]), do: agent_named(name, rest, :show)
+  defp agent_verb(["set", name | rest]), do: agent_named(name, rest, :set)
+
+  defp agent_verb(["set-soul", name, text | rest]) do
+    with {:ok, opts} <- agent_named(name, rest, :set) do
+      if agent_flag?(text),
+        do: {:error, :usage},
+        else: {:ok, %{opts | fields: Map.put(opts.fields, :soul, text)}}
+    end
+  end
+
+  defp agent_verb(["unset", name, field | rest]) do
+    with {:ok, opts} <- agent_named(name, rest, :set) do
+      if agent_flag?(field), do: {:error, :usage}, else: {:ok, %{opts | unset: [field]}}
+    end
+  end
+
+  defp agent_verb(["retract", name, target | rest]) do
+    with {:ok, opts} <- agent_named(name, rest, :retract) do
+      if agent_flag?(target), do: {:error, :usage}, else: {:ok, %{opts | target: target}}
+    end
+  end
+
+  defp agent_verb(["rekey", name | rest]), do: agent_named(name, rest, :rekey)
+
+  defp agent_verb(["tombstone", name, target | rest]) do
+    with {:ok, opts} <- agent_named(name, rest, :tombstone) do
+      if agent_flag?(target), do: {:error, :usage}, else: {:ok, %{opts | target: target}}
+    end
+  end
+
+  defp agent_verb(_other), do: {:error, :usage}
+
+  defp agent_named("--" <> _flag, _rest, _verb), do: {:error, :usage}
+  defp agent_named(name, rest, verb), do: agent_opts(rest, agent_base(verb, name))
+
+  defp agent_flag?(token), do: String.starts_with?(token, "--")
+
+  defp agent_base(verb, name) do
+    %{
+      verb: verb,
+      name: name,
+      registry: nil,
+      operator_seed_env: nil,
+      force: false,
+      fields: %{},
+      unset: [],
+      api_key_stdin: false,
+      new_seed_env: nil,
+      target: nil,
+      field: nil,
+      rotated: nil
+    }
+  end
+
+  defp agent_opts([], opts), do: {:ok, opts}
+
+  defp agent_opts(["--registry", dir | rest], %{registry: nil} = opts) when dir != "",
+    do: agent_opts(rest, %{opts | registry: dir})
+
+  # the signing env NAME — and, on a write, ALSO the recorded
+  # `operator_seed_env` field (so later verbs and the daemon find the seed);
+  # the door refuses a 64-hex VALUE here (AC21)
+  defp agent_opts(["--operator-seed-env", var | rest], %{operator_seed_env: nil} = opts)
+       when var != "",
+       do:
+         agent_opts(rest, %{
+           opts
+           | operator_seed_env: var,
+             fields: Map.put(opts.fields, :operator_seed_env, var)
+         })
+
+  defp agent_opts(["--force" | rest], opts), do: agent_opts(rest, %{opts | force: true})
+
+  defp agent_opts(["--new-seed-env", var | rest], %{new_seed_env: nil} = opts) when var != "",
+    do: agent_opts(rest, %{opts | new_seed_env: var})
+
+  defp agent_opts(["--field", field | rest], %{field: nil} = opts) when field != "",
+    do: agent_opts(rest, %{opts | field: field})
+
+  defp agent_opts(["--rotated", note | rest], %{rotated: nil} = opts) when note != "",
+    do: agent_opts(rest, %{opts | rotated: note})
+
+  defp agent_opts(["--unset", field | rest], opts) when field != "",
+    do: agent_opts(rest, %{opts | unset: opts.unset ++ [field]})
+
+  # --api-key: BARE reads the value from STDIN and stores it encrypted
+  # (AC20); a VALUE on argv is refused outright — argv is ps-visible (AC17)
+  defp agent_opts(["--api-key" | rest], opts) do
+    case rest do
+      [<<"--", _::binary>> | _more] -> agent_opts(rest, %{opts | api_key_stdin: true})
+      [] -> agent_opts([], %{opts | api_key_stdin: true})
+      [_value | _more] -> {:error, :plaintext_key_on_argv}
+    end
+  end
+
+  defp agent_opts([flag, value | rest], opts)
+       when is_map_key(@agent_flag_fields, flag) and value != "" do
+    field = Map.fetch!(@agent_flag_fields, flag)
+
+    if Map.has_key?(opts.fields, field),
+      do: {:error, :usage},
+      else: agent_opts(rest, %{opts | fields: Map.put(opts.fields, field, value)})
+  end
+
+  defp agent_opts(_other, _opts), do: {:error, :usage}
+
+  defp cmd_agent(opts), do: opts |> agent_dispatch() |> finalize()
+
+  defp agent_dispatch(%{verb: :new} = opts), do: agent_new(opts)
+  defp agent_dispatch(%{verb: :list} = opts), do: agent_list(opts)
+  defp agent_dispatch(%{verb: :show} = opts), do: agent_show(opts)
+  defp agent_dispatch(%{verb: :set} = opts), do: agent_set_cmd(opts)
+  defp agent_dispatch(%{verb: :retract} = opts), do: agent_retract_cmd(opts)
+  defp agent_dispatch(%{verb: :rekey} = opts), do: agent_rekey(opts)
+  defp agent_dispatch(%{verb: :tombstone} = opts), do: agent_tombstone(opts)
+
+  # ---- new (AC1/AC14)
+
+  defp agent_new(opts) do
+    paths = agent_paths(agent_registry(opts), opts.name)
+
+    with :ok <- agent_refuse_existing(paths, opts),
+         {:ok, seed, seed_var} <- agent_signing_seed(opts, nil),
+         {:ok, fields} <- agent_stdin_key(opts, opts.fields, seed),
+         fields = Map.put_new(fields, :operator_seed_env, seed_var),
+         :ok <- Config.validate_fields(fields),
+         :ok <- agent_validate_genesis(opts.name, fields) do
+      agent_create(paths, seed, opts.name, fields)
+    end
+  end
+
+  defp agent_refuse_existing(paths, opts) do
+    cond do
+      not File.exists?(paths.dir) ->
+        :ok
+
+      opts.force ->
+        File.rm_rf!(paths.dir)
+        :ok
+
+      true ->
+        {:error, {:agent_exists, opts.name}}
+    end
+  end
+
+  # genesis is validated at new-time (premortem P1): the fallback the
+  # harness steps back to must not be born broken — the EFFECTIVE key env
+  # (the operator's override or the genesis DEEPSEEK_API_KEY) must be
+  # present, unless the key is supplied encrypted.
+  defp agent_validate_genesis(name, fields) do
+    if Map.has_key?(fields, :api_key_enc) do
+      :ok
+    else
+      env = Map.get(fields, :api_key_env, @agent_genesis.api_key_env)
+
+      case System.get_env(env) do
+        value when is_binary(value) and value != "" -> :ok
+        _absent -> {:error, {:agent_key_missing, name, env}}
+      end
+    end
+  end
+
+  defp agent_create(paths, seed, name, fields) do
+    ts = agent_now_ms()
+
+    with :ok <- agent_mkdir(paths.dir),
+         :ok <- Keys.import_human_seed(seed, paths.keyring),
+         :ok <- agent_write_pointer(paths),
+         {:ok, genesis} <- AgentEvents.agent_set(seed, ts, name, @agent_genesis),
+         {:ok, seed_delta} <- AgentEvents.agent_set(seed, ts + 1, name, fields),
+         :ok <- agent_append(paths.store, [genesis, seed_delta]) do
+      {:ok, "agent #{name} created at #{paths.store}"}
+    end
+  end
+
+  defp agent_mkdir(dir) do
+    case File.mkdir_p(dir) do
+      :ok -> :ok
+      {:error, reason} -> {:error, {:mkdir_failed, reason}}
+    end
+  end
+
+  defp agent_write_pointer(paths) do
+    json = JSON.encode!(%{"log_path" => paths.store, "keyring_dir" => paths.keyring})
+
+    case File.write(paths.pointer, json) do
+      :ok -> :ok
+      {:error, reason} -> {:error, {:pointer_write_failed, paths.pointer, reason}}
+    end
+  end
+
+  # ---- list / show (AC7)
+
+  defp agent_list(opts) do
+    registry = agent_registry(opts)
+
+    case File.ls(registry) do
+      {:error, _reason} ->
+        {:ok, ""}
+
+      {:ok, entries} ->
+        lines =
+          entries
+          |> Enum.sort()
+          |> Enum.flat_map(fn name ->
+            store = Path.join([registry, name, "store.jsonl"])
+
+            case Config.resolve(agent_load_set(store), name) do
+              {:ok, view} -> [agent_list_line(view)]
+              :not_found -> []
+            end
+          end)
+
+        {:ok, Enum.join(lines, "\n")}
+    end
+  end
+
+  defp agent_list_line(view) do
+    soul_head =
+      case view.soul do
+        nil -> "-"
+        soul -> soul |> String.split("\n", parts: 2) |> hd()
+      end
+
+    Enum.join([view.name, view.model || "-", view.base_url || "-", soul_head], "  ")
+  end
+
+  defp agent_show(opts) do
+    paths = agent_paths(agent_registry(opts), opts.name)
+
+    if File.exists?(paths.pointer) do
+      set = agent_load_set(paths.store)
+
+      case Config.resolve(set, opts.name) do
+        {:ok, view} ->
+          {:ok, agent_render(view, set)}
+
+        :not_found ->
+          {:ok,
+           "#{opts.name}: no live config (stream fully retracted) — " <>
+             "boot falls through to the engine defaults"}
+      end
+    else
+      {:error, {:unknown_agent, opts.name}}
+    end
+  end
+
+  # the fold, one field per line; `api_key` prints the env NAME or the
+  # ciphertext, never a plaintext value (AC19); the per-field heads print so
+  # the operator can retract by id; tombstones surface (AC24)
+  defp agent_render(view, set) do
+    api_key =
+      case view.api_key do
+        {:env, name} -> "env " <> name
+        {:enc, ciphertext} -> "enc " <> ciphertext
+        nil -> "-"
+      end
+
+    fields = [
+      "name: #{view.name}",
+      "soul: #{view.soul || "-"}",
+      "base_url: #{view.base_url || "-"}",
+      "model: #{view.model || "-"}",
+      "api_key: #{api_key}",
+      "system_prompt: #{view.system_prompt || "-"}",
+      "operator_seed_env: #{view.operator_seed_env || "-"}",
+      "oracle_seed: #{view.oracle_seed || "-"}",
+      "loop: #{view.loop || "-"}",
+      "channel_socket: #{view.channel_socket || "-"}",
+      "profile: #{view.profile || "-"}",
+      "self_config: #{view.self_config}"
+    ]
+
+    heads =
+      view.heads
+      |> Enum.sort()
+      |> Enum.map(fn {field, id} -> "head #{field} #{id}" end)
+
+    Enum.join(fields ++ heads ++ agent_tombstone_lines(view.name, set), "\n")
+  end
+
+  defp agent_tombstone_lines(name, set) do
+    for(
+      {id, {claims, _sig}} <- set,
+      %{
+        type: "SecretTombstone",
+        agent: {:entity, ^name, _ctx},
+        tombstone: {:delta, target, _tctx},
+        field: field
+      } <- [Schema.resolve(claims)],
+      do: "tombstone #{target} field=#{field} (#{id})"
+    )
+    |> Enum.sort()
+  end
+
+  # ---- set / unset / set-soul (AC8)
+
+  defp agent_set_cmd(opts) do
+    # the door runs BEFORE seed resolution: a seed VALUE handed to
+    # --operator-seed-env must be refused as secret-shaped (AC21), not
+    # misread as an unset env NAME
+    with {:ok, paths, set, view} <- agent_open(opts),
+         fields = agent_with_unsets(opts.fields, opts.unset),
+         :ok <- Config.validate_fields(fields),
+         {:ok, seed, _var} <- agent_signing_seed(opts, view, set),
+         {:ok, fields} <- agent_stdin_key(opts, fields, seed) do
+      case Config.changed_fields(view, fields) do
+        changed when changed == %{} ->
+          {:ok, "no change (the fold already carries these values)"}
+
+        changed ->
+          with {:ok, signed} <- AgentEvents.agent_set(seed, agent_now_ms(), opts.name, changed),
+               :ok <- agent_append(paths.store, [signed]) do
+            names =
+              changed |> Map.keys() |> Enum.map(&to_string/1) |> Enum.sort() |> Enum.join(", ")
+
+            {:ok, "updated #{opts.name}: #{names}"}
+          end
+      end
+    end
+  end
+
+  defp agent_with_unsets(fields, []), do: fields
+  defp agent_with_unsets(fields, unset), do: Map.put(fields, :unset, unset)
+
+  # ---- retract (AC13)
+
+  defp agent_retract_cmd(opts) do
+    with {:ok, paths, set, view} <- agent_open(opts),
+         :ok <- agent_known_delta(set, opts.target),
+         {:ok, seed, _var} <- agent_signing_seed(opts, view, set),
+         {:ok, signed} <- AgentEvents.agent_retract(seed, agent_now_ms(), opts.name, opts.target),
+         :ok <- agent_append(paths.store, [signed]) do
+      {:ok, "retracted #{opts.target}"}
+    end
+  end
+
+  # ---- rekey (AC20 premortem)
+
+  defp agent_rekey(%{new_seed_env: nil}), do: {:error, :usage, @usage}
+
+  defp agent_rekey(opts) do
+    with {:ok, paths, _set, view} <- agent_open(opts),
+         :ok <- agent_live_view(view, opts.name),
+         {:ok, old_seed, _var} <- agent_signing_seed(opts, view),
+         {:ok, new_seed} <- agent_seed_from_env(opts.new_seed_env),
+         {:ok, ciphertext} <- agent_enc_key(view, opts.name),
+         {:ok, plaintext} <- agent_decrypt(ciphertext, old_seed, opts.name),
+         {:ok, reencrypted} <- Secrets.encrypt(plaintext, new_seed),
+         {:ok, signed} <-
+           AgentEvents.agent_set(old_seed, agent_now_ms(), opts.name, %{api_key_enc: reencrypted}),
+         :ok <- agent_append(paths.store, [signed]) do
+      {:ok, "rekeyed #{opts.name}: api_key_enc now decrypts under #{opts.new_seed_env}"}
+    end
+  end
+
+  defp agent_enc_key(%{api_key: {:enc, ciphertext}}, _name), do: {:ok, ciphertext}
+  defp agent_enc_key(_view, name), do: {:error, {:nothing_to_rekey, name}}
+
+  defp agent_decrypt(ciphertext, seed, name) do
+    case Secrets.decrypt(ciphertext, seed) do
+      {:ok, plaintext} -> {:ok, plaintext}
+      {:error, :decrypt_failed} -> {:error, {:decrypt_failed, name}}
+    end
+  end
+
+  # ---- tombstone (AC24 — the leaked-secret runbook)
+
+  defp agent_tombstone(%{field: nil}), do: {:error, :usage, @usage}
+
+  defp agent_tombstone(opts) do
+    ts = agent_now_ms()
+
+    with {:ok, paths, set, view} <- agent_open(opts),
+         :ok <- agent_known_delta(set, opts.target),
+         {:ok, seed, _var} <- agent_signing_seed(opts, view, set),
+         {:ok, retraction} <- AgentEvents.agent_retract(seed, ts, opts.name, opts.target),
+         {:ok, tombstone} <-
+           AgentEvents.secret_tombstone(
+             seed,
+             ts + 1,
+             opts.name,
+             opts.target,
+             opts.field,
+             opts.rotated
+           ),
+         :ok <- agent_append(paths.store, [retraction, tombstone]) do
+      {:ok,
+       "tombstoned #{opts.target} (#{opts.field}) — the delta is retracted and the " <>
+         "exposure is recorded; ROTATE the credential now (the leaked value is burned)"}
+    end
+  end
+
+  # ---- shared agent machinery
+
+  defp agent_registry(%{registry: dir}) when is_binary(dir), do: dir
+  defp agent_registry(_opts), do: Path.join(Path.dirname(default_log_path()), "agents")
+
+  defp agent_paths(registry, name) do
+    dir = Path.join(registry, name)
+
+    %{
+      dir: dir,
+      store: Path.join(dir, "store.jsonl"),
+      keyring: Path.join(dir, "keyring"),
+      pointer: Path.join(dir, "agent.json")
+    }
+  end
+
+  # fold a store file WITHOUT booting :kyber (a second DurableStore on a
+  # live log is the N1 trap): raw lines through the door, one delta set out.
+  # A refused/torn line is skipped exactly as DurableStore's replay skips it.
+  defp agent_load_set(store_path) do
+    store_path
+    |> Log.stream()
+    |> Enum.reduce(DeltaSet.new(), fn line, set ->
+      with {:ok, wire} <- JSON.decode(line),
+           {:ok, merged} <- Store.admit(wire, set) do
+        merged
+      else
+        _refused -> set
+      end
+    end)
+  end
+
+  defp agent_open(opts) do
+    paths = agent_paths(agent_registry(opts), opts.name)
+
+    if File.exists?(paths.pointer) do
+      set = agent_load_set(paths.store)
+
+      view =
+        case Config.resolve(set, opts.name) do
+          {:ok, view} -> view
+          :not_found -> nil
+        end
+
+      {:ok, paths, set, view}
+    else
+      {:error, {:unknown_agent, opts.name}}
+    end
+  end
+
+  defp agent_view_or_nil(store_path, name) do
+    case Config.resolve(agent_load_set(store_path), name) do
+      {:ok, view} -> view
+      :not_found -> nil
+    end
+  end
+
+  defp agent_known_delta(set, id) do
+    if Map.has_key?(set, id), do: :ok, else: {:error, {:unknown_delta, id}}
+  end
+
+  defp agent_live_view(nil, name), do: {:error, {:unknown_agent, name}}
+  defp agent_live_view(_view, _name), do: :ok
+
+  # the signing seed: the env NAME comes from --operator-seed-env, else the
+  # fold's recorded operator_seed_env, else the latest env NAME in the store
+  # BYTES (retraction negates the config value, but the store only learns —
+  # a fully-retracted stream must still be amendable by its operator), else
+  # KYBER_OPERATOR_SEED — the VALUE only ever rides the environment (M5/N4)
+  defp agent_signing_seed(opts, view, set \\ nil) do
+    var =
+      opts.operator_seed_env || (view && view.operator_seed_env) ||
+        agent_recorded_seed_env(set, opts.name) || "KYBER_OPERATOR_SEED"
+
+    with {:ok, seed} <- agent_seed_from_env(var), do: {:ok, seed, var}
+  end
+
+  defp agent_recorded_seed_env(nil, _name), do: nil
+
+  defp agent_recorded_seed_env(set, name) do
+    for(
+      {id, {claims, _sig}} <- set,
+      %{type: "AgentSet", agent: {:entity, ^name, _ctx}, operator_seed_env: env} <-
+        [Schema.resolve(claims)],
+      is_binary(env),
+      do: {claims.timestamp, id, env}
+    )
+    |> Enum.sort()
+    |> List.last()
+    |> case do
+      {_ts, _id, env} -> env
+      nil -> nil
+    end
+  end
+
+  defp agent_seed_from_env(var) do
+    case System.get_env(var) do
+      value when is_binary(value) and value != "" ->
+        trimmed = String.trim(value)
+
+        case Base.decode16(trimmed, case: :mixed) do
+          {:ok, <<_::binary-32>>} -> {:ok, String.downcase(trimmed)}
+          _garbage -> {:error, {:invalid_operator_seed, var}}
+        end
+
+      _absent ->
+        {:error, {:no_operator_seed_env, var}}
+    end
+  end
+
+  # a bare --api-key reads ONE line from stdin, encrypts under the operator
+  # seed, and rides as api_key_enc — the plaintext exists only in this
+  # unlogged window (AC20)
+  defp agent_stdin_key(%{api_key_stdin: false}, fields, _seed), do: {:ok, fields}
+
+  defp agent_stdin_key(_opts, fields, seed) do
+    case IO.read(:stdio, :line) do
+      line when is_binary(line) ->
+        value = String.trim(line)
+
+        if value == "" do
+          {:error, :no_stdin_key}
+        else
+          with {:ok, ciphertext} <- Secrets.encrypt(value, seed) do
+            {:ok, Map.put(fields, :api_key_enc, ciphertext)}
+          end
+        end
+
+      _eof_or_error ->
+        {:error, :no_stdin_key}
+    end
+  end
+
+  defp agent_append(store_path, signed_list) do
+    case Log.open(store_path) do
+      {:ok, io} ->
+        result =
+          Enum.reduce_while(signed_list, :ok, fn signed, :ok ->
+            case Log.append(io, Wire.envelope(signed)) do
+              :ok -> {:cont, :ok}
+              {:error, reason} -> {:halt, {:error, reason}}
+            end
+          end)
+
+        File.close(io)
+        result
+
+      {:error, reason} ->
+        {:error, {:store_open_failed, store_path, reason}}
+    end
+  end
+
+  defp agent_now_ms, do: 1.0 * System.system_time(:millisecond)
+
+  defp agent_read_pointer(opts) do
+    paths = agent_paths(agent_registry(opts), opts.agent)
+
+    with {:ok, content} <- File.read(paths.pointer),
+         {:ok, %{"log_path" => log, "keyring_dir" => keyring}}
+         when is_binary(log) and is_binary(keyring) <- JSON.decode(content) do
+      {:ok, %{log_path: log, keyring_dir: keyring}}
+    else
+      _other -> {:error, {:unknown_agent, opts.agent}}
+    end
+  end
+
+  # the CLI flags the operator EXPLICITLY passed — merged LAST over the fold
+  # (AC4: overrides win, never append deltas)
+  defp daemon_override_opts(opts) do
+    [
+      model: opts.model,
+      base_url: opts.base_url,
+      system_prompt: opts.system_prompt,
+      profile: opts.profile,
+      channel_socket: opts.channel_socket,
+      loop: opts.loop,
+      oracle_seed: opts.oracle_seed,
+      peer_port: opts.peer_port
+    ]
+    |> Enum.reject(fn {_key, value} -> value == nil end)
+  end
+
+  defp agent_boot_operator_seed(opts, view) do
+    var = opts.operator_seed_env || (view && view.operator_seed_env)
+
+    case var && System.get_env(var) do
+      nil ->
+        {:ok, nil}
+
+      value ->
+        case Base.decode16(String.trim(value), case: :mixed) do
+          {:ok, <<_::binary-32>>} -> {:ok, String.downcase(String.trim(value))}
+          _garbage -> {:error, :usage}
+        end
+    end
+  end
+
+  # an explicit --api-key-env overrides the fold; otherwise the fold's
+  # tagged union resolves here: {:env, NAME} -> the environment (unset is
+  # the AC18 legible refusal), {:enc, ct} -> decrypt under the operator seed
+  defp agent_boot_api_key(%{api_key_env: env}, _view, _seed) when is_binary(env),
+    do: {:ok, resolve_env_value(env)}
+
+  defp agent_boot_api_key(_opts, nil, _seed), do: {:ok, nil}
+
+  defp agent_boot_api_key(opts, view, operator_seed) do
+    case view.api_key do
+      nil ->
+        {:ok, nil}
+
+      {:env, name} ->
+        case System.get_env(name) do
+          value when is_binary(value) and value != "" -> {:ok, value}
+          _absent -> {:error, {:agent_key_missing, view.name, name}}
+        end
+
+      {:enc, ciphertext} ->
+        if operator_seed == nil do
+          {:error,
+           {:no_operator_seed_env,
+            opts.operator_seed_env || view.operator_seed_env || "KYBER_OPERATOR_SEED"}}
+        else
+          agent_decrypt(ciphertext, operator_seed, view.name)
+        end
     end
   end
 
@@ -429,7 +1183,12 @@ defmodule Kyber.CLI do
         api_key_env: nil,
         system_prompt: nil,
         peer_port: nil,
-        oracle_seed: :absent
+        # nil = "not given" so a fold value can win under --agent (AC4);
+        # the non-agent path defaults it to :absent at cmd_daemon
+        oracle_seed: nil,
+        # T17: boot from the registry pointer + AgentSet fold
+        agent: nil,
+        registry: nil
       },
       extra
     )
@@ -438,16 +1197,17 @@ defmodule Kyber.CLI do
   # L8: `--channel-socket` WITHOUT `--loop reactor` is a usage error, exit 2
   # (under :ack sends persist but get the T10 ack-loop answer — the refusal
   # is evidence-backed)
-  defp daemon_opts([], %{log: log, keyring: keyring} = opts)
-       when is_binary(log) and is_binary(keyring) do
-    if opts.channel_socket != nil and opts.loop != :reactor do
-      {:error, :usage}
-    else
-      {:ok, opts}
+  defp daemon_opts([], opts) do
+    # complete = the T10 explicit pair (--log + --keyring) OR the T17
+    # pointer form (--agent <name>: log and keyring ride the pointer)
+    complete = (is_binary(opts.log) and is_binary(opts.keyring)) or is_binary(opts.agent)
+
+    cond do
+      not complete -> {:error, :usage}
+      opts.channel_socket != nil and opts.loop != :reactor -> {:error, :usage}
+      true -> {:ok, opts}
     end
   end
-
-  defp daemon_opts([], _incomplete), do: {:error, :usage}
 
   defp daemon_opts(["--log", path | rest], %{log: nil} = opts),
     do: daemon_opts(rest, %{opts | log: path})
@@ -498,13 +1258,17 @@ defmodule Kyber.CLI do
   # T15: model/provider identity flags for an isolated sibling agent.
   defp daemon_opts(["--model", m | rest], %{model: nil} = opts) when m != "",
     do: daemon_opts(rest, %{opts | model: m})
+
   defp daemon_opts(["--base-url", u | rest], %{base_url: nil} = opts) when u != "",
     do: daemon_opts(rest, %{opts | base_url: u})
+
   # api_key is an ENV NAME (never a value on argv — ps-visible); resolved at boot
   defp daemon_opts(["--api-key-env", var | rest], %{api_key_env: nil} = opts) when var != "",
     do: daemon_opts(rest, %{opts | api_key_env: var})
+
   defp daemon_opts(["--system-prompt", p | rest], %{system_prompt: nil} = opts) when p != "",
     do: daemon_opts(rest, %{opts | system_prompt: p})
+
   defp daemon_opts(["--peer-port", p | rest], %{peer_port: nil} = opts) do
     case Integer.parse(p) do
       {port, ""} when port > 0 and port < 65536 -> daemon_opts(rest, %{opts | peer_port: port})
@@ -517,10 +1281,66 @@ defmodule Kyber.CLI do
   # (default) keeps a bare daemon refuse-only.
   defp daemon_opts(["--oracle-seed", "present" | rest], opts),
     do: daemon_opts(rest, %{opts | oracle_seed: :present})
+
   defp daemon_opts(["--oracle-seed", "absent" | rest], opts),
     do: daemon_opts(rest, %{opts | oracle_seed: :absent})
 
+  # T17: boot from the registry pointer (`--agent` is sugar over it; the
+  # store implies the identity)
+  defp daemon_opts(["--agent", name | rest], %{agent: nil} = opts) when name != "",
+    do: daemon_opts(rest, %{opts | agent: name})
+
+  defp daemon_opts(["--registry", dir | rest], %{registry: nil} = opts) when dir != "",
+    do: daemon_opts(rest, %{opts | registry: dir})
+
   defp daemon_opts(_other, _opts), do: {:error, :usage}
+
+  # T17 AC2/AC4: pointer -> store -> fold -> boot opts, with CLI flags
+  # overriding the fold (overrides never append deltas). The tagged api_key
+  # resolves to a VALUE only here, at the boot boundary: `{:env, NAME}` from
+  # the environment (unset -> the AC18 legible refusal), `{:enc, ct}`
+  # decrypted under the operator seed in the unlogged window.
+  defp cmd_daemon(%{agent: agent} = opts) when is_binary(agent) do
+    with {:ok, pointer} <- agent_read_pointer(opts),
+         view = agent_view_or_nil(pointer.log_path, agent),
+         {:ok, operator_seed} <- agent_boot_operator_seed(opts, view),
+         {:ok, api_key} <- agent_boot_api_key(opts, view, operator_seed) do
+      overrides = daemon_override_opts(opts)
+      fold_opts = if view, do: Config.boot_opts(view, overrides), else: overrides
+
+      boot_opts =
+        fold_opts
+        |> Keyword.delete(:api_key)
+        |> Keyword.delete(:operator_seed_env)
+        |> Keyword.merge(
+          keyring_dir: pointer.keyring_dir,
+          pulse_only: opts.pulse_only,
+          narrate: true,
+          operator_seed: operator_seed,
+          api_key: api_key,
+          # T17 (AC10/AC23): agent mode — the daemon subscribes to the T16
+          # feed and hot-swaps on AgentSet deltas, with the CLI overrides
+          # pinned across every re-fold
+          agent: agent,
+          overrides: overrides
+        )
+        |> Keyword.put_new(:loop, :ack)
+        |> Keyword.put_new(:oracle_seed, :absent)
+        |> Keyword.merge(if(opts.tick_ms, do: [tick_ms: opts.tick_ms], else: []))
+
+      case Daemon.boot(boot_opts) do
+        {:ok, pid} ->
+          %{log_path: log_path} = Daemon.status()
+          {:ok, {:daemon, "daemon running on #{log_path}", pid}}
+
+        {:error, reason} ->
+          {:error, format_error(reason)}
+      end
+    else
+      {:error, :usage} -> {:error, :usage, @usage}
+      {:error, reason} -> {:error, format_error(reason)}
+    end
+  end
 
   # boot the daemon into the supervision tree and hand main/1 the blocking
   # marker; the printed path comes from the daemon's own status (the store it
@@ -530,6 +1350,7 @@ defmodule Kyber.CLI do
       {:ok, operator_seed} ->
         # T15: resolve the model identity (env NAME -> value, never on argv)
         api_key = resolve_env_value(opts.api_key_env)
+
         boot_opts =
           [
             keyring_dir: opts.keyring,
@@ -599,8 +1420,13 @@ defmodule Kyber.CLI do
   defp parse_tui(_argv), do: :not_tui
 
   defp tui_opts([], opts), do: {:ok, opts}
-  defp tui_opts(["--log", path | rest], %{log: nil} = opts), do: tui_opts(rest, %{opts | log: path})
-  defp tui_opts(["--socket", path | rest], %{socket: nil} = opts), do: tui_opts(rest, %{opts | socket: path})
+
+  defp tui_opts(["--log", path | rest], %{log: nil} = opts),
+    do: tui_opts(rest, %{opts | log: path})
+
+  defp tui_opts(["--socket", path | rest], %{socket: nil} = opts),
+    do: tui_opts(rest, %{opts | socket: path})
+
   defp tui_opts(_other, _opts), do: {:error, :usage}
 
   # H6: the NON-booting TUI command. The socket probe happens here (before
@@ -665,8 +1491,9 @@ defmodule Kyber.CLI do
   defp extract_gateway_flags(["--server", id | rest], %{server: nil} = gateway) when id != "",
     do: extract_gateway_flags(rest, %{gateway | server: id})
 
-  defp extract_gateway_flags(["--token-env", var | rest], %{token_env: nil} = gateway) when var != "",
-    do: extract_gateway_flags(rest, %{gateway | token_env: var})
+  defp extract_gateway_flags(["--token-env", var | rest], %{token_env: nil} = gateway)
+       when var != "",
+       do: extract_gateway_flags(rest, %{gateway | token_env: var})
 
   # token hygiene: a token VALUE on argv is a usage error, exit 2 (ps-visible)
   defp extract_gateway_flags(["--token" | _rest], _gateway), do: {:error, :usage}
@@ -910,5 +1737,42 @@ defmodule Kyber.CLI do
   defp format_error({:unknown_profile, nil}), do: "gateway requires a profile"
   defp format_error({:unknown_profile, name}), do: "unknown profile: #{name}"
   defp format_error({:discord_token_missing, var}), do: "no discord token: #{var}"
+
+  # T17: the agent-identity one-liners
+  defp format_error({:agent_exists, name}),
+    do: "agent #{name} already exists — pass --force to overwrite"
+
+  defp format_error({:unknown_agent, name}),
+    do: "unknown agent: #{name} (a ghost — run `kyber agent new #{name}` first)"
+
+  defp format_error({:no_operator_seed_env, var}),
+    do: "agent: the operator seed env #{var} is unset — export a 64-hex seed value in #{var}"
+
+  defp format_error({:invalid_operator_seed, var}),
+    do: "agent: #{var} does not hold a 64-hex seed — check the value exported in #{var}"
+
+  defp format_error({:agent_key_missing, name, env}),
+    do:
+      "agent #{name}: the provider needs the API key named by #{env} — export #{env} in the environment, then retry"
+
+  defp format_error({:invalid_field, field, message}), do: "#{field}: #{message}"
+
+  defp format_error({:secret_shaped, field, message}),
+    do: "#{field} looks secret-shaped — refused: #{message}"
+
+  defp format_error(:plaintext_key_on_argv),
+    do: "a key VALUE never rides argv (ps-visible) — " <> Config.repair()
+
+  defp format_error(:no_stdin_key),
+    do: "no key on stdin — pipe the secret value: echo $KEY | kyber agent set <name> --api-key"
+
+  defp format_error({:unknown_delta, id}), do: "unknown delta: #{id}"
+
+  defp format_error({:nothing_to_rekey, name}),
+    do: "agent #{name} carries no encrypted key — nothing to rekey"
+
+  defp format_error({:decrypt_failed, name}),
+    do: "agent #{name}: the current operator seed cannot decrypt the stored key — wrong seed?"
+
   defp format_error(other), do: "error: #{inspect(other)}"
 end

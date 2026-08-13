@@ -475,6 +475,83 @@ defmodule Kyber.Agent.Events do
     ])
   end
 
+  # T17: the AgentSet field vocabulary — pointer emission order is FIXED
+  # (array order is part of the content address; a reordered map must not
+  # re-address the delta)
+  @agent_fields ~w(soul base_url model api_key_env api_key_enc system_prompt operator_seed_env oracle_seed loop channel_socket profile self_config)a
+
+  @doc """
+  `AgentSet` — one agent-identity SET delta (T17): the agent's operational
+  identity is an entity folded over its own delta stream (no config file).
+  Each delta carries ONLY the fields it changes (`fields` is a map over
+  #{inspect(@agent_fields)} plus `unset: [names]`); the fold merges
+  per-field, last-set-wins. The name rides as the `agent` entity aggregate
+  key (kind marker first). Secret fields are env NAMES or ciphertext, never
+  plaintext (door-refused upstream, AC17).
+  """
+  @spec agent_set(String.t(), number(), String.t(), map()) ::
+          {:ok, signed()} | {:error, term()}
+  def agent_set(seed, ts, name, fields) do
+    build(seed, ts, "AgentSet", [
+      %{role: "agent", target: {:entity, name, "agents"}},
+      Enum.flat_map(@agent_fields, fn field ->
+        case Map.get(fields, field) do
+          nil -> []
+          value -> [%{role: Atom.to_string(field), target: {:string, value}}]
+        end
+      end),
+      Enum.map(Map.get(fields, :unset, []), &%{role: "unset", target: {:string, &1}})
+    ])
+  end
+
+  @doc """
+  `AgentRetract` — the delta-ID-targeted negation of an `AgentSet` delta
+  (T17, the SkillRetract mirror): retraction-is-negation; the fold steps
+  back PER FIELD to the previous live setter; restore = retract the
+  retraction (recursive-existential liveness).
+  """
+  @spec agent_retract(String.t(), number(), String.t(), String.t()) ::
+          {:ok, signed()} | {:error, term()}
+  def agent_retract(seed, ts, name, target_id) do
+    build(seed, ts, "AgentRetract", [
+      %{role: "agent", target: {:entity, name, "agents"}},
+      %{role: "negates", target: {:delta, target_id, "retracted"}}
+    ])
+  end
+
+  @doc """
+  `ConfigRollback` — the safety harness's rollback notification (T17 AC12):
+  the offending delta ids, the classifier's reason, and the restored field
+  values. Surfaces in `ctl tail`/`status`; the user is always told.
+  """
+  @spec config_rollback(String.t(), number(), String.t(), String.t(), [String.t()], [String.t()]) ::
+          {:ok, signed()} | {:error, term()}
+  def config_rollback(seed, ts, name, reason, offends, restored) do
+    build(seed, ts, "ConfigRollback", [
+      %{role: "rollback", target: {:entity, name, "rollbacks"}},
+      %{role: "reason", target: {:string, reason}},
+      Enum.map(offends, &%{role: "offends", target: {:delta, &1, "rolled_back"}}),
+      Enum.map(restored, &%{role: "restored", target: {:string, &1}})
+    ])
+  end
+
+  @doc """
+  `SecretTombstone` — the secret-exposure record (T17 AC24): the operator
+  retracts the offending delta, appends this tombstone (delta id, field,
+  optional rotated-key pointer), and rotates the credential. The runbook is
+  part of the build, not discovered after the incident.
+  """
+  @spec secret_tombstone(String.t(), number(), String.t(), String.t(), String.t(), String.t() | nil) ::
+          {:ok, signed()} | {:error, term()}
+  def secret_tombstone(seed, ts, name, delta_id, field, rotated \\ nil) do
+    build(seed, ts, "SecretTombstone", [
+      %{role: "tombstone", target: {:delta, delta_id, "exposed"}},
+      %{role: "agent", target: {:entity, name, "agents"}},
+      %{role: "field", target: {:string, field}},
+      if(rotated, do: [%{role: "rotated", target: {:string, rotated}}], else: [])
+    ])
+  end
+
   # ---------------------------------------------------------------- helpers
 
   defp build(seed, ts, type, pointers) do

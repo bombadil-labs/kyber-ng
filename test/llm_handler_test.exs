@@ -75,21 +75,22 @@ defmodule Kyber.Agent.LlmHandlerTest do
     delta
   end
 
-  test "gather calls Moonshot's chat API through the injected adapter and answers a signed response wire" do
+  test "gather calls the provider's chat API through the injected adapter and answers a signed response wire" do
     delta = received_delta(@question)
     ok = {:ok, %{status: 200, body: moonshot_body(@canned_answer)}}
 
     assert {:ok, [wire]} = LlmHandler.gather(handler(ok), [delta])
 
-    # the request that crossed the seam is OpenAI-compatible, Moonshot-based
+    # the request that crossed the seam is OpenAI-compatible, deepseek-based
+    # (T17 engine default)
     assert_receive {:llm_request, url, headers, body}
-    assert url == "https://api.moonshot.ai/v1/chat/completions"
+    assert url == "https://api.deepseek.com/v1/chat/completions"
 
     auth = List.keyfind(headers, ~c"authorization", 0)
     assert auth != nil
     assert List.to_string(elem(auth, 1)) == "Bearer test-key-never-real"
 
-    assert body["model"] == "kimi-k3"
+    assert body["model"] == "deepseek-v4-flash"
     assert List.last(body["messages"]) == %{"role" => "user", "content" => @question}
 
     # the output is an ordinary signed claim: door-verified, agent-authored,

@@ -135,8 +135,9 @@ defmodule Kyber.T15bEngineCastTest do
       refute is_nil(handler.model)
       refute is_nil(handler.system_prompt)
       # the defaults must be the kyber substrate persona, not nil/empty
-      assert handler.base_url == "https://api.moonshot.ai/v1"
-      assert handler.model == "kimi-k3"
+      # (T17 engine default: deepseek — the terminal step-back state)
+      assert handler.base_url == "https://api.deepseek.com/v1"
+      assert handler.model == "deepseek-v4-flash"
       assert handler.system_prompt =~ "claims substrate"
     end
 

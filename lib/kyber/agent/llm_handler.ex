@@ -1,15 +1,24 @@
 defmodule Kyber.Agent.LlmHandler do
   @moduledoc """
   The real model as a gather handler (T11b AC1): an OpenAI-compatible client
-  against Moonshot (base `https://api.moonshot.ai/v1`, model `kimi-k3`),
-  stdlib `:httpc`/`:ssl` only, implementing the gather contract
+  (T17 engine default: base `https://api.deepseek.com/v1`, model
+  `deepseek-v4-flash` — the terminal no-AgentSet state and the harness's
+  terminal step-back land on the operator's provider, user verdict
+  2026-08-13), stdlib `:httpc`/`:ssl` only, implementing the gather contract
   `(delta[]) -> delta[]` — conversation deltas in, ONE signed `llm.response`
   wire out, carrying the model's real, non-deterministic content.
 
   The HTTP client is the `Kyber.Agent.HttpClient` behaviour, injected at
   construction (`{module, state}`); the API key is an explicit constructor
   argument — the handler never reads the environment itself (the CLI reads
-  `MOONSHOT_API_KEY` for the live run; tests pass a fake key to a stub).
+  the named key env for the live run; tests pass a fake key to a stub).
+
+  T17 AC22 — the inference boundary is the LAST redaction layer: inside
+  `chat/3`, in the unlogged usage window, immediately before the provider
+  request is built, every message's content is scanned and any occurrence
+  of a KNOWN secret value (the api_key plus the `:redact` list — operator
+  seed, derived config key) is replaced with `[REDACTED]`, and a
+  conservative shape-scan catches unknown secrets (`Kyber.Agent.Redactor`).
 
   Refusals over repairs: a non-200 answer, a malformed body, a transport
   failure, or a prompt-less context each surface as a tagged error — never a
@@ -17,9 +26,10 @@ defmodule Kyber.Agent.LlmHandler do
   """
 
   alias Kyber.{Events, Keys, Wire}
+  alias Kyber.Agent.Redactor
 
-  @base_url "https://api.moonshot.ai/v1"
-  @model "kimi-k3"
+  @base_url "https://api.deepseek.com/v1"
+  @model "deepseek-v4-flash"
   @system_prompt "You are kyber, an agent living in a claims substrate. " <>
                    "Answer the user's latest message, grounded in the conversation so far."
 
@@ -31,7 +41,8 @@ defmodule Kyber.Agent.LlmHandler do
     :http,
     base_url: @base_url,
     model: @model,
-    system_prompt: @system_prompt
+    system_prompt: @system_prompt,
+    redact: []
   ]
 
   @type t :: %__MODULE__{
@@ -41,7 +52,8 @@ defmodule Kyber.Agent.LlmHandler do
           http: {module(), term()},
           base_url: String.t(),
           model: String.t(),
-          system_prompt: String.t()
+          system_prompt: String.t(),
+          redact: [String.t()]
         }
 
   @doc """
@@ -72,7 +84,8 @@ defmodule Kyber.Agent.LlmHandler do
            http: Keyword.get(opts, :http, {Kyber.Agent.HttpClient.Httpc, nil}),
            base_url: Keyword.get(opts, :base_url, @base_url),
            model: Keyword.get(opts, :model, @model),
-           system_prompt: Keyword.get(opts, :system_prompt, @system_prompt)
+           system_prompt: Keyword.get(opts, :system_prompt, @system_prompt),
+           redact: Keyword.get(opts, :redact, [])
          }}
     end
   end
@@ -152,12 +165,17 @@ defmodule Kyber.Agent.LlmHandler do
           | {:error, term()}
   def chat(%__MODULE__{} = handler, messages, opts) do
     tools = Keyword.get(opts, :tools, [])
+    # AC22: the inference boundary — redact known secret values (and
+    # conservative unknown shapes) in the unlogged window, before the
+    # request exists
+    messages = redact_messages(handler, messages)
 
     body = %{
       "model" => handler.model,
       "messages" => messages,
       # kimi-k3's API accepts ONLY temperature 1 — anything else is a 400
-      # (a live-API constraint no stub test can catch; verified 2026-08-06)
+      # (a live-API constraint no stub test can catch; verified 2026-08-06);
+      # deepseek accepts 1.0 too, so the pin is provider-portable
       "temperature" => 1.0
     }
 
@@ -215,6 +233,22 @@ defmodule Kyber.Agent.LlmHandler do
     if length(parsed) == length(calls),
       do: {:ok, {:tool_calls, parsed}},
       else: {:error, {:llm_malformed, calls}}
+  end
+
+  # short values are skipped: exact-matching a tiny key would shred
+  # legitimate text, and no real credential is under 8 bytes
+  defp redact_messages(handler, messages) do
+    known =
+      [handler.api_key | handler.redact]
+      |> Enum.filter(&(is_binary(&1) and byte_size(&1) >= 8))
+
+    Enum.map(messages, fn
+      %{"content" => content} = message when is_binary(content) ->
+        %{message | "content" => Redactor.redact(content, known)}
+
+      message ->
+        message
+    end)
   end
 
   # -------------------------------------------------------------- response

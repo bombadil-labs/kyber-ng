@@ -6,67 +6,84 @@ success criteria. Hermes owns updating this file; the coding agent does not over
 
 ---
 
-## 0. Next Ralph Loop: T16 — Incremental, federatable indexes over the append-only store
+## 0. Next Ralph Loop: T17 — Agent identity as a delta-folded entity (spin up an agent by name)
 
-**THE LIABILITY → THE STRENGTH (user framing, 2026-08-12):** performance over an append-only
-log is the single biggest thing to get wrong. The store only learns, so every query ("what
-points at this message?", "is this turn answered?", "this hyperview's members") is currently a
-full-scan — and the dedup path the judge already flagged is O(N³). T16 turns that liability
-into the substrate's biggest strength: **indexes become first-class, spawnable, federatable
-things.**
+**THE GAP:** T15 proved the daemon mechanics but every agent boot is a bag of
+CLI flags (`--model`, `--base-url`, `--api-key-env`, `--operator-seed-env`,
+`--oracle-seed`, `--system-prompt`, `--channel-socket`, `--loop`, `--keyring`,
+`--log`) — nothing about *who the agent is* survives between boots. T17 makes
+**an agent an entity folded over its own delta stream** (the house doctrine:
+deltas SET properties, facts merge, values supersede, retraction is negation).
+The agent's operational identity (soul, provider, model, key env, prompts,
+seed policy) lives as `AgentSet` deltas in the agent's own store. **No reified
+config file** — the delta stream is the ONLY source of truth; every mutation
+goes through a delta-generating interface; config is **hot-swappable** (a
+delta takes effect on the next inference cycle); an **automatic retraction
+harness** (last-known-good, per-field, bounded) is the safety net; secrets are
+env-referenced or encrypted-at-rest and never ride the prompt.
 
-- **F1 — incremental dedup index (in-process).** `DurableStore` maintains a dedup index in its
-  own GenServer state, updated exactly once per admitted delta at the `do_append` chokepoint
-  (the store already serializes every append and owns `state.set`). `open_duplicate?/1` reads
-  that index in O(1) instead of scanning — closes the round-5 O(N³) medium.
-- **F2 — append feed / subscribe seam.** `DurableStore` broadcasts each admitted delta (id +
-  parsed claims) to a set of subscriber pids, in commit order, only after the write-ahead
-  commit lands (same ordering guarantee as the existing reactor `notify_reactor` pin-1 seam).
-  This is the rhizomatic door: anything that wants a view of the log subscribes once and
-  receives every delta — no polling `set/0`.
-- **F3 — `IndexServer`, spawnable per container / per hyperview.** A generic GenServer that
-  holds its own `DurableIndex` view, fed by the F2 feed. Spin up one per container, per
-  hyperview, per differently-tuned query — each an isolated process maintaining its own derived
-  map. The default dedup view is one such instance.
-- **F4 — `DurableIndex` pure module.** The index *logic* (new / add_delta / answered? /
-  by_pointer) is a pure, side-effect-free module reused by both the in-process store index (F1)
-  and every spawned `IndexServer` (F3). This is the reusable unit the rhizome forks.
+**Contract:** `.adlc/specs/T17.md` — 24 ACs, premortem-folded (fable-5, 9
+causes), spec-lint 24/24 verified. The spec IS the source of truth for this
+loop; §0 summarizes the shape and the gates.
 
-**FEDERATION / OVERFLOW (the strength, user vision 2026-08-12):** because the index is a
-spawnable process fed by an append-broadcast, the same machinery federates *out* — a
-deployment can spin up new `IndexServer`s on demand to offload indexing, and a `DurableStore`
-canfederate its feed to *other* kyber instances (or to a **loam** instance as an overflow
-index) — the append-only log's "only learns" property makes every index a downstream projection
-that can lag, catch up by replay, and merge by union, never wrong. T16 builds the local
-spawnable primitive + the feed; cross-instance federation and loam-overflow are the next
-loops' consumers of this seam (recorded in §2 backlog).
+- **F1 — `AgentSet` delta + fold.** New declaration delta (mirrors
+  `ProfileSet`): `events.agent_set/…` builder, hyperschema/genesis
+  registration, `Kyber.Agent.Config.resolve/2` fold (per-field last-set-wins,
+  retraction step-back, prospective self_config grant, semantics-aware dedup).
+- **F2 — Boot by name.** `kyber agent new/list/show/set/unset/retract/rekey`
+  (`:no_boot` class) + `--agent <name>` on `daemon`/`discord`; registry
+  pointer `~/.kyber/agents/<name>`; genesis default layer (deepseek) validated
+  at new-time; boot mints `identity:soul` idempotently.
+- **F3 — Hot-swap.** Daemon subscribes (T16 feed) to `AgentSet` deltas;
+  rederives on the next inference cycle; CLI overrides pinned + re-applied
+  after every re-fold; `status` shows fold-vs-live.
+- **F4 — Safety harness.** Per-field retraction on config-class failure
+  (explicit classifier: 400/401/404/missing-env/bind/decrypt = config-class;
+  429/5xx/timeout = transient, never retract); bounded step-back; terminal =
+  engine deepseek defaults; `ConfigRollback` claim + notification.
+- **F5 — Secrets.** Env-name reference OR encrypted-at-rest (`{enc}` AEAD,
+  key derived from operator seed); door refuses plaintext; inference-boundary
+  redactor (`[REDACTED]`); log redaction; `agent rekey`; tombstone runbook.
+- **F6 — Operator-locked base_url.** `base_url` changes fold only when
+  operator-attested (proxy-exfiltration P0); agent self-config may change
+  model/api_key but never base_url.
+- **F7 — Engine default flip.** `llm_handler.ex` fallback moonshot/k3 →
+  deepseek (`https://api.deepseek.com/v1`, `deepseek-v4-flash`,
+  `DEEPSEEK_API_KEY`) — the terminal no-AgentSet state lands on the
+  operator's provider.
 
-**Why now:** PR #5 is merged (T15 / Wisp). The round-5 adversarial review passed the gate but
-flagged the O(N³) dedup scan as scaling debt — a *symptom* of having no index layer at all.
-Every future "what points at X?" question (memory seam T14c, always-on context T14h,
-hyperviews) would reinvent the same scan. Building the index as a spawnable, federatable
-primitive pays the dedup debt AND seeds the later slices' query substrate in one move.
+**Why now:** T16 landed the indexing substrate (PR #8, 2026-08-13). The Wisp
+tire-kick (same day) proved the daemon mechanics work end-to-end but exposed
+the ergonomic cliff: booting Wisp required the full 11-flag incantation, and
+nothing persisted. T17 turns "agent" from a habit into a file-backed, delta-
+folded, hot-swappable, self-healing entity — the prerequisite for spawning
+agents at will (the rhizomatic vision: a kyber store is a loam store).
 
-**Success criteria (exact, testable):**
-- (a) `mix test` green at baseline (631 tests, 1 known `trajectory_test` flake); `open_duplicate?/1`
-  no longer calls `DurableStore.set/0` to answer (TDD: a test asserts the call-count / a store
-  flag).
-- (b) The T15c dedup contract is preserved exactly: recent-unanswered re-send collapses;
-  answered re-ask allowed; stale failed-turn re-send allowed (round-3 + round-4 behavior intact).
-- (c) `DurableStore.subscribe/1` delivers one `{:delta, id, claims}` cast per admitted delta, in
-  commit order, never for a refused delta.
-- (d) A spawned dedup `IndexServer` fed by the feed answers `answered?/1` identically to the
-  in-process index, and re-seeds correctly from `DurableStore.set/0` after a store restart.
-- (e) Indexes are append-only, union-merge derived state (add on admit, never mutate/remove;
-  retraction is a delta the feed delivers and the index ignores/folds) — matches the "store only
-  learns" atom.
-- (f) No `Process.sleep`; `mix format --check-formatted` clean; rails (deps/, spec/, SPEC.md,
-  mix.exs, config/) untouched; real `~/.kyber` never touched.
+**Success criteria (exact, testable — from the spec's ACs):**
+- (a) `kyber agent new wisp --soul "..."` (no provider flags) → store +
+  genesis default + seed deltas; `show` carries deepseek from the genesis
+  layer (AC1/AC14).
+- (b) `kyber daemon --agent wisp` boots with fold-resolved model/base_url/
+  key/soul/seed-policy; live turn answers on deepseek; `Soul:` renders
+  (AC2). `oracle_seed: absent` = refuse-only (AC3).
+- (c) `agent set wisp --model kimi-k3` + hot-swap → next inference runs
+  kimi-k3 without reboot (AC10); CLI override survives a re-fold, `status`
+  shows fold-vs-live (AC23).
+- (d) Per-field harness: stubbed engine fails on the changed provider →
+  exactly the deltas that last set the changed fields retracted,
+  `ConfigRollback` emitted, 429 never rolls back (AC12).
+- (e) Door rejects plaintext secrets (AC17); `{enc}` round-trip works and a
+  wrong-seed boot fails legibly (AC20); redactor strips a key from the
+  assembled context, keeps 64-hex IDs (AC22); `agent rekey` rotates (AC20).
+- (f) `mix test` green at baseline (644 tests pre-T17, 0 failures) + new T17
+  tests; no `Process.sleep`; `mix format --check-formatted` on touched
+  files; rails (deps/, spec/, SPEC.md, mix.exs, config/) untouched; real
+  `~/.kyber` never touched.
 
-**Out of scope (later loops):** a general query DSL / pointer-graph query language; materialized
-hyperviews beyond the dedup view (the spawnable server exists; only dedup ships as a consumer);
-retraction-aware index folding beyond "ignore the negation delta"; cross-instance federation
-and loam-overflow wiring (the F2 seam enables them; the wiring is a later loop).
+**Out of scope (later loops):** multi-provider routing/fallback in one agent;
+in-process siblings / multi-daemon per BEAM; property-scoped self_config
+allowlists (boolean v1); sandboxed tool execution / off-box proxy keys (the
+threat-model follow-ons, §2 backlog); live hot-apply beyond next-inference.
 
 ## 1. Current State (What Works)
 
@@ -179,6 +196,17 @@ and loam-overflow wiring (the F2 seam enables them; the wiring is a later loop).
   challenge it). Also flagged: replay/convergence for late-spawned blind views (can a
   blind view catch pre-spawn claims without a snapshot — `subscribe_seeded` answers
   this, needs a test).
+- **Loop 18 — Browser tool for kyber agents (scoped 2026-08-13, WSL/Windows):** a
+  dedicated Chrome instance on the WINDOWS side driven over CDP (Chrome DevTools
+  Protocol) from the WSL agent — `--user-data-dir=C:\kyber-browser-profile` (NEVER the
+  personal profile; full cookie/session isolation), `--remote-debugging-port=9222`,
+  bound to 127.0.0.1. The agent's tool executor (tool_executor.ex registry) gains
+  `browser.*` tools (goto/click/type/screenshot/read-dom) speaking CDP, behind the
+  same gate as existing tools. Accounts (gmail/github) are logged in ONCE in the
+  dedicated profile by the operator; sessions persist in the profile dir (a
+  filesystem secret like the keyring — NOT in the delta store; T17 redactor covers
+  cookie leakage). Tool grant is opt-in per profile (tool_bounds), mirroring
+  self_config. Deliverable: `Kyber.Agent.Browser` CDP client + tool registrations.
 
 ## 3. Long-Term Vision: Rhizomatic Cognition
 

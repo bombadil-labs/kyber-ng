@@ -158,6 +158,48 @@ defmodule Kyber.Schema.Genesis do
     {"ProfileSet",
      requires: [{"profile", "entity"}, {"rules", "string"}],
      many: [{"rides", "entity"}, {"allow_tool", "string"}, {"families", "string"}]},
+    # T17: the agent-identity aggregate — an agent's operational identity is
+    # an entity folded over its own AgentSet delta stream (no config file;
+    # deltas SET properties, facts merge, values supersede last-set-wins
+    # per field; retraction is negation). The name rides as the `agent`
+    # entity aggregate key; every field is optional (a delta carries only
+    # what it changes); `unset` names fields reset to absent. Secret fields
+    # are env NAMES (`api_key_env`) or AEAD ciphertext (`api_key_enc`) —
+    # NEVER plaintext (door-refused, AC17). The H2c author filter applies
+    # with a PROSPECTIVE self_config grant; base_url folds only when
+    # operator-attested, always (premortem P0).
+    {"AgentSet",
+     requires: [{"agent", "entity"}],
+     many: [{"unset", "string"}],
+     optional: [
+       {"soul", "string"},
+       {"base_url", "string"},
+       {"model", "string"},
+       {"api_key_env", "string"},
+       {"api_key_enc", "string"},
+       {"system_prompt", "string"},
+       {"operator_seed_env", "string"},
+       {"oracle_seed", "string"},
+       {"loop", "string"},
+       {"channel_socket", "string"},
+       {"profile", "string"},
+       {"self_config", "string"}
+     ]},
+    # T17: the delta-ID-targeted negation of an AgentSet delta (the
+    # SkillRetract mirror) — the fold steps back per field to the previous
+    # live setter; the retracted delta stays in the log (store only learns)
+    {"AgentRetract", requires: [{"agent", "entity"}, {"negates", "delta"}]},
+    # T17 (AC12): the safety harness's rollback notification — offending
+    # delta ids, reason, restored field values; surfaces in ctl tail/status
+    {"ConfigRollback",
+     requires: [{"rollback", "entity"}, {"reason", "string"}],
+     many: [{"offends", "delta"}, {"restored", "string"}]},
+    # T17 (AC24): the secret-exposure tombstone — records a plaintext-secret
+    # miss (the retracted delta, the field, an optional rotated-key pointer);
+    # the runbook is part of the build, not discovered after the incident
+    {"SecretTombstone",
+     requires: [{"tombstone", "delta"}, {"agent", "entity"}, {"field", "string"}],
+     optional: [{"rotated", "string"}]},
     # T14h (N5): the always-on context family — StandingDigest is the
     # trajectory view (sessionId FIRST — the kind-marker grammar: routes to
     # no subscription and matches no lens — the digest-of-digest exclusion;

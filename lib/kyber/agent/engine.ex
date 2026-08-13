@@ -86,6 +86,18 @@ defmodule Kyber.Agent.Engine do
   @spec resume(GenServer.server()) :: %{resumed: non_neg_integer(), waiting: non_neg_integer()}
   def resume(engine \\ __MODULE__), do: GenServer.call(engine, :resume, :infinity)
 
+  @doc """
+  T17 (AC10): hot-swap the live LLM configuration — `changes` merges into
+  the handler STRUCT (`struct/2`), so the HTTP transport seam and every
+  unnamed field survive untouched (a test stub stays a stub; the real
+  adapter stays real). The next inference cycle runs the new config; no
+  restart, no re-queue.
+  """
+  @spec swap_llm_config(GenServer.server(), map()) :: :ok
+  def swap_llm_config(engine \\ __MODULE__, changes) when is_map(changes) do
+    GenServer.call(engine, {:swap_llm_config, changes})
+  end
+
   # -------------------------------------------------------------- callbacks
 
   @impl true
@@ -121,6 +133,10 @@ defmodule Kyber.Agent.Engine do
   def handle_call(:status, _from, state) do
     counters = Map.take(state, [:answered, :skipped, :tool_calls])
     {:reply, Map.put(counters, :pending, map_size(state.pending)), state}
+  end
+
+  def handle_call({:swap_llm_config, changes}, _from, state) do
+    {:reply, :ok, %{state | llm: struct(state.llm, changes)}}
   end
 
   def handle_call(:resume, _from, state) do

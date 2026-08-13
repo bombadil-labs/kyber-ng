@@ -58,7 +58,8 @@ defmodule Kyber.Daemon do
   use GenServer
 
   alias Kyber.{AgentLoop, DeltaSet, DurableStore, Gather, Keys, Log, Store, Wire}
-  alias Kyber.Agent.Profile
+  alias Kyber.Agent.{Config, Identity, Profile, Redactor}
+  alias Kyber.Agent.Events, as: AgentEvents
   alias Rhizomatic.Delta
 
   @default_tick_ms 250
@@ -217,6 +218,8 @@ defmodule Kyber.Daemon do
         skipped: 0
       }
 
+      state = agent_identity_init(state, opts)
+
       case loop do
         :reactor ->
           # pin 17: the oracle_seed boot-opt assertion — `:present` appends
@@ -271,6 +274,33 @@ defmodule Kyber.Daemon do
     schedule(state)
     {:noreply, state}
   end
+
+  # T17 (AC10/AC23): the T16 feed watcher — an `AgentSet` on this daemon's
+  # agent hot-swaps the live config AND arms the safety harness; an
+  # `AgentRetract` hot-swaps only (never arms — the harness's own rollback
+  # retractions must not re-arm it into a loop). Everything else is inert.
+  def handle_info({:delta, id, claims}, %{agent: agent} = state) when is_binary(agent) do
+    case Kyber.Schema.resolve(claims) do
+      %{type: "AgentSet", agent: {:entity, ^agent, _ctx}} = resolved ->
+        {:noreply, agent_config_changed(state, id, claims, resolved)}
+
+      %{type: "AgentRetract", agent: {:entity, ^agent, _ctx}} ->
+        {:noreply, agent_hot_swap(state)}
+
+      _other ->
+        {:noreply, state}
+    end
+  end
+
+  def handle_info({:delta, _id, _claims}, state), do: {:noreply, state}
+
+  # T17 (AC12): engine completion signals, forwarded by the reactor (a
+  # send, never a call — pin 26(c)), feed the safety harness.
+  def handle_info({:engine, event}, %{agent: agent} = state) when is_binary(agent) do
+    {:noreply, agent_engine_event(event, state)}
+  end
+
+  def handle_info({:engine, _event}, state), do: {:noreply, state}
 
   # the gather is link-coupled: if it dies abnormally the daemon stops with
   # it (the supervisor's :transient restart re-inits both)
@@ -708,6 +738,71 @@ defmodule Kyber.Daemon do
     end
   end
 
+  # D6: the hot path keeps the oracle gate consistent with the fold. The
+  # gate is a pure store read (reactor pin 16: open iff an unretracted seed
+  # claim exists), so the flip is a delta operation — never reactor state:
+  # fold wants :present with no live seed => append one (the boot shape;
+  # the fixed ts unless a retracted seed already holds that content id, in
+  # which case a fresh ts mints a new claim the dedup can't absorb); fold
+  # wants :absent with a live seed => append its negation (retraction-is-
+  # negation, the store only learns). A gate already matching the fold
+  # appends nothing. Takes effect on the next dispatch — the next
+  # inference cycle, no reboot.
+  defp sync_oracle_gate(state, fold_opts) do
+    # the fold DECLARES the gate only when it sets `oracle_seed` explicitly:
+    # boot_opts/2 rejects nil values, so an ABSENT key means "the fold never
+    # spoke about the gate" — the boot state stands (the operator's boot flag
+    # or the boot-time assert stays). Only an explicit fold value syncs.
+    case Keyword.fetch(fold_opts, :oracle_seed) do
+      :error ->
+        :ok
+
+      {:ok, want} ->
+        {live_id, any_seed?} = seed_claim_state(DurableStore.set())
+
+        cond do
+          want == :present and live_id == nil ->
+            ts = if any_seed?, do: now_ts(), else: @oracle_seed_ts
+            wire = build_signed(state, [%{role: "seed", target: {:entity, "oracle", "seed"}}], ts)
+
+            case DurableStore.append(wire) do
+              :ok -> narrate(state, "oracle gate open via config hot-swap")
+              {:error, reason} -> narrate(state, "oracle gate open refused #{inspect(reason)}")
+            end
+
+          want == :absent and live_id != nil ->
+            wire =
+              build_signed(state, [%{role: "negates", target: {:delta, live_id, "retracted"}}])
+
+            case DurableStore.append(wire) do
+              :ok -> narrate(state, "oracle gate closed via config hot-swap")
+              {:error, reason} -> narrate(state, "oracle gate close refused #{inspect(reason)}")
+            end
+
+          true ->
+            :ok
+        end
+    end
+  end
+
+  # {live unretracted seed claim id | nil, any seed claim at all?} — the
+  # second element tells the re-open path the fixed-content boot id is
+  # already taken by a retracted claim
+  defp seed_claim_state(set) do
+    retracted =
+      for {_id, {claims, _sig}} <- set,
+          %{role: "negates", target: {:delta, target, _ctx}} <- claims.pointers,
+          into: MapSet.new(),
+          do: target
+
+    seeds =
+      for {id, {claims, _sig}} <- set,
+          match?([%{role: "seed"} | _rest], claims.pointers),
+          do: id
+
+    {Enum.find(seeds, &(not MapSet.member?(retracted, &1))), seeds != []}
+  end
+
   # ------------------------------------------------------------------ T14i
 
   # H7: the channel daemon boot consumes the SAME boot_context/1 helper as
@@ -790,6 +885,284 @@ defmodule Kyber.Daemon do
         end
     end
   end
+
+  # ------------------------------------------------------- T17 agent identity
+
+  # Agent mode (`agent:` boot opt): subscribe to the T16 feed, fold the
+  # AgentSet stream into the state, mint the soul (AC6), and carry the
+  # harness/rollback state. Non-agent boots get `agent: nil` and every T17
+  # clause is inert.
+  defp agent_identity_init(state, opts) do
+    case Keyword.get(opts, :agent) do
+      nil ->
+        Map.put(state, :agent, nil)
+
+      agent when is_binary(agent) ->
+        # subscribe BEFORE the fold: a delta landing between the two is both
+        # folded and re-delivered — the hot-swap re-fold is idempotent
+        :ok = DurableStore.subscribe(self())
+
+        state
+        |> Map.merge(%{
+          agent: agent,
+          operator_seed: Keyword.get(opts, :operator_seed),
+          overrides: Keyword.get(opts, :overrides, []),
+          rollback_threshold: Keyword.get(opts, :rollback_threshold, 2),
+          fold_view: agent_fold(agent),
+          live: %{
+            model: Keyword.get(opts, :model),
+            base_url: Keyword.get(opts, :base_url)
+          },
+          boot_api_key: Keyword.get(opts, :api_key),
+          armed: nil,
+          failures: 0,
+          rollbacks: 0,
+          redact: Enum.filter([Keyword.get(opts, :api_key)], &is_binary/1)
+        })
+        |> mint_soul()
+    end
+  end
+
+  defp agent_fold(agent) do
+    case Config.resolve(DurableStore.set(), agent) do
+      {:ok, view} -> view
+      :not_found -> nil
+    end
+  end
+
+  # AC6: boot mints `identity:soul` from the fold's soul — IDEMPOTENT (a
+  # live soul head is never re-minted, and the mint's timestamp is the soul
+  # head delta's own, so a raced double-mint collapses to one content
+  # address). Signed by the operator seed: the identity fold is author-
+  # filtered to the operator (H2), so an agent-signed mint would be inert.
+  defp mint_soul(%{fold_view: %{soul: soul} = view, operator_seed: seed} = state)
+       when is_binary(soul) and is_binary(seed) do
+    set = DurableStore.set()
+
+    case Identity.primitive(set, Keys.author_for_seed(seed), "soul") do
+      {:ok, _live} ->
+        state
+
+      :not_found ->
+        ts = soul_head_ts(set, view)
+        {:ok, signed} = AgentEvents.identity_set(seed, ts, "identity:soul", "soul", soul)
+
+        case DurableStore.append(Wire.envelope(signed)) do
+          :ok -> narrate(state, "minted identity:soul from the #{state.agent} fold")
+          {:error, reason} -> narrate(state, "soul mint refused #{inspect(reason)}")
+        end
+
+        state
+    end
+  end
+
+  defp mint_soul(state), do: state
+
+  defp soul_head_ts(set, view) do
+    case set[view.heads[:soul]] do
+      {claims, _sig} -> claims.timestamp
+      nil -> now_ts()
+    end
+  end
+
+  # an AgentSet on this agent: hot-swap, then ARM the harness — the source
+  # classification (operator vs agent author) decides rollback-vs-detection
+  # when the next inference fails config-class (AC12)
+  defp agent_config_changed(state, id, claims, resolved) do
+    state = agent_hot_swap(state)
+
+    source =
+      case state.fold_view do
+        %{operator_author: author} when author == claims.author -> :operator
+        _other -> :agent
+      end
+
+    fields = agent_delta_fields(resolved)
+    %{state | armed: %{source: source, id: id, fields: fields}, failures: 0}
+  end
+
+  defp agent_delta_fields(resolved) do
+    sets = for field <- Config.fields(), Map.get(resolved, field) != nil, do: field
+
+    unsets =
+      for name <- Map.get(resolved, :unset, []),
+          field = Enum.find(Config.fields(), &(Atom.to_string(&1) == to_string(name))),
+          do: field
+
+    Enum.uniq(sets ++ unsets)
+  end
+
+  # the hot-swap (AC10/AC23): re-fold, re-apply the boot OVERRIDES last
+  # (pinned across every re-fold), rebuild the handler through the SAME
+  # llm_for/2 boot path (absent fields land on the engine's deepseek
+  # defaults — the terminal step-back state), and swap it into the live
+  # engine. Only a :reactor loop has an engine to swap.
+  defp agent_hot_swap(%{loop: :reactor} = state) do
+    view = agent_fold(state.agent)
+    state = %{state | fold_view: view}
+    fold_opts = if view, do: Config.boot_opts(view, state.overrides), else: state.overrides
+    sync_oracle_gate(state, fold_opts)
+
+    with {:ok, api_key} <- agent_swap_key(fold_opts[:api_key], state),
+         llm_opts =
+           [
+             api_key: api_key,
+             base_url: fold_opts[:base_url],
+             model: fold_opts[:model],
+             system_prompt: fold_opts[:system_prompt]
+           ]
+           |> Enum.reject(fn {_k, v} -> is_nil(v) end),
+         {:ok, handler} <- Kyber.Agent.Reactor.llm_for(state.seed, llm_opts),
+         changes = Map.take(handler, [:model, :base_url, :system_prompt, :api_key]),
+         :ok <- Kyber.Agent.Reactor.swap_llm_config(changes) do
+      narrate(state, "config hot-swap #{state.agent}: model #{handler.model}")
+
+      %{
+        state
+        | live: %{model: handler.model, base_url: handler.base_url},
+          redact: Enum.uniq(Enum.filter([api_key | state.redact], &is_binary/1))
+      }
+    else
+      {:error, reason} ->
+        narrate(state, "config hot-swap failed #{inspect(reason)}")
+        agent_failure(state, reason)
+    end
+  end
+
+  defp agent_hot_swap(state), do: %{state | fold_view: agent_fold(state.agent)}
+
+  # the tagged key resolves to a VALUE only here, at the swap boundary; a
+  # fold with no key falls back to the boot-resolved key (the engine keeps
+  # running rather than losing its credential to an unrelated re-fold)
+  defp agent_swap_key({:env, name}, state) do
+    case System.get_env(name) do
+      value when is_binary(value) and value != "" -> {:ok, value}
+      _unset -> {:error, {:agent_key_missing, state.agent, name}}
+    end
+  end
+
+  defp agent_swap_key({:enc, ciphertext}, state) do
+    case state.operator_seed do
+      nil ->
+        {:error, {:decrypt_failed, state.agent}}
+
+      seed ->
+        case Kyber.Agent.Secrets.decrypt(ciphertext, seed) do
+          {:ok, value} -> {:ok, value}
+          {:error, _reason} -> {:error, {:decrypt_failed, state.agent}}
+        end
+    end
+  end
+
+  defp agent_swap_key(nil, state), do: {:ok, state.boot_api_key}
+
+  # AC12: the harness. `answered` resets the consecutive counter; a
+  # config-class llm error counts (transient neither counts nor resets).
+  defp agent_engine_event({:llm_error, reason}, state) do
+    if config_class?(reason), do: agent_failure(state, reason), else: state
+  end
+
+  defp agent_engine_event({:answered, _request_id}, state), do: %{state | failures: 0}
+  defp agent_engine_event(_event, state), do: state
+
+  # the EXPLICIT classifier (premortem fold): 400/401/404, refused/unknown
+  # host binds, missing key env, decrypt failures are CONFIG-CLASS;
+  # 429/5xx/timeouts and everything unrecognized are TRANSIENT (conservative
+  # default — a brownout destroys no good deltas).
+  defp config_class?({:llm_http, status, _body}) when status in [400, 401, 404], do: true
+  defp config_class?({:llm_transport, reason}) when reason in [:econnrefused, :nxdomain], do: true
+  defp config_class?({:agent_key_missing, _agent, _env}), do: true
+  defp config_class?({:decrypt_failed, _agent}), do: true
+  defp config_class?(_reason), do: false
+
+  # no operator seed => the harness cannot sign a retraction: detection only
+  defp agent_failure(%{operator_seed: nil} = state, _reason), do: state
+
+  defp agent_failure(state, reason) do
+    case state.armed do
+      %{source: :agent} = armed ->
+        failures = state.failures + 1
+
+        if failures >= state.rollback_threshold do
+          agent_rollback(state, armed, reason)
+        else
+          %{state | failures: failures}
+        end
+
+      %{source: :operator} ->
+        narrate(
+          state,
+          "config-class failure after an OPERATOR delta (#{inspect(reason)}) — " <>
+            "detection only, no auto-retract (run `kyber agent retract` to step back)"
+        )
+
+        state
+
+      nil ->
+        state
+    end
+  end
+
+  # the bounded, per-FIELD step-back: retract exactly the AGENT-authored
+  # deltas that last set the armed fields (an operator head is NEVER
+  # auto-retracted), then the ConfigRollback notification. The feed then
+  # re-delivers the retractions and the hot-swap restores the live engine.
+  defp agent_rollback(state, armed, reason) do
+    set = DurableStore.set()
+    operator_author = with %{operator_author: author} <- state.fold_view, do: author
+
+    offends =
+      armed.fields
+      |> Enum.map(&(state.fold_view && state.fold_view.heads[&1]))
+      |> Enum.filter(& &1)
+      |> Enum.uniq()
+      |> Enum.filter(fn head_id ->
+        case set[head_id] do
+          {claims, _sig} -> claims.author != operator_author
+          nil -> false
+        end
+      end)
+
+    case offends do
+      [] ->
+        %{state | armed: nil, failures: 0}
+
+      _offending ->
+        ts = now_ts()
+
+        Enum.each(offends, fn target_id ->
+          {:ok, signed} =
+            AgentEvents.agent_retract(state.operator_seed, ts, state.agent, target_id)
+
+          DurableStore.append(Wire.envelope(signed))
+        end)
+
+        restored = Enum.map(armed.fields, &Atom.to_string/1)
+
+        {:ok, rollback} =
+          AgentEvents.config_rollback(
+            state.operator_seed,
+            ts + 1.0,
+            state.agent,
+            "config-class failure: #{inspect(reason)}",
+            offends,
+            restored
+          )
+
+        DurableStore.append(Wire.envelope(rollback))
+
+        narrate(
+          state,
+          "config rollback #{state.agent}: retracted #{length(offends)} delta(s), " <>
+            "restored #{Enum.join(restored, ", ")}"
+        )
+
+        %{state | armed: nil, failures: 0, rollbacks: state.rollbacks + 1}
+    end
+  end
+
+  defp fold_summary(nil), do: nil
+  defp fold_summary(view), do: Map.take(view, [:model, :base_url, :soul, :self_config])
 
   # ------------------------------------------------------------------ lock
 
@@ -881,6 +1254,19 @@ defmodule Kyber.Daemon do
 
   defp boot_reason(reason), do: reason
 
+  # T17 (AC23): agent mode exposes the FOLD value and the LIVE value
+  # DISTINCTLY (they can never silently disagree) plus the rollback counter
+  # (AC12 surfacing). JSON-safe scalars only — never the tagged api_key.
+  defp status_map(%{agent: agent} = state) when is_binary(agent) do
+    state
+    |> Map.take([:cursor, :author, :log_path, :fired, :persisted, :pulsed, :skipped])
+    |> Map.merge(%{
+      agent: agent,
+      rollbacks: state.rollbacks,
+      config: %{fold: fold_summary(state.fold_view), live: state.live}
+    })
+  end
+
   defp status_map(state) do
     Map.take(state, [:cursor, :author, :log_path, :fired, :persisted, :pulsed, :skipped])
   end
@@ -896,6 +1282,11 @@ defmodule Kyber.Daemon do
   defp short(id) when is_binary(id), do: String.slice(id, 0, 8)
   defp short(_id), do: "?"
 
-  defp narrate(%{narrate: true}, message), do: IO.puts(message)
+  # T17 (AC19): the narration path redacts every configured key VALUE (known
+  # from the boot/swap closures) — an error message never echoes a key
+  defp narrate(%{narrate: true} = state, message), do: IO.puts(redact_line(state, message))
   defp narrate(_state, _message), do: :ok
+
+  defp redact_line(%{redact: [_ | _] = values}, message), do: Redactor.redact(message, values)
+  defp redact_line(_state, message), do: message
 end
