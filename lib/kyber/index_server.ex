@@ -28,9 +28,16 @@ defmodule Kyber.IndexServer do
       a permanently-detached server serving stale answers is worse than a
       crash (P5 medium).
     - `seed_from_set: false`: a BLIND view — starts empty and sees only
-      deltas delivered AFTER it attaches. It NEVER converts to a
-      full-history view (P5 medium: the old code re-attached + rebuilt on
-      the first delta, silently violating the blind contract).
+      deltas delivered AFTER it attaches. The contract, stated exactly
+      (fable-5 P5 round 3 — doc and behavior must agree): feed-only during
+      NORMAL operation — it never rebuilds from the full history just
+      because a delta arrives. On STORE RESTART recovery, however, it
+      re-seeds from the set, because deltas committed in the gap between
+      the store reboot and the re-subscribe cannot be reconstructed from
+      the feed alone — a view that missed the gap has no way to know what
+      it missed, and a silently-incomplete index is worse than a seeded
+      one. "Blind" is a startup/steady-state posture, not a guarantee that
+      survives a store crash.
   """
 
   use GenServer

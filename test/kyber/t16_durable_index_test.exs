@@ -363,30 +363,28 @@ defmodule Kyber.T16DurableIndexTest do
     test "seed+attach is atomic: deltas committed between seed and attach are never lost" do
       # the OLD race: seed from set/0, then subscribe — a delta committed in
       # between is lost. The fix: subscribe_seeded does both in ONE store
-      # call. To actually exercise the race (fable-5 P5 low — a single
-      # server+append serializes cleanly and cannot fail against the bug),
-      # spawn N servers and interleave N appends: with the OLD
-      # seed-then-attach, some server would miss its message; with the
-      # atomic call, every server sees every message regardless of
-      # interleaving (each message is either in a server's seed snapshot or
-      # delivered by its feed — the store serializes subscribe_seeded and
-      # appends).
+      # call. To actually exercise the race (fable-5 P5 — a sequential
+      # server-then-append serializes cleanly and cannot fail against the
+      # bug), run a CONCURRENCY STORM: many servers start_link while many
+      # appends land from other processes, so the seed snapshot and the
+      # append commit interleave across processes. With the OLD
+      # seed-then-attach some server would miss a delta; with the atomic
+      # call, every server sees every delta (each is either in a server's
+      # seed snapshot or delivered by its feed).
       now = System.system_time(:millisecond) * 1.0
+      contents = for i <- 1..12, do: "T16_STORM_#{i}"
 
-      servers =
-        for _i <- 1..8 do
-          {:ok, server} = Kyber.IndexServer.start_link(seed_from_set: true)
-          server
+      # storm: 12 servers starting concurrently with 12 appends
+      tasks =
+        for content <- contents do
+          Task.async(fn ->
+            {:ok, server} = Kyber.IndexServer.start_link(seed_from_set: true)
+            append_message(content, now)
+            server
+          end)
         end
 
-      contents = for i <- 1..8, do: "T16_ATOMIC_#{i}"
-
-      # interleave: start a server, append a message, next server, next
-      # message... (the race window is widest when seed and append alternate)
-      Enum.zip(servers, contents)
-      |> Enum.each(fn {_server, content} ->
-        append_message(content, now)
-      end)
+      servers = Task.await_many(tasks, 10_000)
 
       # every server must know every content (either from its seed or its
       # feed — never neither)
