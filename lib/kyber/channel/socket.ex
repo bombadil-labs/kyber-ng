@@ -192,81 +192,13 @@ defmodule Kyber.Channel.Socket do
   # a stale unanswered MessageReceived (the inference failed / timed out, so
   # no ResponseDelta ever landed) is NOT treated as a duplicate, so the
   # operator can re-send and retry. See ADLC P5 (PR #5).
+  #
+  # T16 (F1): answered from the DurableStore's maintained dedup index in
+  # O(1) — the nested full-set scans (message_answered? /
+  # inference_answered?, the PR #5 round-5 O(N³) finding) are gone; the
+  # index holds the same two-hop bridge the scans implemented.
   defp open_duplicate?(content) do
-    set = DurableStore.set()
-    now = System.system_time(:millisecond)
-
-    Enum.any?(set, fn {id, {claims, _sig}} ->
-      message_received?(claims) and content_of(claims) == content and
-        recent?(claims.timestamp, now) and not message_answered?(set, id)
-    end)
-  end
-
-  defp recent?(ts, now) when is_number(ts), do: now - ts <= @dup_window_ms
-  defp recent?(_ts, _now), do: false
-
-  # true iff the MessageReceived `msg_id` has been answered: at least one
-  # InferenceRequested for it (promptRef -> msg_id) has a corresponding
-  # ResponseDelta (requestRef -> that inference). We scan ALL inference
-  # requests for the message (not just the first map match) so that a
-  # failed-then-retried attempt still counts as answered, and the result
-  # is independent of DurableStore.set/0's unordered iteration. The chain
-  # is two hops (MessageReceived -> InferenceRequested -> ResponseDelta),
-  # matched by pointer role+target, not first-pointer order. See ADLC P5
-  # (PR #5), round 4 high-severity finding.
-  defp message_answered?(set, msg_id) do
-    Enum.any?(set, fn {inf_id, {claims, _sig}} ->
-      inference_requested?(claims) and
-        delta_id(pointer_target(claims, "promptRef")) == msg_id and
-        inference_answered?(set, inf_id)
-    end)
-  end
-
-  defp inference_requested?(claims) do
-    Enum.any?(claims.pointers, fn
-      %{role: "type", target: {:entity, "InferenceRequested", _ctx}} -> true
-      _other -> false
-    end)
-  end
-
-  defp inference_answered?(set, inference_id) do
-    Enum.any?(set, fn {_id, {claims, _sig}} ->
-      response_delta?(claims) and delta_id(pointer_target(claims, "requestRef")) == inference_id
-    end)
-  end
-
-  defp response_delta?(claims) do
-    Enum.any?(claims.pointers, fn
-      %{role: "type", target: {:entity, "ResponseDelta", _ctx}} -> true
-      _other -> false
-    end)
-  end
-
-  # a delta pointer target decodes to {:delta, id, ctx} (or {:delta, id});
-  # return just the id so callers compare order/arity-independently.
-  defp delta_id({:delta, id, _ctx}), do: id
-  defp delta_id({:delta, id}), do: id
-  defp delta_id(_), do: nil
-
-  defp pointer_target(claims, role) do
-    case Enum.find(claims.pointers, fn %{role: r} -> r == role; _ -> false end) do
-      %{target: target} -> target
-      _ -> nil
-    end
-  end
-
-  defp message_received?(claims) do
-    Enum.any?(claims.pointers, fn
-      %{role: "type", target: {:entity, "MessageReceived", _ctx}} -> true
-      _other -> false
-    end)
-  end
-
-  defp content_of(claims) do
-    case Enum.find(claims.pointers, fn %{role: "content"} -> true; _ -> false end) do
-      %{target: {:string, text}} -> text
-      _ -> nil
-    end
+    DurableStore.dedup_check(content, @dup_window_ms)
   end
 
   @impl true

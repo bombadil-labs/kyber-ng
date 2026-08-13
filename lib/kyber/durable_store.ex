@@ -28,7 +28,7 @@ defmodule Kyber.DurableStore do
 
   use GenServer
 
-  alias Kyber.{DeltaSet, Log, Store}
+  alias Kyber.{DeltaSet, DurableIndex, Log, Store}
 
   @type line_no :: non_neg_integer()
   @type replay_report :: %{
@@ -58,6 +58,48 @@ defmodule Kyber.DurableStore do
   @spec set() :: DeltaSet.t()
   def set do
     GenServer.call(__MODULE__, :set)
+  end
+
+  @doc """
+  T16 (F1) — is `content` an open duplicate within `window_ms`? Answered
+  from the store's maintained dedup index in O(1) — the socket's
+  `open_duplicate?/1` no longer scans the set (the PR #5 round-5 O(N³)
+  finding). The window is passed by the caller (the socket's
+  `@dup_window_ms`) so the collapse semantics are byte-identical to the
+  pre-index scan.
+  """
+  @spec dedup_check(String.t(), non_neg_integer()) :: boolean()
+  def dedup_check(content, window_ms) do
+    GenServer.call(__MODULE__, {:dedup_check, content, window_ms})
+  end
+
+  @doc """
+  T16 (AC1 observable) — how many times `set/0` has been served since boot.
+  Lets a test prove `dedup_check/1` answers from the index without a set()
+  rescan (the O(1) seam).
+  """
+  @spec set_calls() :: non_neg_integer()
+  def set_calls do
+    GenServer.call(__MODULE__, :set_calls)
+  end
+
+  @doc """
+  T16 (F2) — the rhizomatic seam: register a subscriber pid. Every delta
+  admitted AFTER the write-ahead commit is SENT to each subscriber as
+  `{:delta, id, claims}` in commit order (plain `send/2` — a GenServer
+  receives it in `handle_info`, any process in `receive`); a refused delta
+  is never delivered. Subscribers are a small registered set — a dead pid
+  is pruned on the next fan-out, never a crash.
+  """
+  @spec subscribe(pid()) :: :ok
+  def subscribe(pid) when is_pid(pid) do
+    GenServer.call(__MODULE__, {:subscribe, pid})
+  end
+
+  @doc "T16 (F2) — remove a subscriber pid."
+  @spec unsubscribe(pid()) :: :ok
+  def unsubscribe(pid) when is_pid(pid) do
+    GenServer.call(__MODULE__, {:unsubscribe, pid})
   end
 
   @doc "The pinned replay observable: refused/torn line numbers from the last boot, plus the live count of failed live appends."
@@ -98,6 +140,12 @@ defmodule Kyber.DurableStore do
        path: log_path,
        io: nil,
        set: set,
+       # T16 (F1): the dedup index, rebuilt from the replayed set in one pass
+       # (PM3 — same fold as live appends, so a fresh boot agrees with a
+       # spawned IndexServer seeded from set/0)
+       index: DurableIndex.build(set),
+       set_calls: 0,
+       subscribers: [],
        refused: refused,
        torn: torn,
        failed_appends: 0,
@@ -117,11 +165,54 @@ defmodule Kyber.DurableStore do
     # running the cast is a verified silent no-op (store-only contexts:
     # durable_store_test, CLI ingest, federation — unaffected). The pulse
     # admission for the ephemeral channel is unchanged.
-    if reply == :ok, do: notify_reactor(wire)
-    {:reply, reply, new_state}
+    #
+    # T16 (PM2): the index update + subscriber fan-out happen ONLY in the
+    # committed branch — never on persist_failed, so the index can never
+    # claim a delta the log does not have.
+    case reply do
+      :ok ->
+        case Store.verify(wire) do
+          {:ok, delta} ->
+            notify_reactor(wire)
+            committed = %{new_state | index: DurableIndex.add(new_state.index, delta)}
+            {:reply, :ok, fan_out(committed, delta)}
+
+          {:error, _reason} ->
+            # door accepted the wire but verify disagrees (should not
+            # happen — admit and verify share the door); keep the commit
+            # but do not index what we cannot parse
+            {:reply, :ok, new_state}
+        end
+
+      _other ->
+        {:reply, reply, new_state}
+    end
   end
 
-  def handle_call(:set, _from, state), do: {:reply, state.set, state}
+  def handle_call(:set, _from, state), do: {:reply, state.set, %{state | set_calls: state.set_calls + 1}}
+
+  def handle_call({:dedup_check, content, window_ms}, _from, state) do
+    # T16 (F1): O(1) answer from the maintained index; the window comes
+    # from the caller (the socket's @dup_window_ms) so the collapse
+    # semantics are byte-identical to the pre-index scan
+    now = System.system_time(:millisecond)
+    {:reply, DurableIndex.open_duplicate?(state.index, content, now, window_ms), state}
+  end
+
+  def handle_call(:set_calls, _from, state), do: {:reply, state.set_calls, state}
+
+  def handle_call({:subscribe, pid}, _from, state) do
+    # a fresh subscribe re-seeds the subscriber with the CURRENT index
+    # state? No — the feed is forward-only; a late subscriber replays via
+    # DurableStore.set/0 itself (IndexServer does this on start_link). The
+    # registered set is deduped by pid.
+    subs = if pid in state.subscribers, do: state.subscribers, else: [pid | state.subscribers]
+    {:reply, :ok, %{state | subscribers: subs}}
+  end
+
+  def handle_call({:unsubscribe, pid}, _from, state) do
+    {:reply, :ok, %{state | subscribers: List.delete(state.subscribers, pid)}}
+  end
 
   def handle_call(:replay_report, _from, state) do
     {:reply, %{refused: state.refused, torn: state.torn, failed_appends: state.failed_appends},
@@ -145,6 +236,24 @@ defmodule Kyber.DurableStore do
       {:ok, delta} -> GenServer.cast(Kyber.Agent.Reactor, {:ingest, delta})
       {:error, _reason} -> :ok
     end
+  end
+
+  # T16 (F2/PM4): fan the committed delta out to every subscriber in commit
+  # order. A dead subscriber pid is pruned (the prune keeps the registered
+  # set bounded) — the fan-out never crashes the store's append path. Plain
+  # `send/2`, NOT GenServer.cast: cast wraps the payload as
+  # {:'$gen_cast', msg}, which a plain (non-GenServer) subscriber process
+  # can never match; `send` delivers `{:delta, id, claims}` verbatim to any
+  # process (a GenServer receives it in handle_info, a plain process in
+  # receive — the F2 contract).
+  defp fan_out(state, delta) do
+    {alive, _dead} = Enum.split_with(state.subscribers, &Process.alive?/1)
+
+    Enum.each(alive, fn pid ->
+      send(pid, {:delta, delta.id, delta.claims})
+    end)
+
+    %{state | subscribers: alive}
   end
 
   # ------------------------------------------------------------- write-ahead
