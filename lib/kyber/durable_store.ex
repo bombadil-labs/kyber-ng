@@ -207,10 +207,17 @@ defmodule Kyber.DurableStore do
               {:reply, :ok, new_state}
             end
 
-          {:error, _reason} ->
+          {:error, reason} ->
             # door accepted the wire but verify disagrees (should not
             # happen — admit and verify share the door); keep the commit
-            # but do not index what we cannot parse
+            # but do not index what we cannot parse. LOUD: a silent index
+            # desync is worse than a crash (P5 round 5 low).
+            require Logger
+
+            Logger.error(
+              "kyber: DurableStore append committed but verify failed (#{inspect(reason)}) — index NOT updated for #{wire["id"]}"
+            )
+
             {:reply, :ok, new_state}
         end
 

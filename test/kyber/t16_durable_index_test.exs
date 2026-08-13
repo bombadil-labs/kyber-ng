@@ -401,14 +401,15 @@ defmodule Kyber.T16DurableIndexTest do
       end
     end
 
-    test "a blind view re-subscribes after a store restart (P5 fix — feed is never lost)" do
+    test "a blind view survives a store restart: feed live again, gap closed by the re-seed" do
       now = System.system_time(:millisecond) * 1.0
 
       # blind view: starts empty, sees only post-attach feed deltas
       {:ok, server} = Kyber.IndexServer.start_link(seed_from_set: false)
       refute Kyber.IndexServer.open_duplicate?(server, "T16_BLIND", 30_000)
 
-      # a delta before a restart reaches it via the feed
+      # a delta before a restart reaches it via the feed (normal operation:
+      # feed-only — never a full-history rebuild)
       append_message("T16_BLIND", now)
 
       blind_sees =
@@ -427,17 +428,21 @@ defmodule Kyber.T16DurableIndexTest do
 
       assert blind_sees
 
-      # store restarts: the blind view's registration died with the store;
-      # the monitor fires and it re-subscribes (keeping its feed-only view —
-      # never converted to full-history)
+      # store restarts. The blind view's registration died with the store;
+      # the monitor fires and recovery RE-SEEDS from the set (the documented
+      # recovery contract — deltas committed in the gap between the reboot
+      # and the re-subscribe cannot be reconstructed from the feed alone).
       Application.stop(:kyber)
       {:ok, _} = Application.ensure_all_started(:kyber)
 
-      # after re-subscribe, a NEW delta reaches it again
+      # a delta committed AFTER the store is back but BEFORE the view has
+      # re-subscribed would be lost without the recovery re-seed. This is
+      # the gap: the view must recover it (the re-seed folds the whole set,
+      # including this delta, whatever the interleaving).
       now2 = System.system_time(:millisecond) * 1.0
       append_message("T16_BLIND_2", now2)
 
-      blind2 =
+      recovered =
         Enum.reduce_while(1..200, false, fn _, _ ->
           if Kyber.IndexServer.open_duplicate?(server, "T16_BLIND_2", 30_000) do
             {:halt, true}
@@ -451,11 +456,36 @@ defmodule Kyber.T16DurableIndexTest do
           end
         end)
 
-      assert blind2
+      assert recovered,
+             "the blind view must recover the delta committed in the restart gap (recovery re-seeds)"
 
-      # the blind view stayed feed-only (it knows what the feed delivered,
-      # never a full-history rebuild from set/0)
-      assert Kyber.IndexServer.message_count(server) >= 1
+      # the re-seed also folded the PRE-restart delta (it is in the set, and
+      # recovery re-seeds the whole set — the view's count is at least the
+      # two messages it has seen/recovered; a feed-only view that only ever
+      # added live deltas would also have both, but the re-seed makes the
+      # count deterministic)
+      assert Kyber.IndexServer.message_count(server) >= 2
+
+      # and the feed is live again: a THIRD delta, committed after recovery
+      # completed, reaches it
+      now3 = System.system_time(:millisecond) * 1.0
+      append_message("T16_BLIND_3", now3)
+
+      blind3 =
+        Enum.reduce_while(1..100, false, fn _, _ ->
+          if Kyber.IndexServer.open_duplicate?(server, "T16_BLIND_3", 30_000) do
+            {:halt, true}
+          else
+            receive do
+            after
+              25 -> :timeout
+            end
+
+            {:cont, false}
+          end
+        end)
+
+      assert blind3
     end
   end
 end

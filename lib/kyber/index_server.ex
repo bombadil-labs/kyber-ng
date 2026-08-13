@@ -38,6 +38,13 @@ defmodule Kyber.IndexServer do
       it missed, and a silently-incomplete index is worse than a seeded
       one. "Blind" is a startup/steady-state posture, not a guarantee that
       survives a store crash.
+
+  Known characteristic (fable-5 P5 round 5 low, accepted by-design): every
+  store restart makes each attached server re-fold the full set — O(set
+  size) per restart, and the index itself grows with the log (it is a
+  projection; it cannot be smaller than what it indexes). For bounded
+  indexes, a later loop can add eviction/compaction; the re-fold is the
+  price of the gap-closing re-seed.
   """
 
   use GenServer
