@@ -164,13 +164,21 @@ and loam-overflow wiring (the F2 seam enables them; the wiring is a later loop).
 - **Loop 6 — Migration:** old kyber `deltas.jsonl` → claims with lineage (spec/07).
 - **Substrate track (rhizomatic repo):** Elixir evaluator (L1) + reactor (L4) — kyber is the
   consumer that justifies them (spec/03 §3, D8).
-- **Loop 16 — Indexing substrate (IN PROGRESS, see §0):** incremental + federatable indexes.
-  After the local spawnable `IndexServer` + append feed land, the seam enables two follow-on
-  consumers: (a) **cross-instance federation** — a `DurableStore` federates its append feed to
-  *other* kyber instances that maintain their own indexes (offload indexing on demand); (b)
-  **loam-overflow index** — federate the feed to a **loam** instance as an overflow/secondary
-  index. The append-only "store only learns" property makes every index a downstream projection
-  that can lag, catch up by replay, and merge by union, never wrong.
+- **Loop 16 — Indexing substrate (MERGED — PR #8, 2026-08-13):** incremental +
+  federatable indexes. The local spawnable `IndexServer` + append feed landed; the seam
+  enables two follow-on consumers: (a) **cross-instance federation** — a `DurableStore`
+  federates its append feed to *other* kyber instances that maintain their own indexes
+  (offload indexing on demand); (b) **loam-overflow index** — federate the feed to a
+  **loam** instance as an overflow/secondary index. The append-only "store only learns"
+  property makes every index a downstream projection that can lag, catch up by replay,
+  and merge by union, never wrong.
+- **Loop 17 — Index seed governance (raised by Wisp, 2026-08-13 tire-kick):** what
+  qualifies as a seed for a seeded `IndexServer` view, who can bless one, and how a
+  seeded set can be challenged over time. Wisp's read: seeds are governance, and
+  governance should be explicit (metadata on *why* a seed exists, so future agents can
+  challenge it). Also flagged: replay/convergence for late-spawned blind views (can a
+  blind view catch pre-spawn claims without a snapshot — `subscribe_seeded` answers
+  this, needs a test).
 
 ## 3. Long-Term Vision: Rhizomatic Cognition
 
