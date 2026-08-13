@@ -96,12 +96,15 @@ defmodule Kyber.T15bEngineCastTest do
       # RE-CHECKS until found (a one-shot halt after a timeout-only receive
       # false-negatives when the delta lands past the first ~2s window under
       # full-suite load — the repo's no-sleep idiom: `{:cont, _}` after a
-      # timeout-only receive, bounded attempts).
+      # timeout-only receive, bounded attempts). It matches the resolved
+      # delta's content pointer against the stubbed reply so a stale or
+      # unrelated ResponseDelta in a leaked store can never satisfy it
+      # (fable-5 P5, PR #7: type-only match looseness).
       answered =
         Enum.reduce_while(1..120, false, fn _, _ ->
           if Enum.any?(Kyber.DurableStore.set(), fn {_id, {claims, _sig}} ->
                case Kyber.Schema.resolve(claims) do
-                 %{type: "ResponseDelta"} -> true
+                 %{type: "ResponseDelta", content: "wisp: hi back"} -> true
                  _other -> false
                end
              end) do
