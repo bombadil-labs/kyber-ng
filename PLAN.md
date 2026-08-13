@@ -6,203 +6,67 @@ success criteria. Hermes owns updating this file; the coding agent does not over
 
 ---
 
-## 0. Next Ralph Loop: The agent actually lives in it — an LLM handler on the Gather (the harness eats a real model)
+## 0. Next Ralph Loop: T16 — Incremental, federatable indexes over the append-only store
 
-**ORACLE ARC (user mandate 2026-08-06, supersedes the T11 tail when it ships):** after T11c
-merges to main (closing the T11 split), the arc continues on a PROVISIONAL BRANCH
-(`provisional/oracle`) — NOT main. T12 → T13 → T14, drafted by Hermes, each a full three-way
-campaign (fable / kimi-k3 / deepseek, blind taste test, folds, ADLC ceremony) with winners
-merged into the provisional branch as they land:
+**THE LIABILITY → THE STRENGTH (user framing, 2026-08-12):** performance over an append-only
+log is the single biggest thing to get wrong. The store only learns, so every query ("what
+points at this message?", "is this turn answered?", "this hyperview's members") is currently a
+full-scan — and the dedup path the judge already flagged is O(N³). T16 turns that liability
+into the substrate's biggest strength: **indexes become first-class, spawnable, federatable
+things.**
 
-- **T12 — the agent acts** (capabilities): the tool chain matures from the stub echo to a real
-  executor — action registry with typed schemas, a permission gate (allow-list / prompt /
-  deny), bounded filesystem + shell + HTTP actions, all through the existing
-  ToolCall→ToolResult delta chain with crash-window idempotence intact.
-- **T13 — the agent remembers** (memory-driven): the T11c memory store becomes the agent's
-  operational memory — tool outcomes, trajectory retrieval, provenance-weighted recall, the
-  agent writing memory entities it later reads. **ASSOCIATIVE MEMORY (user musing 2026-08-06 —
-  design mandate for T13):** retrieval is a semantic WALK over the entity graph (RhizomeDB
-  flight-lines made concrete), not a scroll — from the query's resolved entities, follow
-  pointer edges (shared targets/roles/sessions/content-feature hashes); pure structural
-  association, NO embedding service (determinism clause — boot-boundary swap only, per the
-  T11b premortem). GROOVE = saturation: the context builder pre-fetches the association set
-  for the current window into the next request, so recall cost falls toward zero as the
-  session deepens (functions fire when saturated). SYNCHRONICITY's kernel: a bounded
-  divergent-recall channel surfacing entities with surprising shared-feature overlap despite
-  no direct link (the cross-session "meaningful coincidence"), capped so it never drowns
-  precision recall. Bounded walks (max depth/candidates, window-anchored seeds). Caution:
-  association is a retrieval POLICY, never a truth-maker — the canon stays the canon;
-  resonance-ranked recall returns real claims only.
-- **T14 — the agent runs** (autonomous operation, the Class 4 Oracle seed): event-driven
-  waking (prompts, watcher ticks, memory edits), the agent initiating rather than only
-  responding. All gated: permission gates, human-edit priority, the repo doctrine. NO
-  misaligned behavior — aligned capabilities only.
+- **F1 — incremental dedup index (in-process).** `DurableStore` maintains a dedup index in its
+  own GenServer state, updated exactly once per admitted delta at the `do_append` chokepoint
+  (the store already serializes every append and owns `state.set`). `open_duplicate?/1` reads
+  that index in O(1) instead of scanning — closes the round-5 O(N³) medium.
+- **F2 — append feed / subscribe seam.** `DurableStore` broadcasts each admitted delta (id +
+  parsed claims) to a set of subscriber pids, in commit order, only after the write-ahead
+  commit lands (same ordering guarantee as the existing reactor `notify_reactor` pin-1 seam).
+  This is the rhizomatic door: anything that wants a view of the log subscribes once and
+  receives every delta — no polling `set/0`.
+- **F3 — `IndexServer`, spawnable per container / per hyperview.** A generic GenServer that
+  holds its own `DurableIndex` view, fed by the F2 feed. Spin up one per container, per
+  hyperview, per differently-tuned query — each an isolated process maintaining its own derived
+  map. The default dedup view is one such instance.
+- **F4 — `DurableIndex` pure module.** The index *logic* (new / add_delta / answered? /
+  by_pointer) is a pure, side-effect-free module reused by both the in-process store index (F1)
+  and every spawned `IndexServer` (F3). This is the reusable unit the rhizome forks.
 
-**END STATE:** an UNMERGED PR from `provisional/oracle` into main + a comprehensive report of
-every design choice, verdict, and discovery. Hermes owns PLAN.md updates; milestones recorded
-per completed stage.
+**FEDERATION / OVERFLOW (the strength, user vision 2026-08-12):** because the index is a
+spawnable process fed by an append-broadcast, the same machinery federates *out* — a
+deployment can spin up new `IndexServer`s on demand to offload indexing, and a `DurableStore`
+canfederate its feed to *other* kyber instances (or to a **loam** instance as an overflow
+index) — the append-only log's "only learns" property makes every index a downstream projection
+that can lag, catch up by replay, and merge by union, never wrong. T16 builds the local
+spawnable primitive + the feed; cross-instance federation and loam-overflow are the next
+loops' consumers of this seam (recorded in §2 backlog).
 
----
-*T11 tail (in progress — the last slice merges to main, then the arc above forks):*
+**Why now:** PR #5 is merged (T15 / Wisp). The round-5 adversarial review passed the gate but
+flagged the O(N³) dedup scan as scaling debt — a *symptom* of having no index layer at all.
+Every future "what points at X?" question (memory seam T14c, always-on context T14h,
+hyperviews) would reinvent the same scan. Building the index as a spawnable, federatable
+primitive pays the dedup debt AND seeds the later slices' query substrate in one move.
 
-**Objective (T10's own closing line + the Prime Intellect thesis the user surfaced 2026-08-06: the
-harness elevates the baseline reasoning of *any* model plugged into it):** T10 landed the
-operational harness — `kyber daemon` (ticker, pid-lock, SIGTERM-clean), `Kyber.Gather` (container
-subscriptions), the persisted cursor (re-boot idempotent by construction), the admission knob, the
-vault, and the DETERMINISTIC built-in loop (`message.received` → `ack <id>`). The harness is real;
-the agent is a stub. T11 swaps the stub: a REAL model — Moonshot Kimi K3 (provider wiring already
-proven: `moonshotai/kimi-k3`, `MOONSHOT_API_KEY`) — becomes a gather handler, so an actual LLM
-lives in the loop: event in → signed claim → model action → response claim → memory (the claims
-substrate IS the memory). The Discord transport later plugs in as just another handler.
+**Success criteria (exact, testable):**
+- (a) `mix test` green at baseline (631 tests, 1 known `trajectory_test` flake); `open_duplicate?/1`
+  no longer calls `DurableStore.set/0` to answer (TDD: a test asserts the call-count / a store
+  flag).
+- (b) The T15c dedup contract is preserved exactly: recent-unanswered re-send collapses;
+  answered re-ask allowed; stale failed-turn re-send allowed (round-3 + round-4 behavior intact).
+- (c) `DurableStore.subscribe/1` delivers one `{:delta, id, claims}` cast per admitted delta, in
+  commit order, never for a refused delta.
+- (d) A spawned dedup `IndexServer` fed by the feed answers `answered?/1` identically to the
+  in-process index, and re-seeds correctly from `DurableStore.set/0` after a store restart.
+- (e) Indexes are append-only, union-merge derived state (add on admit, never mutate/remove;
+  retraction is a delta the feed delivers and the index ignores/folds) — matches the "store only
+  learns" atom.
+- (f) No `Process.sleep`; `mix format --check-formatted` clean; rails (deps/, spec/, SPEC.md,
+  mix.exs, config/) untouched; real `~/.kyber` never touched.
 
-**Sequencing (decomposition decided 2026-08-06 — the umbrella spec stays the architecture; the
-tickets own AC slices):** T11a the schema layer (AC2/AC7 — the vocabulary first, everything else
-writes against it) → T11b the inference chain (AC1/AC3/AC4/AC5/AC8/AC9 — the operational run with a
-real model call is its gate; the context builder takes a MemoryPort seam, not a concrete memory
-container) → T11c the memory store (AC6 — the expected-to-iterate piece gets its own lifecycle and
-slots into the seam; A/B-swappable by design).
-
-**Requirements (contract: .adlc/specs/T11.md — the full architecture: deltas-as-events,
-entities-as-resolutions, primitives-ride/composites-point, actors-bound-to-containers, schemas-as-deltas,
-memory-reified-to-markdown):**
-1. `Kyber.Agent.LlmHandler` — an OpenAI-compatible client (Moonshot base
-   `https://api.moonshot.ai/v1`, key from env `MOONSHOT_API_KEY`, model `kimi-k3`, zero new deps —
-   stdlib `:httpc`/`:ssl` like the rest of the repo; NO external HTTP lib) that implements the
-   gather handler contract `(delta[]) -> delta[]` with REAL (non-deterministic) content.
-2. The delta vocabulary (all pinned in the genesis schema set): `SubmittedPrompt` embeds
-   primitives (author-by-signature, timestamp, channel, prompt_text) + `sessionId`;
-   `InferenceRequested` embeds primitives and POINTS to `conversationRef` + `memoryPointers[]`
-   + `promptRef`; `ResponseDelta` points back to its request + the memory it used. No delta
-   embeds the conversation history (composites point). Crash-window safety is the pointer
-   guarantee: the store is immutable, so frozen pointers resolve identically on re-fire →
-   content-address dedup drops replays (the T10 lesson, reapplied).
-3. The intake takes DELTAS only — never resolved views. Entities (Prompt, Session, Memory)
-   exist by being referenced; resolution = gather hyperview → hyperschema → schema, time-versioned.
-4. Actors bound to containers: `Kyber.Agent.ContextBuilder` (session hyperview + window lens +
-   memory injection → emits one thin `InferenceRequested` per prompt), `Kyber.Agent.Engine`
-   (stateful: fires on requests, walks pointers, calls the model, emits `ResponseDelta` /
-   `ToolCall` mid-turn; in-flight turn state rehydrates from the chain), `Kyber.Agent.Memory`
-   (MemoryEntity resolution + markdown projector + edit watcher + L0/L1 tierer + trajectory
-   retriever), `Kyber.Schema` (schema container actor + genesis schema deltas; validate at
-   admission; codegen is derived convenience, never authority).
-5. The memory store round-trips through markdown (an Obsidian vault = the L2 tier, human-editable):
-   system memories derive from response deltas; HUMAN edits are observed by the watcher →
-   diff → attested `MemoryEdited` delta (`source: :human_edit`, old+new) → canon re-resolves.
-   Canon is a RESOLUTION, never a store; `provenance` (model|human|derived) weights retrieval
-   (human-canon authoritative, never auto-consolidated). The memory container is swappable
-   behind the same substrate (the A/B property). OpenViking's L0/L1/L2 tiering + filesystem-as-
-   projection (viking://) is the reference shape; ours derives from the delta substrate, not a
-   sidecar store.
-6. Tool chains are cascades of linked deltas (Prompt → ToolCall → ToolResult → … → Response),
-   emitted as they happen; rendering/visibility is a lens, not data.
-7. The operational run (THE gate, Hermes-executed): boot the daemon on a tmp store/keyring with
-   the LLM handler live; CLI ingest a `message.received` whose content is a real question; the
-   context builder fires, the model answers, the answer persists as `message.sent` (agent-signed,
-   non-deterministic); the vault renders the exchange; SIGTERM; re-boot; the exchange does NOT
-   duplicate; the answer claim is still in the store. Bounded explicit polling, never
-   `Process.sleep`.
-8. A memory affordance proves itself: the handler's SECOND invocation is grounded in the FIRST
-   exchange — the model sees its own prior `message.sent` claims (the store as memory) and answers
-   a follow-up that REQUIRES that memory ("what did I just say?"). verify: the second answer
-   references the first exchange's content.
-9. No `Process.sleep`; rails (deps/, spec/, SPEC.md, mix.exs, config/) frozen; the real `~/.kyber`
-   never touched; format clean; warnings-as-errors clean. verify: the T9/T10 gate suite.
-10. Determinism harness: with the LLM path disabled (or a canned stub handler), the T10
-    deterministic ack loop still works — the built-in loop is the fallback, not a casualty.
-    verify: the T10 daemon/agent_loop tests stay green unchanged.
-
-**Success criteria (exact, testable):** (a) `mix test` green including handler/engine/memory/schema
-tests; (b) the operational run (AC4) passes with a REAL Moonshot call (recorded as the loop's
-acceptance evidence); (c) the memory-grounding follow-up exchange passes; (d) re-boot idempotence
-holds with the LLM handler (no duplicate exchange, crash-window test included); (e) the memory
-store round-trips: system memory → markdown → human edit → `MemoryEdited` delta → re-resolved
-canon with `provenance: human`; (f) schema validation at admission (well-formed admitted,
-malformed refused, unknown admitted raw); (g) the T10 deterministic tests untouched.
-
-**The architectural model (user design, 2026-08-06 — the harness as a closed loop;
-refined the same day: deltas AS the events — one kind of thing in motion):** every
-operation in the harness generates a delta and writes it to the intake. The
-persisted/ephemeral split is NOT a type distinction — it is a property of REDUCTION:
-deltas are the events that pass through the pulse, and whether a delta is memory
-(admitted to the log — the vault, the store, the peer exchange) or a pulse
-(side-effect carrier — fires handlers, dropped by default) is decided by ADMISSION
-POLICY at each sink, never baked into the object. One object everywhere: the wire,
-the intake, the pulse, the log, the vault, the peer exchange all speak the same
-signed-delta language; a handler receives a delta whether it arrived live, was
-replayed, or came over TCP (promotion of a pulse to memory is free — same object,
-admission is a policy decision; the reject-never-repair door applies to the ephemeral
-channel too). The pulse IS the log in motion; the log IS the pulse at rest — replay
-and live delivery are the same mechanism, so the gather's dispatch cursor prevents
-re-running side effects (handlers are pure functions of their inputs — re-delivery is
-harmless by construction), never "re-firing events." D5 is re-read accordingly:
-pulses are delta-SHAPED; "pulses never reach the delta layer" holds by admission
-policy (role-based: memory-ish roles admit — message.*, session, insight; mechanism
-roles pulse-and-drop — watcher.*, cron.*, handler.*), the door's verification is the
-final gate, and the vault only renders the store so mechanism noise never reaches the
-human. (The D5 re-read is a deliberate spec amendment, recorded when T10's contract
-is written.)
-
-**Admission default (user refinement, 2026-08-06): persist EVERYTHING first.** "Is it a
-memory or not" is a KNOB, not a policy decided upfront: we start by persisting every
-delta, and later demote shapes whose history no longer needs persisting (a
-role/shape-based admission knob at the door — tune a shape to pulse-only when its
-history stops earning its keep). The store only learns — you can always tune a shape
-down, but you can never recover what you chose not to persist, so the default is
-learning. The vault renders the store, so the human sees the full memory until the
-knob tunes.
-
-**The handler contract (user refinement, 2026-08-06): `(delta[]) -> delta[]`, not
-`(delta) -> [delta]`.** The reactor/gather takes an input SET — many deltas, or deltas
-pre-organized into a hyperview/view — and is PARTIALLY APPLIED incrementally as deltas
-accumulate; it fires only when enough deltas have accumulated that its declared input
-is SATURATED. A handler = {declared input shape, function} where the function maps an
-accumulated input view to output deltas; saturation = the declared shape's required
-slots are filled. The T10 built-in agent-loop handler is the degenerate case (a single
-`message.received` saturates it), but the contract is written for composition: the
-reactor's future {inputs, function} declaration and the gather's dispatch are the
-same shape, so the L4 upgrade is a drop-in.
-
-**Ad-hoc containers = the hyperview's type (user refinement, 2026-08-06 — the
-synthesis of loam's container primitive and the gather):** the ideal abstraction to
-"gather-into" is the container — loam's §27 primitive (its own delta-set, resolvable
-in its own right, spawn/seed/resolve/ship/drop) IS the lifecycle of a handler's
-accumulated input view. A handler's declared input shape compiles to a container's
-MEMBERSHIP TERM — no new language. The contract: `{ inputs: [container_spec, ...],
-function: (containers) -> [delta] }`; partial application = each incoming delta
-routes into the containers whose membership it satisfies; SATURATION = the bound
-container's membership is complete; the function fires when every bound argument is
-saturated. Consequences: (a) content-addressing gives determinism — a saturated
-container's identity derives from its contents, so a firing is reproducible and the
-door dedups its outputs (idempotence stays structural, one level up); (b) the
-ephemeral/persisted axis is POSTURE — a SHARED hyperview (live reading, dropped after
-firing) is the pulse; a SEPARATE one (materialized bytes) is memory; the admission
-knob tunes which containers a delta gathers into (persist-everything default = every
-container separate until tuned shared); (c) PROMOTION is the one operation — a pulse
-container worth remembering is materialized (same deltas, same identity, posture
-flipped: the quarantine→blessed, ephemeral→memory, untrusted-peer→trusted arcs are
-all the same move); (d) the reactor graph closes — firing outputs gather into
-downstream containers, making the L4 reactor a router over one primitive. The vault
-(T7) is retroactively validated: it WAS a shared container (membership =
-memory-shaped deltas, resolved into markdown); the cap is a bounded-membership
-container. T10 discipline: ad-hoc containers stay GATHER-INTERNAL (no curated
-entity, no new claim vocabulary — their declaration lives in the handler spec);
-promotion to a named loam.container (§27 vocabulary) is the later landing point,
-after loam's container design settles — kyber never races the substrate, but the
-gather is container-shaped on day one.
-
-**Success Criteria (the gate):**
-- `mix test` green; `! grep -r "Process.sleep" test/`; `mix format --check-formatted` exits 0.
-- THE operational run (the gate's verification, executed by Hermes): the daemon boots,
-  the loop closes live, the memory grows, and the vault shows it.
-- Re-boot idempotence: the daemon survives restarts without re-firing handled claims
-  (the store only learns; the gather is a lens over the log, never a source of truth).
-
-**Out of scope (later loops):** the substrate L4 reactor (the gather is the
-provisional harness-side mechanism, spec/04 §6), the Discord transport (a handler
-plugged into the daemon — the deployment), peer auth/TLS, legacy semantic
-interpretation, vault-to-store writes.
-
----
+**Out of scope (later loops):** a general query DSL / pointer-graph query language; materialized
+hyperviews beyond the dedup view (the spawnable server exists; only dedup ships as a consumer);
+retraction-aware index folding beyond "ignore the negation delta"; cross-instance federation
+and loam-overflow wiring (the F2 seam enables them; the wiring is a later loop).
 
 ## 1. Current State (What Works)
 
@@ -262,6 +126,31 @@ interpretation, vault-to-store writes.
   (b) **cache-warm sessions** — no more cold-start `claude -p` per step where it
   matters: use `--continue`/`--resume <session>` for follow-up steps in a loop so the
   substrate context stays warm (user note 2026-08-06: cold starts forfeit caching).
+- **Loops 11–14 COMPLETE (T11–T14, Oracle Arc) — the agent lives in it.** Three-way
+  campaigns (fable / kimi-k3 / deepseek, blind taste tests, folds, ADLC ceremony),
+  winners merged via `provisional/oracle` → `main`/PRs:
+  - **T11 — real model:** `Kyber.Agent.LlmHandler` (OpenAI-compatible, Moonshot kimi-k3,
+    stdlib `:httpc`/`:ssl`, zero new deps) becomes a gather handler; schema layer
+    (T11a), inference chain (T11b), memory store (T11c). The harness eats a real LLM.
+  - **T12 — the agent acts:** tool chain (typed schemas, allow-list/prompt/deny gate,
+    bounded filesystem + shell + HTTP) through the ToolCall→ToolResult delta chain with
+    crash-window idempotence intact.
+  - **T13 — the agent remembers:** associative memory — a semantic WALK over the entity
+    graph (pointer edges, not a scroll), no embedding service (determinism clause);
+    GROOVE saturation + bounded SYNCHRONICITY recall.
+  - **T14 — the agent runs (autonomous, the Class 4 Oracle seed):** event-driven waking,
+    the agent initiates; slices a–j (reactor T14a, policy T14b, memory seam T14c, skills
+    T14f, identity T14g, always-on context T14h, I/O channels T14i, loose ends T14j) +
+    boundary enumeration T14d + carry closure T14e. Merged to `main` (T14 arc complete).
+- **Loop 15 COMPLETE (T15, PR #5 merged) — Wisp, the isolated sibling.** `kyber daemon`
+  stands up an isolated kyber agent on `/tmp/wisp/` (never `~/.kyber`), content-derived
+  identity across reboots, peer listener :48080 for Liet federation. Model/persona
+  configurable via `--model`/`--base-url`/`--api-key-env`/`--system_prompt`; pure-CLI I/O
+  via `kyber ctl` over the channel-socket JSONL protocol. Triple-send dedup (T15c) —
+  order-independent, retry-safe, recent-window-bounded. ADLC P5 adversarial review ran to
+  `approve` (rounds 1–5) closing HIGH/MEDIUM findings (nil-fallback engine build, dedup
+  window, system_prompt threading, retry-safe dedup, loud no-key boot warning).
+- **Loop 16 IN PROGRESS (T16) — indexed, federatable substrate.** See §0. The next loop.
 
 ## 2. Active Backlog
 
@@ -275,6 +164,13 @@ interpretation, vault-to-store writes.
 - **Loop 6 — Migration:** old kyber `deltas.jsonl` → claims with lineage (spec/07).
 - **Substrate track (rhizomatic repo):** Elixir evaluator (L1) + reactor (L4) — kyber is the
   consumer that justifies them (spec/03 §3, D8).
+- **Loop 16 — Indexing substrate (IN PROGRESS, see §0):** incremental + federatable indexes.
+  After the local spawnable `IndexServer` + append feed land, the seam enables two follow-on
+  consumers: (a) **cross-instance federation** — a `DurableStore` federates its append feed to
+  *other* kyber instances that maintain their own indexes (offload indexing on demand); (b)
+  **loam-overflow index** — federate the feed to a **loam** instance as an overflow/secondary
+  index. The append-only "store only learns" property makes every index a downstream projection
+  that can lag, catch up by replay, and merge by union, never wrong.
 
 ## 3. Long-Term Vision: Rhizomatic Cognition
 
