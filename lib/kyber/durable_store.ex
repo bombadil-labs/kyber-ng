@@ -102,6 +102,20 @@ defmodule Kyber.DurableStore do
     GenServer.call(__MODULE__, {:unsubscribe, pid})
   end
 
+  @doc """
+  T16 (F2, P5 fix) — ATOMIC seed+attach in ONE store call: register the
+  pid AND hand it the current set snapshot, serialized inside the store.
+  Because the store serializes appends, there is no gap between the seed
+  and the subscription: any delta committed before this call is in the
+  returned set; any delta committed after is delivered by the feed. (The
+  fable-5 P5 medium: a separate seed-then-attach permanently loses deltas
+  committed between the two calls.)
+  """
+  @spec subscribe_seeded(pid()) :: {:ok, DeltaSet.t()}
+  def subscribe_seeded(pid) when is_pid(pid) do
+    GenServer.call(__MODULE__, {:subscribe_seeded, pid})
+  end
+
   @doc "The pinned replay observable: refused/torn line numbers from the last boot, plus the live count of failed live appends."
   @spec replay_report() :: replay_report()
   def replay_report do
@@ -168,12 +182,14 @@ defmodule Kyber.DurableStore do
     #
     # T16 (PM2): the index update + subscriber fan-out happen ONLY in the
     # committed branch — never on persist_failed, so the index can never
-    # claim a delta the log does not have.
+    # claim a delta the log does not have. The single Store.verify result
+    # feeds BOTH the reactor push and the index/fan-out (one verify per
+    # append, not two — P5 low).
     case reply do
       :ok ->
         case Store.verify(wire) do
           {:ok, delta} ->
-            notify_reactor(wire)
+            notify_reactor(delta)
             committed = %{new_state | index: DurableIndex.add(new_state.index, delta)}
             {:reply, :ok, fan_out(committed, delta)}
 
@@ -189,7 +205,8 @@ defmodule Kyber.DurableStore do
     end
   end
 
-  def handle_call(:set, _from, state), do: {:reply, state.set, %{state | set_calls: state.set_calls + 1}}
+  def handle_call(:set, _from, state),
+    do: {:reply, state.set, %{state | set_calls: state.set_calls + 1}}
 
   def handle_call({:dedup_check, content, window_ms}, _from, state) do
     # T16 (F1): O(1) answer from the maintained index; the window comes
@@ -208,6 +225,13 @@ defmodule Kyber.DurableStore do
     # registered set is deduped by pid.
     subs = if pid in state.subscribers, do: state.subscribers, else: [pid | state.subscribers]
     {:reply, :ok, %{state | subscribers: subs}}
+  end
+
+  def handle_call({:subscribe_seeded, pid}, _from, state) do
+    # P5 fix: the seed snapshot and the registration happen in ONE
+    # serialized call, so there is no commit gap between them
+    subs = if pid in state.subscribers, do: state.subscribers, else: [pid | state.subscribers]
+    {:reply, {:ok, state.set}, %{state | subscribers: subs}}
   end
 
   def handle_call({:unsubscribe, pid}, _from, state) do
@@ -230,12 +254,10 @@ defmodule Kyber.DurableStore do
   def terminate(_reason, %{io: io}), do: File.close(io)
 
   # the pin-1 seam: GenServer.cast to the registered reactor name; a cast to
-  # a non-existent process is dropped, never a crash
-  defp notify_reactor(wire) do
-    case Store.verify(wire) do
-      {:ok, delta} -> GenServer.cast(Kyber.Agent.Reactor, {:ingest, delta})
-      {:error, _reason} -> :ok
-    end
+  # a non-existent process is dropped, never a crash. Takes the VERIFIED
+  # delta (one verify per append, shared with the index — P5 low).
+  defp notify_reactor(delta) do
+    GenServer.cast(Kyber.Agent.Reactor, {:ingest, delta})
   end
 
   # T16 (F2/PM4): fan the committed delta out to every subscriber in commit

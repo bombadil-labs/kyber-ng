@@ -52,7 +52,14 @@ defmodule Kyber.T16DurableIndexTest do
   # append a signed MessageReceived and return its id
   defp append_message(content, ts) do
     {:ok, signed} =
-      Events.message_received(@seed, ts, "message:t16:#{trunc(ts)}", "channel:t16", "session:t16", content)
+      Events.message_received(
+        @seed,
+        ts,
+        "message:t16:#{trunc(ts)}",
+        "channel:t16",
+        "session:t16",
+        content
+      )
 
     wire = Wire.envelope(signed)
     {:ok, %{id: id}} = Kyber.Store.verify(wire)
@@ -162,6 +169,7 @@ defmodule Kyber.T16DurableIndexTest do
       now = System.system_time(:millisecond) * 1.0
 
       parent = self()
+
       {:ok, sub} =
         Task.start(fn ->
           loop = fn loop ->
@@ -201,8 +209,9 @@ defmodule Kyber.T16DurableIndexTest do
     test "fed by the feed, answers identically to the in-process index" do
       now = System.system_time(:millisecond) * 1.0
 
+      # init ATOMICALLY seeds + subscribes (subscribe_seeded); no explicit
+      # attach needed (P5 fix — the seed-then-attach gap is gone)
       {:ok, server} = Kyber.IndexServer.start_link(seed_from_set: true)
-      :ok = Kyber.IndexServer.attach(server)
 
       # a recent unanswered message: both the in-process index and the
       # server's view agree it is a duplicate
@@ -238,7 +247,7 @@ defmodule Kyber.T16DurableIndexTest do
       refute Kyber.IndexServer.answered?(blind, msg_id)
     end
 
-    test "the server survives a store restart and re-seeds (AC3)" do
+    test "the server survives a store restart and re-attaches (P5 fix)" do
       now = System.system_time(:millisecond) * 1.0
       msg_id = append_message(@content, now)
       inf_id = append_inference(msg_id, now + 1)
@@ -247,18 +256,78 @@ defmodule Kyber.T16DurableIndexTest do
       {:ok, server} = Kyber.IndexServer.start_link(seed_from_set: true)
       assert Kyber.IndexServer.answered?(server, msg_id)
 
-      # restart the STORE from the same log; the server re-seeds from the
-      # fresh set/0 and still agrees
+      # restart the STORE from the same log: the server's monitor fires, it
+      # re-attaches + re-seeds atomically (bounded retry until the new store
+      # is up), and still agrees.
       Application.stop(:kyber)
       {:ok, _} = Application.ensure_all_started(:kyber)
       assert DurableStore.set() |> map_size() >= 3
 
-      # the server's view was seeded before the restart and holds the answer
-      assert Kyber.IndexServer.answered?(server, msg_id)
+      # the server re-attached and re-seeded from the restarted store (the
+      # re-attach is a bounded 50ms-cadence retry, so the view catches up
+      # within the poll budget — no-sleep idiom)
+      answered =
+        Enum.reduce_while(1..100, false, fn _, _ ->
+          if Kyber.IndexServer.answered?(server, msg_id) do
+            {:halt, true}
+          else
+            receive do
+            after
+              25 -> :timeout
+            end
+
+            {:cont, false}
+          end
+        end)
+
+      assert answered
+
+      # and it is live on the feed again: a NEW message + answer propagates
+      # (the feed send and the server's processing are async across
+      # processes — gate on the view with the no-sleep poll, like the
+      # re-attach above)
+      now2 = System.system_time(:millisecond) * 1.0
+      msg2 = append_message("T16_AFTER_RESTART", now2)
+      refute Kyber.IndexServer.answered?(server, msg2)
+      inf2 = append_inference(msg2, now2 + 1)
+      append_response(inf2, now2 + 2)
+
+      answered2 =
+        Enum.reduce_while(1..100, false, fn _, _ ->
+          if Kyber.IndexServer.answered?(server, msg2) do
+            {:halt, true}
+          else
+            receive do
+            after
+              25 -> :timeout
+            end
+
+            {:cont, false}
+          end
+        end)
+
+      assert answered2
 
       # a fresh server seeded from the RESTARTED store agrees too (PM3)
       {:ok, fresh} = Kyber.IndexServer.start_link(seed_from_set: true)
       assert Kyber.IndexServer.answered?(fresh, msg_id)
+    end
+
+    test "seed+attach is atomic: deltas committed between seed and attach are never lost" do
+      # the OLD race: seed from set/0, then subscribe — a delta committed in
+      # between is lost. The fix: subscribe_seeded does both in ONE store
+      # call. Exercise it by starting the server, then IMMEDIATELY appending
+      # a message (the server's init call and this append serialize in the
+      # store — whichever order, the server ends up consistent).
+      {:ok, server} = Kyber.IndexServer.start_link(seed_from_set: true)
+      now = System.system_time(:millisecond) * 1.0
+      msg_id = append_message(@content, now)
+
+      # the message is either in the server's seed OR delivered by the feed
+      # (the store serializes subscribe_seeded and the append); either way
+      # the view must know it
+      assert Kyber.IndexServer.open_duplicate?(server, @content, 30_000)
+      refute Kyber.IndexServer.answered?(server, msg_id)
     end
   end
 end
