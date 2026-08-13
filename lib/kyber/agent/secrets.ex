@@ -70,16 +70,29 @@ defmodule Kyber.Agent.Secrets do
     end
   end
 
-  @doc "The door's shape check (AC17): valid base64 of at least nonce+tag+1 bytes."
+  @doc """
+  The door's shape check (AC17): valid base64 of at least nonce+tag+1
+  bytes that is NOT text-shaped. Real AEAD output (random nonce +
+  ciphertext + tag) is uniformly random — an all-printable decode at 29+
+  bytes has probability ~(95/256)^29 ≈ 1e-13, so rejecting text-shaped
+  blobs never refuses genuine ciphertext but catches the P5 LOW-1 hole:
+  a base64'd PLAINTEXT key smuggled into `api_key_enc`.
+  """
   @spec well_formed?(String.t()) :: boolean()
   def well_formed?(encoded) when is_binary(encoded) do
     case Base.decode64(encoded) do
-      {:ok, bin} -> byte_size(bin) > @nonce_bytes + @tag_bytes
+      {:ok, bin} -> byte_size(bin) > @nonce_bytes + @tag_bytes and not text_shaped?(bin)
       :error -> false
     end
   end
 
   def well_formed?(_), do: false
+
+  defp text_shaped?(bin) do
+    bin
+    |> :binary.bin_to_list()
+    |> Enum.all?(fn byte -> byte in 32..126 or byte in [9, 10, 13] end)
+  end
 
   # the seed rides as 64-hex (the house convention); decode when it does,
   # take the raw bytes otherwise — deterministic either way

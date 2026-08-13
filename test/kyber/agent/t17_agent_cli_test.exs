@@ -11,8 +11,9 @@ defmodule Kyber.Agent.T17AgentCliTest do
 
   import ExUnit.CaptureIO
 
-  alias Kyber.{CLI, DeltaSet, Keys, Log, Schema, Store}
+  alias Kyber.{CLI, DeltaSet, Keys, Log, Schema, Store, Wire}
   alias Kyber.Agent.{Config, Secrets}
+  alias Kyber.Agent.Events, as: AgentEvents
 
   @operator_seed String.duplicate("7f", 32)
   @new_seed String.duplicate("8e", 32)
@@ -58,9 +59,25 @@ defmodule Kyber.Agent.T17AgentCliTest do
     end)
   end
 
+  defp pointer!(registry),
+    do: JSON.decode!(File.read!(Path.join([registry, "wisp", "agent.json"])))
+
+  # the fold as consumers see it: PINNED to the pointer's operator chain
+  # (resolve/2 is display-only legacy)
   defp fold!(registry) do
-    {:ok, view} = Config.resolve(load_set(registry), "wisp")
+    {:ok, view} =
+      Config.resolve(load_set(registry), "wisp", pointer!(registry)["operator_authors"])
+
     view
+  end
+
+  # a store-level append BYPASSING the CLI door — the attacker's move: a
+  # held seed writes directly to the stream
+  defp append_raw!(registry, seed, ts, fields) do
+    {:ok, signed} = AgentEvents.agent_set(seed, ts, "wisp", fields)
+    {:ok, io} = Log.open(store_path(registry))
+    :ok = Log.append(io, Wire.envelope(signed))
+    File.close(io)
   end
 
   defp store_lines(registry), do: store_path(registry) |> Log.stream() |> Enum.to_list()
@@ -386,18 +403,17 @@ defmodule Kyber.Agent.T17AgentCliTest do
       assert {:ok, message} = agent(["rekey", "wisp", "--new-seed-env", "T17_NEW_SEED"], registry)
       assert message =~ "authority"
 
-      old_author = Keys.author_for_seed(@operator_seed)
       new_author = Keys.author_for_seed(@new_seed)
 
-      # the pointer chain gains the new author (oldest -> newest)
-      pointer = JSON.decode!(File.read!(Path.join([registry, "wisp", "agent.json"])))
-      assert pointer["operator_authors"] == [old_author, new_author]
+      # P5 HIGH-3: the pointer chain is REPLACED — the old author is revoked
+      pointer = pointer!(registry)
+      assert pointer["operator_authors"] == [new_author]
 
-      # the handoff delta carries the new seed env — the plain verbs resolve
+      # the snapshot delta carries the new seed env — the plain verbs resolve
       # the NEW seed automatically and its deltas fold under the chain pin
       assert {:ok, _} = agent(["set", "wisp", "--model", "kimi-k3"], registry)
 
-      {:ok, view} = Config.resolve(load_set(registry), "wisp", [old_author, new_author])
+      {:ok, view} = Config.resolve(load_set(registry), "wisp", [new_author])
       assert view.model == "kimi-k3"
       assert view.operator_author == new_author
       assert view.heads[:model] != nil
@@ -421,8 +437,134 @@ defmodule Kyber.Agent.T17AgentCliTest do
       registry: registry
     } do
       new!(registry)
-      pointer = JSON.decode!(File.read!(Path.join([registry, "wisp", "agent.json"])))
-      assert pointer["operator_authors"] == [Keys.author_for_seed(@operator_seed)]
+      assert pointer!(registry)["operator_authors"] == [Keys.author_for_seed(@operator_seed)]
+    end
+
+    test "a leaked rotated-away seed folds as NON-operator: no config seizure (P5 HIGH-3)", %{
+      registry: registry
+    } do
+      new!(registry)
+      System.put_env("T17_NEW_SEED", @new_seed)
+      assert {:ok, _} = agent(["rekey", "wisp", "--new-seed-env", "T17_NEW_SEED"], registry)
+
+      # the attacker still holds the OLD seed and appends straight to the
+      # store, timestamped after everything else
+      later = 1.0 * System.system_time(:millisecond) + 60_000
+
+      append_raw!(registry, @operator_seed, later, %{
+        model: "seized-model",
+        base_url: "https://evil.example"
+      })
+
+      # under the pinned chain the old author is just another agent author
+      # with no self_config grant: the delta is inert
+      view = fold!(registry)
+      assert view.operator_author == Keys.author_for_seed(@new_seed)
+      assert view.model == "deepseek-v4-flash"
+      assert view.base_url == "https://api.deepseek.com/v1"
+    end
+
+    test "an interrupted rekey never wedges: clear refusal or completion (P5 LOW-2)", %{
+      registry: registry
+    } do
+      new!(registry)
+      System.put_env("T17_NEW_SEED", @new_seed)
+      pointer_path = Path.join([registry, "wisp", "agent.json"])
+      pre = File.read!(pointer_path)
+
+      assert {:ok, _} = agent(["rekey", "wisp", "--new-seed-env", "T17_NEW_SEED"], registry)
+
+      # simulate the crash BETWEEN the store append and the pointer write:
+      # the deltas landed; the pointer still carries the old chain
+      File.write!(pointer_path, pre)
+
+      # not a wedge: the verbs still resolve under the old chain
+      assert {:ok, shown} = agent(["show", "wisp"], registry)
+      assert shown =~ "model: deepseek-v4-flash"
+
+      # the BARE re-run refuses CLEARLY (the folded seed env names the new
+      # seed, which the still-old chain does not recognize)...
+      assert {:error, message} =
+               agent(["rekey", "wisp", "--new-seed-env", "T17_NEW_SEED"], registry)
+
+      assert message =~ "not the CURRENT operator"
+
+      # ...and the documented explicit re-run completes the handoff
+      assert {:ok, _} =
+               agent(
+                 [
+                   "rekey",
+                   "wisp",
+                   "--new-seed-env",
+                   "T17_NEW_SEED",
+                   "--operator-seed-env",
+                   "T17_OP_SEED"
+                 ],
+                 registry
+               )
+
+      assert pointer!(registry)["operator_authors"] == [Keys.author_for_seed(@new_seed)]
+      assert fold!(registry).operator_author == Keys.author_for_seed(@new_seed)
+    end
+  end
+
+  describe "agent name validation (P5 HIGH-2)" do
+    test "a traversal name is refused on EVERY verb; the target dir survives --force", %{
+      registry: registry
+    } do
+      # the would-be victim: a sibling of the registry — exactly what
+      # `agent new ../<dir> --force` used to rm_rf
+      victim =
+        Path.join(Path.dirname(registry), "t17-victim-#{System.unique_integer([:positive])}")
+
+      File.mkdir_p!(victim)
+      canary = Path.join(victim, "keep.txt")
+      File.write!(canary, "precious")
+      on_exit(fn -> File.rm_rf(victim) end)
+
+      evil = "../" <> Path.basename(victim)
+
+      assert {:error, message} =
+               agent(["new", evil, "--force", "--operator-seed-env", "T17_OP_SEED"], registry)
+
+      assert message =~ "invalid agent name"
+      assert File.read!(canary) == "precious"
+
+      for args <- [
+            ["show", evil],
+            ["set", evil, "--model", "x"],
+            ["set-soul", evil, "seized"],
+            ["unset", evil, "soul"],
+            ["retract", evil, String.duplicate("00", 32)],
+            ["rekey", evil, "--new-seed-env", "T17_NEW_SEED"],
+            ["tombstone", evil, String.duplicate("00", 32), "--field", "soul"]
+          ] do
+        assert {:error, message} = agent(args, registry)
+        assert message =~ "invalid agent name"
+      end
+
+      assert File.read!(canary) == "precious"
+    end
+
+    test "an absolute-path name is refused; the target dir survives", %{registry: registry} do
+      victim =
+        Path.join(System.tmp_dir!(), "t17-abs-victim-#{System.unique_integer([:positive])}")
+
+      File.mkdir_p!(victim)
+      on_exit(fn -> File.rm_rf(victim) end)
+
+      assert {:error, message} =
+               agent(["new", victim, "--force", "--operator-seed-env", "T17_OP_SEED"], registry)
+
+      assert message =~ "invalid agent name"
+      assert File.dir?(victim)
+    end
+
+    test "daemon --agent refuses a traversal name", %{registry: registry} do
+      assert {:error, message} =
+               CLI.run(["daemon", "--agent", "../evil", "--registry", registry])
+
+      assert message =~ "invalid agent name"
     end
   end
 

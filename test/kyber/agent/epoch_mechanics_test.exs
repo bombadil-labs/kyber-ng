@@ -120,8 +120,14 @@ defmodule Kyber.Agent.EpochMechanicsTest do
         store: fn -> set end
       )
 
-    {:ok, signed} = Events.tool_call(@agent_seed, @ts + 3, "memory.read",
-      JSON.encode!(%{"entity" => "e1"}), String.duplicate("cd", 32))
+    {:ok, signed} =
+      Events.tool_call(
+        @agent_seed,
+        @ts + 3,
+        "memory.read",
+        JSON.encode!(%{"entity" => "e1"}),
+        String.duplicate("cd", 32)
+      )
 
     {:ok, call} = Store.verify(Wire.envelope(signed))
 
@@ -136,14 +142,22 @@ defmodule Kyber.Agent.EpochMechanicsTest do
 
   # -------------------------------------------------------------- D4
 
-  # D4 — the concurrency bound is STRUCTURAL: one handle_cast, synchronous
-  # LlmHandler.chat/3 inside the cast, zero Task/spawn in engine.ex. NO new
-  # literal, NO new GateDecision surface. The static witness pins the
-  # structure; the blocking-stub leg pins the behavior.
-  test "D4: cap 1 structural — one handle_cast, zero Task/spawn in engine.ex (static witness)" do
+  # D4 — the concurrency bound is STRUCTURAL: one WORK-dispatching
+  # handle_cast ({:delta, ...} — synchronous LlmHandler.chat/3 inside it),
+  # zero Task/spawn in engine.ex. NO new literal, NO new GateDecision
+  # surface. The only other cast is {:swap_llm_config, ...} (P5 HIGH-1:
+  # async config swap), a pure state update that dispatches nothing. The
+  # static witness pins the structure; the blocking-stub leg pins the
+  # behavior.
+  test "D4: cap 1 structural — one work cast, zero Task/spawn in engine.ex (static witness)" do
     source = File.read!("lib/kyber/agent/engine.ex")
 
-    assert length(Regex.scan(~r/def handle_cast/, source)) == 1
+    casts =
+      Regex.scan(~r/def handle_cast\(\{:(\w+)/, source)
+      |> Enum.map(fn [_, tag] -> tag end)
+      |> Enum.sort()
+
+    assert casts == ["delta", "swap_llm_config"]
     refute Regex.match?(~r/(Task\.|spawn\()/, source)
   end
 

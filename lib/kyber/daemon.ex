@@ -58,7 +58,8 @@ defmodule Kyber.Daemon do
   use GenServer
 
   alias Kyber.{AgentLoop, DeltaSet, DurableStore, Gather, Keys, Log, Store, Wire}
-  alias Kyber.Agent.{Config, Identity, Profile, Redactor}
+  alias Kyber.Agent.{Config, Identity, Profile, Redactor, ToolExecutor}
+  alias Kyber.Agent.Action.Gate
   alias Kyber.Agent.Events, as: AgentEvents
   alias Rhizomatic.Delta
 
@@ -666,6 +667,8 @@ defmodule Kyber.Daemon do
           ok
       end
 
+    engine = agent_self_config_engine(engine, opts)
+
     [
       seed: seed,
       budget_cap: Keyword.get(opts, :budget_cap, 32),
@@ -694,6 +697,30 @@ defmodule Kyber.Daemon do
     case Kyber.Agent.Reactor.llm_for(seed, llm_opts) do
       {:ok, llm} -> [llm: llm, tools: []]
       {:error, reason} -> {:error, reason}
+    end
+  end
+
+  # P5 MEDIUM-1: an AGENT boot serves `self_config.set` from the live
+  # engine — merged over the boot's toolset so it is reachable, not just
+  # defined. The call-time grant check still gates every use (an ungranted
+  # call is refused, no delta minted). The handler context threads the SAME
+  # pinned operator chain the boot pinned (P5 MEDIUM-2 — the grant is read
+  # through it, never through display-only resolve/2). The gate allow is
+  # put_new: an explicit operator-supplied gate wins.
+  defp agent_self_config_engine(engine, opts) do
+    agent = Keyword.get(opts, :agent)
+
+    if is_binary(agent) and is_list(engine) do
+      {tools, context} = ToolExecutor.default_tools(engine)
+      tools = Map.merge(Map.new(tools), ToolExecutor.self_config_tools(agent))
+      context = Map.merge(context, %{agent: agent, operator_authors: boot_operator_chain(opts)})
+
+      engine
+      |> Keyword.put(:tools, tools)
+      |> Keyword.put(:context, context)
+      |> Keyword.put_new(:gate, Gate.new(allow: ["self_config.set"]))
+    else
+      engine
     end
   end
 
@@ -919,6 +946,24 @@ defmodule Kyber.Daemon do
   # AgentSet stream into the state, mint the soul (AC6), and carry the
   # harness/rollback state. Non-agent boots get `agent: nil` and every T17
   # clause is inert.
+  # H2 pin: the operator author chain is CALLER-ATTESTED — the pointer
+  # file's chain when supplied, else derived from the boot operator seed.
+  # Never inferred from store timestamps (a backdated delta must not seize
+  # operatorship). The ONE derivation: the fold pin AND the tool-handler
+  # context (P5 MEDIUM-2) read the same chain.
+  defp boot_operator_chain(opts) do
+    case Keyword.get(opts, :operator_authors) do
+      [_ | _] = chain ->
+        chain
+
+      _absent ->
+        case Keyword.get(opts, :operator_seed) do
+          seed when is_binary(seed) -> [Keys.author_for_seed(seed)]
+          _no_seed -> nil
+        end
+    end
+  end
+
   defp agent_identity_init(state, opts) do
     case Keyword.get(opts, :agent) do
       nil ->
@@ -930,16 +975,7 @@ defmodule Kyber.Daemon do
         :ok = DurableStore.subscribe(self())
 
         operator_seed = Keyword.get(opts, :operator_seed)
-
-        # H2 pin: the operator author chain is CALLER-ATTESTED — the pointer
-        # file's chain when supplied, else derived from the boot operator
-        # seed. Never inferred from store timestamps (a backdated delta must
-        # not seize operatorship).
-        operator_authors =
-          case Keyword.get(opts, :operator_authors) do
-            [_ | _] = chain -> chain
-            _absent -> if operator_seed, do: [Keys.author_for_seed(operator_seed)]
-          end
+        operator_authors = boot_operator_chain(opts)
 
         state
         |> Map.merge(%{

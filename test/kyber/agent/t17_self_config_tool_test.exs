@@ -48,7 +48,7 @@ defmodule Kyber.Agent.T17SelfConfigToolTest do
     )
   end
 
-  defp call!(set, fields_json) do
+  defp call!(set, fields_json, context \\ %{agent: "wisp"}) do
     {:ok, signed} =
       AgentEvents.tool_call(
         @agent_seed,
@@ -67,7 +67,7 @@ defmodule Kyber.Agent.T17SelfConfigToolTest do
         seed: @agent_seed,
         tools: ToolExecutor.self_config_tools("wisp"),
         gate: Gate.new(allow: ["self_config.set"]),
-        context: %{agent: "wisp"},
+        context: context,
         store: fn -> set end
       )
 
@@ -197,6 +197,43 @@ defmodule Kyber.Agent.T17SelfConfigToolTest do
 
     assert agent_sets(outputs) == []
     assert result_status(outputs) == "error"
+  end
+
+  test "the grant check rides the PINNED chain: a backdated self-grant is inert (P5 MEDIUM-2)" do
+    attacker_seed = String.duplicate("5d", 32)
+    op_author = Keys.author_for_seed(@operator_seed)
+
+    # the attacker BACKDATES a self-grant before the operator's first delta
+    # (timestamps are self-asserted — the store admits it)
+    set =
+      DeltaSet.new()
+      |> admit!(
+        AgentEvents.agent_set(attacker_seed, @base_ts - 100, "wisp", %{self_config: "true"})
+      )
+      |> admit!(
+        AgentEvents.agent_set(@operator_seed, @base_ts, "wisp", %{
+          model: "kimi-base",
+          base_url: "https://api.deepseek.com/v1"
+        })
+      )
+
+    # display-only resolve/2 falls for the earliest author...
+    assert {:ok, %{self_config: true}} = Config.resolve(set, "wisp")
+    # ...the pinned fold does not
+    assert {:ok, %{self_config: false}} = Config.resolve(set, "wisp", [op_author])
+
+    # a call through the PINNED boot context (what a live daemon threads,
+    # P5 MEDIUM-1) is refused at the boundary: NO delta minted
+    outputs =
+      call!(
+        set,
+        JSON.encode!(%{"fields" => %{"model" => "kimi-owned"}}),
+        %{agent: "wisp", operator_authors: [op_author]}
+      )
+
+    assert agent_sets(outputs) == []
+    assert result_status(outputs) == "error"
+    assert result_text(outputs) =~ "self_config"
   end
 
   test "fold-side pin: an agent unset of base_url is fold-inert (P0)" do

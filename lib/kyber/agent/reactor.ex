@@ -150,12 +150,16 @@ defmodule Kyber.Agent.Reactor do
 
   @doc """
   T17 (AC10): forward a hot-swap of the live LLM config to the hosted
-  engine. `{:error, :no_engine}` under `engine: :none` — a config delta can
-  never conjure an HTTP client where boot refused one.
+  engine. Asynchronous end-to-end (P5 HIGH-1): a synchronous call here can
+  time out against a reactor blocked in a long LLM inference and take the
+  linked daemon down with it. The cast is applied by the engine after any
+  in-flight request returns; the next inference rederives the config.
+  Under `engine: :none` the swap is a no-op — a config delta can never
+  conjure an HTTP client where boot refused one.
   """
-  @spec swap_llm_config(map()) :: :ok | {:error, :no_engine}
+  @spec swap_llm_config(map()) :: :ok
   def swap_llm_config(changes) when is_map(changes),
-    do: GenServer.call(__MODULE__, {:swap_llm_config, changes})
+    do: GenServer.cast(__MODULE__, {:swap_llm_config, changes})
 
   # -------------------------------------------------------------- callbacks
 
@@ -214,15 +218,17 @@ defmodule Kyber.Agent.Reactor do
     end
   end
 
+  def handle_cast({:swap_llm_config, changes}, state) do
+    case state.engine do
+      nil -> :ok
+      engine -> Engine.swap_llm_config(engine, changes)
+    end
+
+    {:noreply, state}
+  end
+
   @impl true
   def handle_call(:sync, _from, state), do: {:reply, :ok, state}
-
-  def handle_call({:swap_llm_config, changes}, _from, state) do
-    case state.engine do
-      nil -> {:reply, {:error, :no_engine}, state}
-      engine -> {:reply, Engine.swap_llm_config(engine, changes), state}
-    end
-  end
 
   # engine completion signals (notify: defaults to the reactor, pin 6) are
   # forwarded to the daemon's T17 safety harness (a SEND, never a call —

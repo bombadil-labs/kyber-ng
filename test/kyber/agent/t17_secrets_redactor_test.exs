@@ -57,6 +57,13 @@ defmodule Kyber.Agent.T17SecretsRedactorTest do
       refute Secrets.well_formed?(Base.encode64("short"))
     end
 
+    test "well_formed?/1 rejects a base64'd PLAINTEXT key — text is not AEAD output (P5 LOW-1)" do
+      plaintext_key = "sk-live-" <> String.duplicate("abcdef0123456789", 4)
+      assert byte_size(plaintext_key) > 28
+      refute Secrets.well_formed?(Base.encode64(plaintext_key))
+      refute Secrets.well_formed?(Base.encode64("Bearer token with spaces\nand newlines here"))
+    end
+
     test "derive_key/1 is deterministic per seed and 32 bytes (HKDF-SHA256)" do
       k1 = Secrets.derive_key(@seed)
       k2 = Secrets.derive_key(@seed)
@@ -143,6 +150,13 @@ defmodule Kyber.Agent.T17SecretsRedactorTest do
                Config.validate_fields(%{api_key_enc: "sk-plaintext-key-1234567890"})
     end
 
+    test "api_key_enc refuses a base64'd plaintext key at the door (P5 LOW-1)" do
+      smuggled = Base.encode64("sk-live-" <> String.duplicate("abcdef0123456789", 4))
+
+      assert {:error, {:invalid_field, :api_key_enc, _}} =
+               Config.validate_fields(%{api_key_enc: smuggled})
+    end
+
     test "operator_seed_env is env-name-only — a 64-hex seed VALUE is refused (AC21)" do
       assert {:error, {:invalid_field, :operator_seed_env, _}} =
                Config.validate_fields(%{operator_seed_env: String.duplicate("ab", 32)})
@@ -167,7 +181,9 @@ defmodule Kyber.Agent.T17SecretsRedactorTest do
 
     test "the fail-closed entropy scan refuses a long high-entropy token, passes prose (AC24)" do
       random = Base.encode64(:crypto.strong_rand_bytes(36))
-      assert {:error, {:secret_shaped, :soul, _}} = Config.validate_fields(%{soul: "x #{random} y"})
+
+      assert {:error, {:secret_shaped, :soul, _}} =
+               Config.validate_fields(%{soul: "x #{random} y"})
 
       prose =
         "I am wisp, the quiet sibling — grounded, honest, eager; " <>
@@ -190,7 +206,9 @@ defmodule Kyber.Agent.T17SecretsRedactorTest do
 
     test "unknown field names in unset are refused" do
       assert :ok = Config.validate_fields(%{unset: ["model", "soul"]})
-      assert {:error, {:invalid_field, :unset, _}} = Config.validate_fields(%{unset: ["nonsense"]})
+
+      assert {:error, {:invalid_field, :unset, _}} =
+               Config.validate_fields(%{unset: ["nonsense"]})
     end
   end
 end

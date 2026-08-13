@@ -51,6 +51,61 @@ defmodule Kyber.Agent.T17DaemonIdentityTest do
     end
   end
 
+  # the P5 HIGH-1 stub: blocks the ENGINE process inside the HTTP call
+  # until the test sends :t17_release — a config delta landing in that
+  # window must never cascade a call timeout into the daemon
+  defmodule SlowHttp do
+    @behaviour Kyber.Agent.HttpClient
+    @impl true
+    def post(_url, _headers, body, %{reply_to: pid}) do
+      send(pid, {:t17_slow_started, self()})
+
+      receive do
+        :t17_release -> :ok
+      end
+
+      send(pid, {:t17_llm_body, JSON.decode!(body)})
+
+      {:ok,
+       %{
+         status: 200,
+         body: JSON.encode!(%{"choices" => [%{"message" => %{"content" => "slow: ok"}}]})
+       }}
+    end
+  end
+
+  # the P5 MEDIUM-1 stub: first request answers a self_config_set tool
+  # call; the resumed request (a tool-role message present) answers text
+  defmodule ToolHttp do
+    @behaviour Kyber.Agent.HttpClient
+    @impl true
+    def post(_url, _headers, body, %{reply_to: pid}) do
+      decoded = JSON.decode!(body)
+      send(pid, {:t17_llm_body, decoded})
+
+      message =
+        if Enum.any?(decoded["messages"], &(&1["role"] == "tool")) do
+          %{"content" => "done"}
+        else
+          %{
+            "content" => nil,
+            "tool_calls" => [
+              %{
+                "id" => "call-t17-m1",
+                "type" => "function",
+                "function" => %{
+                  "name" => "self_config_set",
+                  "arguments" => JSON.encode!(%{"fields" => %{"model" => "kimi-self"}})
+                }
+              }
+            ]
+          }
+        end
+
+      {:ok, %{status: 200, body: JSON.encode!(%{"choices" => [%{"message" => message}]})}}
+    end
+  end
+
   setup do
     uniq = "#{System.os_time()}-#{System.unique_integer([:positive])}"
     key_dir = Path.join(System.tmp_dir!(), "kyber-t17di-key-#{uniq}")
@@ -186,6 +241,50 @@ defmodule Kyber.Agent.T17DaemonIdentityTest do
     ingest!(key_dir, 1)
     assert_receive {:t17_llm_body, body}, 60_000
     assert body["model"] == "kimi-hot"
+  end
+
+  test "a hot-swap landing mid-LLM-call never kills the daemon (P5 HIGH-1)", %{
+    key_dir: key_dir
+  } do
+    append_set!(@operator_seed, @base_ts, %{model: "kimi-base", api_key_env: "T17_DI_KEY"})
+
+    {:ok, llm} =
+      LlmHandler.new(
+        seed: @daemon_seed,
+        api_key: @key_value,
+        model: "kimi-base",
+        http: {SlowHttp, %{reply_to: self()}}
+      )
+
+    boot!(key_dir, llm, model: "kimi-base")
+    daemon = Process.whereis(Kyber.Daemon)
+    ref = Process.monitor(daemon)
+
+    # the engine goes busy: the stub blocks the engine process mid-HTTP-call
+    ingest!(key_dir, 1)
+    assert_receive {:t17_slow_started, in_flight}, 60_000
+
+    # the config delta lands while the engine is blocked — pre-fix the
+    # daemon->reactor->engine call chain timed out at 5s and the exit
+    # cascaded through the links into the daemon
+    append_set!(@operator_seed, @base_ts + 10, %{model: "kimi-hot"})
+
+    refute_receive {:DOWN, ^ref, :process, _, _}, 7_000
+    assert Process.alive?(daemon)
+    assert eventually(fn -> live_model() == "kimi-hot" end)
+
+    # release the in-flight call: it completes under the config it started
+    # with — the queued swap applies only after it returns
+    send(in_flight, :t17_release)
+    assert_receive {:t17_llm_body, first}, 60_000
+    assert first["model"] == "kimi-base"
+
+    # the NEXT inference runs the rederived config
+    ingest!(key_dir, 2)
+    assert_receive {:t17_slow_started, next}, 60_000
+    send(next, :t17_release)
+    assert_receive {:t17_llm_body, second}, 60_000
+    assert second["model"] == "kimi-hot"
   end
 
   test "a CLI override survives the hot-swap; status shows fold AND live (AC23)", %{
@@ -362,6 +461,65 @@ defmodule Kyber.Agent.T17DaemonIdentityTest do
     encoded = JSON.encode!(body)
     refute encoded =~ @operator_seed
     assert encoded =~ "[REDACTED]"
+  end
+
+  test "a live agent boot SERVES self_config.set and a granted call folds (P5 MEDIUM-1)", %{
+    key_dir: key_dir
+  } do
+    append_set!(@operator_seed, @base_ts, %{
+      model: "kimi-base",
+      api_key_env: "T17_DI_KEY",
+      self_config: "true"
+    })
+
+    {:ok, llm} =
+      LlmHandler.new(
+        seed: @daemon_seed,
+        api_key: @key_value,
+        model: "kimi-base",
+        http: {ToolHttp, %{reply_to: self()}}
+      )
+
+    # deliberately NO :tools in the engine opts — the boot path itself must
+    # wire the tool into what the reactor serves
+    {:ok, _pid} =
+      Daemon.boot(
+        keyring_dir: key_dir,
+        tick_ms: :manual,
+        loop: :reactor,
+        oracle_seed: :present,
+        engine: [llm: llm],
+        agent: "wisp",
+        operator_seed: @operator_seed,
+        api_key: @key_value
+      )
+
+    ingest!(key_dir, 1)
+
+    # the FIRST request already advertises the tool
+    assert_receive {:t17_llm_body, first}, 60_000
+    names = for %{"function" => %{"name" => name}} <- first["tools"] || [], do: name
+    assert "self_config_set" in names
+
+    # the model's call mints an AGENT-authored AgentSet that folds live
+    assert eventually(fn ->
+             get_in(Daemon.status(), [:config, :fold, :model]) == "kimi-self"
+           end),
+           "the self_config.set call never folded (status: #{inspect(Daemon.status())})"
+
+    # the minted delta is AGENT-sourced (the daemon's boot signing key),
+    # never operator-attested
+    minted =
+      for {_id, {claims, _sig}} <- DurableStore.set(),
+          match?(%{type: "AgentSet", model: "kimi-self"}, Schema.resolve(claims)),
+          do: claims.author
+
+    assert [author] = minted
+    refute author == Keys.author_for_seed(@operator_seed)
+
+    # the turn resumes over the ToolResult and completes
+    assert_receive {:t17_llm_body, second}, 60_000
+    assert Enum.any?(second["messages"], &(&1["role"] == "tool"))
   end
 
   test "an operator-attested bad delta is detection-only — never auto-retracted (AC12)", %{

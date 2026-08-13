@@ -91,11 +91,14 @@ defmodule Kyber.Agent.Engine do
   the handler STRUCT (`struct/2`), so the HTTP transport seam and every
   unnamed field survive untouched (a test stub stays a stub; the real
   adapter stays real). The next inference cycle runs the new config; no
-  restart, no re-queue.
+  restart, no re-queue. Delivered as a cast (P5 HIGH-1): the engine may be
+  blocked in a long HTTP inference, and a synchronous call from the swap
+  path would time out and cascade; the mailbox applies the swap as soon as
+  the in-flight request returns.
   """
   @spec swap_llm_config(GenServer.server(), map()) :: :ok
   def swap_llm_config(engine \\ __MODULE__, changes) when is_map(changes) do
-    GenServer.call(engine, {:swap_llm_config, changes})
+    GenServer.cast(engine, {:swap_llm_config, changes})
   end
 
   # -------------------------------------------------------------- callbacks
@@ -129,14 +132,14 @@ defmodule Kyber.Agent.Engine do
     {:noreply, dispatch(delta, state)}
   end
 
+  def handle_cast({:swap_llm_config, changes}, state) do
+    {:noreply, %{state | llm: struct(state.llm, changes)}}
+  end
+
   @impl true
   def handle_call(:status, _from, state) do
     counters = Map.take(state, [:answered, :skipped, :tool_calls])
     {:reply, Map.put(counters, :pending, map_size(state.pending)), state}
-  end
-
-  def handle_call({:swap_llm_config, changes}, _from, state) do
-    {:reply, :ok, %{state | llm: struct(state.llm, changes)}}
   end
 
   def handle_call(:resume, _from, state) do
