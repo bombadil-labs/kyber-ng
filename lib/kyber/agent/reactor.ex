@@ -204,6 +204,19 @@ defmodule Kyber.Agent.Reactor do
     end
   end
 
+  # P5 round-3 M3: a crash report dumps the state — the signing seed must
+  # never print in plaintext (the D8 log-leak class on the crash path)
+  @impl true
+  def format_status(status) do
+    Map.new(status, fn
+      {:state, %{seed: seed} = state} when not is_nil(seed) ->
+        {:state, %{state | seed: "<redacted>"}}
+
+      other ->
+        other
+    end)
+  end
+
   @impl true
   def handle_cast({:ingest, delta}, state) do
     # pin 8: routing owns once-per-delta-id — a push duplicate (the flush's

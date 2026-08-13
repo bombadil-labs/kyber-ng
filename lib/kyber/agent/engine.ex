@@ -136,6 +136,21 @@ defmodule Kyber.Agent.Engine do
     {:noreply, %{state | llm: struct(state.llm, changes)}}
   end
 
+  # P5 round-3 M3: a crash report dumps the state — the handler struct's
+  # seed/api_key must never print in plaintext (the D8 log-leak class on
+  # the crash path)
+  @impl true
+  def format_status(status) do
+    Map.new(status, fn
+      {:state, %{llm: %LlmHandler{} = llm} = state} ->
+        {:state,
+         %{state | llm: %{llm | seed: "<redacted>", api_key: "<redacted>", redact: "<redacted>"}}}
+
+      other ->
+        other
+    end)
+  end
+
   @impl true
   def handle_call(:status, _from, state) do
     counters = Map.take(state, [:answered, :skipped, :tool_calls])

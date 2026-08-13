@@ -594,7 +594,8 @@ defmodule Kyber.Agent.ToolExecutor do
     with {:agent, agent} when is_binary(agent) <- {:agent, context[:agent]},
          {:ok, fields} <- decode_self_config_args(args),
          :ok <- refuse_operator_attested(fields),
-         :ok <- self_config_granted(set, agent, context[:operator_authors]),
+         :ok <-
+           self_config_granted(set, agent, context[:operator_authors], context[:agent_author]),
          :ok <- door(fields) do
       case Events.agent_set(seed, ts, agent, fields) do
         {:ok, signed} -> {[Wire.envelope(signed)], "updated config for " <> agent, "ok"}
@@ -660,9 +661,11 @@ defmodule Kyber.Agent.ToolExecutor do
   # P5 MEDIUM-2: the grant is read through the PINNED operator chain when
   # the boot threads one (context[:operator_authors]) — unpinned resolve/2
   # is display-only, and a backdated first-author delta could grant itself
-  # under it. nil operators => legacy fallback (chainless handler tests).
-  defp self_config_granted(set, agent, operators) do
-    case Config.resolve(set, agent, operators) do
+  # under it. The agent-author pin rides along (P5 HIGH-1) so the grant
+  # read matches the daemon's own fold. nil pins => legacy fallback
+  # (chainless handler tests).
+  defp self_config_granted(set, agent, operators, agent_author) do
+    case Config.resolve(set, agent, operators, agent_author) do
       {:ok, %{self_config: true}} -> :ok
       _other -> {:error, "no live self_config grant for " <> agent}
     end

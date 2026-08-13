@@ -13,10 +13,18 @@ defmodule Kyber.Agent.Config do
   from delta ordering. Timestamps are self-asserted, so first-writer-wins
   would let a backdated delta seize operatorship (P5 HIGH-2); the two-arg
   `resolve/2` keeps the legacy earliest-author reading for DISPLAY-ONLY
-  paths and must not gate anything. The H2c author filter applies with a
-  PROSPECTIVE `self_config` grant: an agent-authored delta folds only when
-  a live operator-attested grant precedes it in `{timestamp, id}` order —
-  a pre-grant agent delta stays inert forever, and retracting the grant
+  paths and must not gate anything. The AGENT is PINNED the same way (P5
+  HIGH-1): `resolve/4` takes the agent's own author (content-derived from
+  the agent seed the daemon boots with) and admits agent-sourced deltas
+  ONLY from it — the `self_config` grant gates WHAT an agent delta may do,
+  never WHO may author one, so a leaked rotated-away operator seed (or any
+  third party) is fold-inert even under a live grant. `:none` pins an
+  EMPTY agent identity (no agent seed exists yet — every non-operator
+  delta is refused); `nil` keeps the legacy admit-any reading for
+  display-only callers. The H2c author filter applies with a PROSPECTIVE
+  `self_config` grant: an admitted agent delta folds only when a live
+  operator-attested grant precedes it in `{timestamp, id}` order — a
+  pre-grant agent delta stays inert forever, and retracting the grant
   de-activates everything it admitted. `base_url` AND `operator_seed_env`
   fold ONLY when operator-attested, regardless of the grant (premortem P0
   and P5 HIGH-3 — a prompt-injected agent must not point the key at an
@@ -77,12 +85,22 @@ defmodule Kyber.Agent.Config do
   the current operator). `nil` falls back to the legacy earliest-author
   reading, which trusts self-asserted timestamps — display-only; every
   gate-bearing caller (daemon boot/hot-swap, CLI write verbs) must pin.
-  """
-  @spec resolve(DeltaSet.t(), String.t(), String.t() | [String.t()] | nil) ::
-          {:ok, view()} | :not_found
-  def resolve(set, name, operators \\ nil)
 
-  def resolve(set, name, operators) when is_binary(name) do
+  `agent_author` pins the agent's own author (P5 HIGH-1): a binary admits
+  agent-sourced deltas from exactly that author; `:none` admits none (no
+  agent seed has ever existed for this store — fail closed); `nil` keeps
+  the legacy admit-any-under-grant reading, display-only.
+  """
+  @spec resolve(
+          DeltaSet.t(),
+          String.t(),
+          String.t() | [String.t()] | nil,
+          String.t() | :none | nil
+        ) ::
+          {:ok, view()} | :not_found
+  def resolve(set, name, operators \\ nil, agent_author \\ nil)
+
+  def resolve(set, name, operators, agent_author) when is_binary(name) do
     if String.trim(name) == "" do
       :not_found
     else
@@ -92,7 +110,7 @@ defmodule Kyber.Agent.Config do
 
         [{_id, _resolved, first} | _] = deltas ->
           operators = operator_chain(operators, first)
-          {acc, heads} = walk(set, deltas, operators)
+          {acc, heads} = walk(set, deltas, operators, agent_author)
 
           if acc == %{} do
             :not_found
@@ -294,8 +312,11 @@ defmodule Kyber.Agent.Config do
   # the ordered walk carries the PROSPECTIVE grant state: `granted` is the
   # folded self_config value at each position, so an agent delta folds only
   # under a live operator grant that PRECEDES it — and a retracted grant
-  # de-activates everything it admitted (liveness is fold-time)
-  defp walk(set, deltas, operators) do
+  # de-activates everything it admitted (liveness is fold-time). The agent
+  # pin gates ADMISSION (P5 HIGH-1): under a pinned agent author only the
+  # agent's own deltas ever reach the grant check — the grant decides WHAT
+  # folds, never WHO may author.
+  defp walk(set, deltas, operators, agent_author) do
     {acc, heads, _granted} =
       Enum.reduce(deltas, {%{}, %{}, false}, fn {id, resolved, claims}, {acc, heads, granted} ->
         cond do
@@ -307,7 +328,7 @@ defmodule Kyber.Agent.Config do
               {acc, heads, granted}
             end
 
-          granted ->
+          granted and agent_admitted?(agent_author, claims.author) ->
             if Liveness.live?(set, id, agent_filter(operators, claims.author)) do
               {acc, heads} = apply_fields(acc, heads, id, resolved, :agent)
               {acc, heads, granted_after(acc)}
@@ -324,6 +345,13 @@ defmodule Kyber.Agent.Config do
   end
 
   defp granted_after(acc), do: Map.get(acc, :self_config) == "true"
+
+  # the P5 HIGH-1 admission pin: a pinned binary admits exactly the agent's
+  # own author; :none admits nobody (no agent seed exists — fail closed);
+  # nil is the legacy admit-any reading (display-only callers)
+  defp agent_admitted?(nil, _author), do: true
+  defp agent_admitted?(:none, _author), do: false
+  defp agent_admitted?(pinned, author) when is_binary(pinned), do: author == pinned
 
   defp apply_fields(acc, heads, id, resolved, source) do
     sets =

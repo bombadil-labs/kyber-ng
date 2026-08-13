@@ -68,7 +68,10 @@ defmodule Kyber.CLI do
                                            append an operator-attested AgentSet delta (only changed
                                            fields; re-asserting the current value is a no-op).
                                            --api-key (bare) reads the key from STDIN and stores it
-                                           encrypted; a key VALUE on argv is refused (ps-visible)
+                                           encrypted; a key VALUE on argv is refused (ps-visible).
+                                           Write verbs (set/retract/rekey/tombstone) REFUSE while a
+                                           daemon holds the store lock — route the change through
+                                           `kyber ctl set-config` instead; offline appends directly
     agent retract <name> <delta-id>        negate a delta; the fold steps back per field
     agent rekey <name> --new-seed-env NAME move operator authority to the new seed: the old-signed
                                            handoff + a new-signed config snapshot land in the store
@@ -730,7 +733,12 @@ defmodule Kyber.CLI do
           |> Enum.flat_map(fn name ->
             paths = agent_paths(registry, name)
 
-            case Config.resolve(agent_load_set(paths.store), name, agent_pointer_chain(paths)) do
+            case Config.resolve(
+                   agent_load_set(paths.store),
+                   name,
+                   agent_pointer_chain(paths),
+                   agent_pinned_author(paths.keyring)
+                 ) do
               {:ok, view} -> [agent_list_line(view)]
               :not_found -> []
             end
@@ -756,7 +764,12 @@ defmodule Kyber.CLI do
     if File.exists?(paths.pointer) do
       set = agent_load_set(paths.store)
 
-      case Config.resolve(set, opts.name, agent_pointer_chain(paths)) do
+      case Config.resolve(
+             set,
+             opts.name,
+             agent_pointer_chain(paths),
+             agent_pinned_author(paths.keyring)
+           ) do
         {:ok, view} ->
           {:ok, agent_render(view, set)}
 
@@ -1007,23 +1020,75 @@ defmodule Kyber.CLI do
   defp agent_open(opts) do
     paths = agent_paths(agent_registry(opts), opts.name)
 
-    if File.exists?(paths.pointer) do
-      set = agent_load_set(paths.store)
+    cond do
+      not File.exists?(paths.pointer) ->
+        {:error, {:unknown_agent, opts.name}}
 
-      view =
-        case Config.resolve(set, opts.name, agent_pointer_chain(paths)) do
-          {:ok, view} -> view
-          :not_found -> nil
-        end
+      # P5 round-3 M2: single-writer. A live daemon's DurableStore
+      # subscription is in-process only — a direct append behind its back
+      # diverges silently until restart. Route live changes through the
+      # served channel (`kyber ctl set-config`); offline appends directly.
+      agent_store_live?(paths.store) ->
+        {:error, {:agent_live, opts.name}}
 
-      {:ok, paths, set, view}
-    else
-      {:error, {:unknown_agent, opts.name}}
+      true ->
+        set = agent_load_set(paths.store)
+
+        view =
+          case Config.resolve(
+                 set,
+                 opts.name,
+                 agent_pointer_chain(paths),
+                 agent_pinned_author(paths.keyring)
+               ) do
+            {:ok, view} -> view
+            :not_found -> nil
+          end
+
+        {:ok, paths, set, view}
     end
   end
 
-  defp agent_view_or_nil(store_path, name, chain) do
-    case Config.resolve(agent_load_set(store_path), name, chain) do
+  # the daemon's lock file (`<store>.lock`, OS pid inside) is the liveness
+  # oracle — same `ps -p` posture as the daemon's own reclaim check (EPERM-
+  # safe); our OWN pid counts as live (an in-VM daemon is still the writer)
+  defp agent_store_live?(store_path) do
+    case File.read(store_path <> ".lock") do
+      {:ok, content} ->
+        pid = String.trim(content)
+        pid == System.pid() or agent_os_pid_alive?(pid)
+
+      {:error, _no_lock} ->
+        false
+    end
+  end
+
+  defp agent_os_pid_alive?(pid_text) do
+    case Integer.parse(pid_text) do
+      {n, ""} when n > 0 ->
+        match?({_, 0}, System.cmd("ps", ["-p", Integer.to_string(n)], stderr_to_stdout: true))
+
+      _garbage ->
+        false
+    end
+  end
+
+  # P5 round-3 H1: the agent-admission pin for CLI folds — the agent author
+  # derives from the registry keyring's `agent.seed` (the seed the daemon
+  # boots with). Absent or garbage seed folds FAIL-CLOSED (`:none`): no
+  # agent identity exists, so no agent-authored delta is admissible.
+  defp agent_pinned_author(keyring_dir) do
+    with {:ok, content} <- File.read(Path.join(keyring_dir, "agent.seed")),
+         seed = content |> String.trim() |> String.downcase(),
+         {:ok, <<_::binary-32>>} <- Base.decode16(seed, case: :mixed) do
+      Keys.author_for_seed(seed)
+    else
+      _absent_or_garbage -> :none
+    end
+  end
+
+  defp agent_view_or_nil(store_path, name, chain, agent_author) do
+    case Config.resolve(agent_load_set(store_path), name, chain, agent_author) do
       {:ok, view} -> view
       :not_found -> nil
     end
@@ -1431,7 +1496,13 @@ defmodule Kyber.CLI do
   # decrypted under the operator seed in the unlogged window.
   defp cmd_daemon(%{agent: agent} = opts) when is_binary(agent) do
     with {:ok, pointer} <- agent_read_pointer(opts),
-         view = agent_view_or_nil(pointer.log_path, agent, pointer.operator_authors),
+         view =
+           agent_view_or_nil(
+             pointer.log_path,
+             agent,
+             pointer.operator_authors,
+             agent_pinned_author(pointer.keyring_dir)
+           ),
          {:ok, operator_seed} <- agent_boot_operator_seed(opts, view),
          {:ok, api_key} <- agent_boot_api_key(opts, view, operator_seed) do
       overrides = daemon_override_opts(opts)
@@ -1902,6 +1973,12 @@ defmodule Kyber.CLI do
 
   defp format_error(:no_stdin_key),
     do: "no key on stdin — pipe the secret value: echo $KEY | kyber agent set <name> --api-key"
+
+  defp format_error({:agent_live, name}),
+    do:
+      "agent #{name} is live (a daemon holds its store lock) — a direct append would " <>
+        "diverge from the running fold; route the change through the daemon: " <>
+        "kyber ctl set-config"
 
   defp format_error({:unknown_delta, id}), do: "unknown delta: #{id}"
 

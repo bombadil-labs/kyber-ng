@@ -383,6 +383,59 @@ defmodule Kyber.Agent.T17ConfigFoldTest do
     end
   end
 
+  # ------------------------------------------- pinned agent identity (H1 r3)
+
+  describe "Config.resolve/4 — the agent author is PINNED under a grant (P5 round-3 H1)" do
+    test "a third-party delta under a live grant does NOT fold when the agent is pinned" do
+      operator = Keys.author_for_seed(@operator_seed)
+      agent_author = Keys.author_for_seed(@agent_seed)
+
+      pairs = [
+        agent_set("wisp", @genesis_fields, ts: @ts),
+        agent_set("wisp", %{self_config: "true"}, ts: @ts + 1),
+        # the leaked/rotated-away seed: not the operator, not the agent
+        agent_set("wisp", %{model: "intruder-choice"}, seed: @intruder_seed, ts: @ts + 2)
+      ]
+
+      set = set_of(pairs)
+
+      # the legacy nil pin admits it (the documented display-only hole)
+      assert {:ok, %{model: "intruder-choice"}} = Config.resolve(set, "wisp", operator)
+
+      # the pinned fold refuses it: the grant decides WHAT folds, the pin
+      # decides WHO may author
+      assert {:ok, view} = Config.resolve(set, "wisp", operator, agent_author)
+      assert view.model == "deepseek-v4-flash"
+    end
+
+    test "the pinned agent author's own delta folds under the grant" do
+      operator = Keys.author_for_seed(@operator_seed)
+      agent_author = Keys.author_for_seed(@agent_seed)
+
+      pairs = [
+        agent_set("wisp", @genesis_fields, ts: @ts),
+        agent_set("wisp", %{self_config: "true"}, ts: @ts + 1),
+        agent_set("wisp", %{model: "agent-choice"}, seed: @agent_seed, ts: @ts + 2)
+      ]
+
+      assert {:ok, %{model: "agent-choice"}} =
+               Config.resolve(set_of(pairs), "wisp", operator, agent_author)
+    end
+
+    test ":none fails closed — no agent seed exists, no non-operator delta folds" do
+      operator = Keys.author_for_seed(@operator_seed)
+
+      pairs = [
+        agent_set("wisp", @genesis_fields, ts: @ts),
+        agent_set("wisp", %{self_config: "true"}, ts: @ts + 1),
+        agent_set("wisp", %{model: "agent-choice"}, seed: @agent_seed, ts: @ts + 2)
+      ]
+
+      assert {:ok, %{model: "deepseek-v4-flash"}} =
+               Config.resolve(set_of(pairs), "wisp", operator, :none)
+    end
+  end
+
   # --------------------------------------------- api_key union unset (LOW-1)
 
   describe "Config.resolve — api_key union unset (P5 L1 probe)" do

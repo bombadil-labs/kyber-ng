@@ -113,6 +113,11 @@ defmodule Kyber.Agent.T17DaemonIdentityTest do
     File.mkdir_p!(key_dir)
     File.mkdir_p!(log_dir)
     :ok = Keys.import_human_seed(@daemon_seed, key_dir)
+    # P5 round-3 HIGH-1: the daemon's agent identity is DETERMINISTIC — the
+    # fold's agent-admission pin derives from this seed, and the tests sign
+    # the agent's own deltas with it (a random-minted seed would make every
+    # agent-authored append fold-inert under the pin)
+    File.write!(Path.join(key_dir, "agent.seed"), @daemon_seed)
     log_path = Path.join(log_dir, "store.jsonl")
 
     config_log_path = Application.get_env(:kyber, :log_path)
@@ -336,8 +341,9 @@ defmodule Kyber.Agent.T17DaemonIdentityTest do
       rollback_threshold: 2
     )
 
-    # the agent self-configures a broken model (granted by the operator)
-    agent_delta = append_set!(@agent_seed, @base_ts + 10, %{model: "kimi-broken"})
+    # the agent self-configures a broken model (granted by the operator;
+    # signed with the daemon's OWN pinned seed — P5 round-3 HIGH-1)
+    agent_delta = append_set!(@daemon_seed, @base_ts + 10, %{model: "kimi-broken"})
     assert eventually(fn -> live_model() == "kimi-broken" end)
 
     # first inference after the self-config delta fails config-class (401)
@@ -377,7 +383,7 @@ defmodule Kyber.Agent.T17DaemonIdentityTest do
       rollback_threshold: 2
     )
 
-    append_set!(@agent_seed, @base_ts + 10, %{model: "kimi-broken"})
+    append_set!(@daemon_seed, @base_ts + 10, %{model: "kimi-broken"})
     assert eventually(fn -> live_model() == "kimi-broken" end)
 
     :ets.insert(table, {:mode, {:fail, 429}})
@@ -415,7 +421,7 @@ defmodule Kyber.Agent.T17DaemonIdentityTest do
     # happens AT THE SWAP, before any inference — the harness must already
     # be armed with this delta and roll it back (never `failures: 0` reset
     # after the failing swap)
-    agent_delta = append_set!(@agent_seed, @base_ts + 10, %{api_key_env: "T17_DI_MISSING"})
+    agent_delta = append_set!(@daemon_seed, @base_ts + 10, %{api_key_env: "T17_DI_MISSING"})
 
     assert eventually(fn -> agent_delta in retract_targets() end),
            "the swap-time key failure never fed the harness (status: #{inspect(Daemon.status())})"
@@ -635,5 +641,112 @@ defmodule Kyber.Agent.T17DaemonIdentityTest do
       )
 
     assert [{^first_id, _claims}] = soul_mints()
+  end
+
+  test "a third-party delta under a live grant is fold-inert; the pinned agent author folds (P5 r3 HIGH-1)",
+       %{key_dir: key_dir} do
+    table = :ets.new(:t17_stub, [:public])
+    :ets.insert(table, {:mode, :ok})
+
+    append_set!(@operator_seed, @base_ts, %{
+      model: "kimi-base",
+      api_key_env: "T17_DI_KEY",
+      self_config: "true"
+    })
+
+    boot!(key_dir, stub_llm(table, model: "kimi-base"), model: "kimi-base")
+
+    # the PINNED agent author (the daemon's own boot seed) folds under the grant
+    append_set!(@daemon_seed, @base_ts + 10, %{model: "kimi-own"})
+    assert eventually(fn -> live_model() == "kimi-own" end)
+
+    # a leaked/rotated-away seed's delta at a LATER timestamp under the same
+    # grant — pre-fix last-set-wins admitted any author and it would seize
+    # the model; pinned it must never fold
+    append_set!(@agent_seed, @base_ts + 20, %{model: "kimi-evil"})
+
+    # no-sleep choreography: a later operator delta proves the daemon's FIFO
+    # mailbox processed the feed PAST the intruder delta
+    append_set!(@operator_seed, @base_ts + 30, %{soul: "post-intruder marker"})
+
+    assert eventually(fn ->
+             get_in(Daemon.status(), [:config, :fold, :soul]) == "post-intruder marker"
+           end)
+
+    assert get_in(Daemon.status(), [:config, :fold, :model]) == "kimi-own"
+    assert live_model() == "kimi-own"
+  end
+
+  test "rollback retracts ONLY the failing field's setter — a benign soul delta survives (P5 r3 MEDIUM-1)",
+       %{key_dir: key_dir} do
+    table = :ets.new(:t17_stub, [:public])
+    :ets.insert(table, {:mode, :ok})
+
+    append_set!(@operator_seed, @base_ts, %{
+      model: "kimi-base",
+      api_key_env: "T17_DI_KEY",
+      self_config: "true"
+    })
+
+    boot!(key_dir, stub_llm(table, model: "kimi-base"),
+      model: "kimi-base",
+      test_pid: self(),
+      rollback_threshold: 2
+    )
+
+    # the agent breaks the model, THEN ships a benign soul delta — the soul
+    # delta is the NEWEST AgentSet when the failures land (pre-fix the
+    # single-slot harness blamed it and the broken model survived rollback)
+    broken = append_set!(@daemon_seed, @base_ts + 10, %{model: "kimi-broken"})
+    assert eventually(fn -> live_model() == "kimi-broken" end)
+
+    benign = append_set!(@daemon_seed, @base_ts + 20, %{soul: "agent-souled"})
+
+    assert eventually(fn ->
+             get_in(Daemon.status(), [:config, :fold, :soul]) == "agent-souled"
+           end)
+
+    :ets.insert(table, {:mode, {:fail, 401}})
+    ingest!(key_dir, 1)
+    assert_receive {:engine, {:llm_error, {:llm_http, 401, _body}}}, 60_000
+    ingest!(key_dir, 2)
+    assert_receive {:engine, {:llm_error, {:llm_http, 401, _body}}}, 60_000
+
+    assert eventually(fn -> broken in retract_targets() end),
+           "the broken model delta was never retracted"
+
+    # blame is PER FIELD: the newest (benign) delta is not the offender
+    refute benign in retract_targets()
+    assert get_in(Daemon.status(), [:config, :fold, :soul]) == "agent-souled"
+    assert eventually(fn -> live_model() == "kimi-base" end)
+    assert Daemon.status().rollbacks == 1
+  end
+
+  test "GenServer state dumps redact the seeds and key material (P5 r3 MEDIUM-3)", %{
+    key_dir: key_dir
+  } do
+    table = :ets.new(:t17_stub, [:public])
+    :ets.insert(table, {:mode, :ok})
+
+    append_set!(@operator_seed, @base_ts, %{model: "kimi-base", api_key_env: "T17_DI_KEY"})
+    boot!(key_dir, stub_llm(table, model: "kimi-base"), model: "kimi-base")
+
+    # the reactor hosts its engine anonymously — the pid rides its state
+    engine = :sys.get_state(Kyber.Agent.Reactor).engine
+    assert is_pid(engine)
+
+    # :sys.get_status runs the same format_status/1 a crash report uses —
+    # the dump must carry the marker and never a secret byte
+    for server <- [Kyber.Daemon, Kyber.Agent.Reactor, engine] do
+      dump =
+        server
+        |> :sys.get_status()
+        |> inspect(limit: :infinity, printable_limit: :infinity)
+
+      refute dump =~ @daemon_seed, "#{inspect(server)} leaks the agent seed"
+      refute dump =~ @operator_seed, "#{inspect(server)} leaks the operator seed"
+      refute dump =~ @key_value, "#{inspect(server)} leaks the api key"
+      assert dump =~ "<redacted>", "#{inspect(server)} shows no redaction marker"
+    end
   end
 end

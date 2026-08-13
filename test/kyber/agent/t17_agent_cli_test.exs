@@ -264,6 +264,39 @@ defmodule Kyber.Agent.T17AgentCliTest do
     end
   end
 
+  describe "single-writer: write verbs vs a live daemon (P5 r3 MEDIUM-2)" do
+    test "a held store lock REFUSES the write with the ctl repair; a dead lock is stale", %{
+      registry: registry
+    } do
+      new!(registry)
+
+      # a live daemon: the lock beside the store carries a LIVE OS pid (our
+      # own — an in-VM daemon is still the single writer)
+      lock = store_path(registry) <> ".lock"
+      File.write!(lock, System.pid())
+
+      before = store_lines(registry)
+      assert {:error, message} = agent(["set", "wisp", "--model", "kimi-k3"], registry)
+      # legible: names the agent, says it is live, points at the ctl path
+      assert message =~ "wisp"
+      assert message =~ "live"
+      assert message =~ "ctl set-config"
+      # NO delta landed behind the daemon's back — the store is untouched
+      assert store_lines(registry) == before
+
+      # retract is a write verb too: same refusal
+      assert {:error, retract_message} =
+               agent(["retract", "wisp", "deadbeef"], registry)
+
+      assert retract_message =~ "live"
+
+      # a dead pid's lock is STALE: the offline mutation path stands
+      File.write!(lock, "999999999")
+      assert {:ok, _} = agent(["set", "wisp", "--model", "kimi-k3"], registry)
+      assert fold!(registry).model == "kimi-k3"
+    end
+  end
+
   describe "agent retract (AC13/AC15/AC16)" do
     test "retracting the override steps the fold back to the genesis layer", %{
       registry: registry
