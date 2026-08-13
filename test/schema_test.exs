@@ -197,14 +197,42 @@ defmodule Kyber.SchemaTest do
     # the emitter's role set minus the declaration, and the emitted claims
     # validate typed as-is.
     for {emitter, type, args} <- [
-          {&Events.message_received/6, "MessageReceived",
-           {@seed, @ts, "msg:1", "channel:cli", "session:1", "hello"}},
+          # T14j (C2): the evolved schema's drift-proof entry rides /7 with a
+          # NON-nil discord_user — the regen is EXERCISED, never decorative
+          # (a /6 entry against the evolved schema fails the role-set
+          # equality below); the value is string-kind BY PIN
+          {&Events.message_received/7, "MessageReceived",
+           {@seed, @ts, "msg:1", "channel:cli", "session:1", "hello", "discord:user:12345"}},
           {&Events.message_sent/6, "MessageSent",
            {@seed, @ts, id64("77"), "msg:2", "channel:cli", "hi back"}},
           {&Events.prompt_annotated/4, "PromptAnnotated", {@seed, @ts, id64("77"), "a note"}},
           {&Events.llm_response/4, "LlmResponse", {@seed, @ts, id64("77"), "the answer"}},
           {&Events.tool_exec/6, "ToolInvoked",
-           {@seed, @ts, id64("77"), "tool:grep", "{}", "3 matches"}}
+           {@seed, @ts, id64("77"), "tool:grep", "{}", "3 matches"}},
+          # T14f (H5): the skill builders against the SkillSet/SkillRetract
+          # schemas — the fold only sees typed deltas, so schema drift would
+          # blind it silently
+          {&Kyber.Agent.Events.skill_set/7, "SkillSet",
+           {@seed, @ts, "greet", "Greet", "say hello", "{}", id64("99")}},
+          {&Kyber.Agent.Events.skill_retract/4, "SkillRetract",
+           {@seed, @ts, "greet", id64("99")}},
+          # T14g (G2/N2): the identity/profile builders and the profile-
+          # keyed PromptAssembled against their schemas — the fold only sees
+          # typed deltas, so schema drift would blind it silently
+          {&Kyber.Agent.Events.identity_set/6, "IdentitySet",
+           {@seed, @ts, "identity:soul", "soul", "I am Veles.", id64("99")}},
+          {&Kyber.Agent.Events.profile_set/7, "ProfileSet",
+           {@seed, @ts, "channel:discord", "rules", ["identity:soul"], ["memory.read"], ["memory"]}},
+          {&Kyber.Agent.Events.prompt_assembled/7, "PromptAssembled",
+           {@seed, @ts, "req-1", "session:s1", "{}", "channel:discord", id64("77")}},
+          # T14h (N5): the always-on family — StandingDigest / StandingFlag /
+          # EpochKeyMaterial builders against their schemas (the folds only
+          # see typed deltas, so schema drift would blind them silently)
+          {&Kyber.Agent.Events.standing_digest/5, "StandingDigest",
+           {@seed, @ts, "session:s1", "asked: hi", [id64("11")]}},
+          {&Kyber.Agent.Events.standing_flag/3, "StandingFlag", {@seed, @ts, "memory:e1"}},
+          {&Kyber.Agent.Events.epoch_key_material/5, "EpochKeyMaterial",
+           {@seed, @ts, "channel:discord", "[]", id64("99")}}
         ] do
       {:ok, {claims, _sig}} = apply(emitter, Tuple.to_list(args))
 

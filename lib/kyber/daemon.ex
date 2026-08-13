@@ -1,4 +1,5 @@
 defmodule Kyber.Daemon do
+  require Logger
   @moduledoc """
   The long-lived process (T10): an agent actually living in the claims
   substrate. The daemon boots against the app-configured store, watches the
@@ -56,6 +57,7 @@ defmodule Kyber.Daemon do
   use GenServer
 
   alias Kyber.{AgentLoop, DeltaSet, DurableStore, Gather, Keys, Log, Store, Wire}
+  alias Kyber.Agent.Profile
   alias Rhizomatic.Delta
 
   @default_tick_ms 250
@@ -82,9 +84,37 @@ defmodule Kyber.Daemon do
   `:manual`, default #{@default_tick_ms}), `:pulse_only` (list of kind-marker
   roles, default `[]` — persist-everything), `:narrate` (boolean, default
   false — one line per dispatch/fire/persist for the operator).
+
+  T14a (the reactor, OPT-IN — the default stays `:ack`, pin 25/H7):
+  `:loop` accepts `:reactor` (the reactor owns all five kinds wholesale; the
+  daemon's flush forwards cursor deltas to it as `{:ingest, delta}` casts
+  with a `:sync` barrier — pin 26), and the reactor boot opts thread through
+  untouched: `:oracle_seed` (`:present`/`:absent`, default `:absent` — the
+  pin-17 seed assertion), `:budget_cap` (positive integer, default 32),
+  `:engine` (keyword | `:none`, default `:none` — the hosted engine's full
+  construction surface, H6), `:test_pid` (observation pid for the
+  `Ctx.test_pid` probes).
   """
   @spec boot(keyword()) :: {:ok, pid()} | {:error, term()}
   def boot(opts) do
+    # T15 (AC1): thread the boot system_prompt into app env so
+    # Prompt.system_prompt/0 (assembly path) agrees with LlmHandler
+    # (gather path) — both must carry the same persona for a coherent
+    # agent. Only override when explicitly supplied; otherwise the pinned
+    # kyber default stands. Loop-agnostic: applies to :ack and :reactor.
+    case Keyword.get(opts, :system_prompt) do
+      sp when is_binary(sp) and sp != "" ->
+        Application.put_env(:kyber, :system_prompt, sp)
+
+      _ ->
+        # no explicit persona: clear any prior boot's override so the pinned
+        # kyber default is restored (prevents a previous agent's persona
+        # leaking into a default boot in the same BEAM).
+        if Application.get_env(:kyber, :system_prompt) do
+          Application.delete_env(:kyber, :system_prompt)
+        end
+    end
+
     if Process.whereis(Kyber.Supervisor) do
       case Supervisor.start_child(Kyber.Supervisor, spec(opts)) do
         {:ok, pid} -> {:ok, pid}
@@ -141,15 +171,28 @@ defmodule Kyber.Daemon do
 
     with :ok <- guard_store(),
          :ok <- guard_log(log_path),
+         # T14i (H7): the channel daemon consumes the SAME boot_context/1
+         # helper as attach — `--profile` with an absent/unnamed
+         # operator-seed env REFUSES boot ({:error, {:unknown_profile,
+         # name}}), never a silent profile-less render with keyed claims
+         # minting (AC3)
+         :ok <- guard_profile(opts),
          {:ok, seed} <- ensure_agent_seed(keyring_dir),
-         :ok <- take_lock(log_path) do
+         :ok <- take_lock(log_path),
+         {:ok, channel_socket} <- start_channel_socket(opts, log_path) do
       Process.flag(:trap_exit, true)
       {:ok, gather} = start_gather()
 
-      # `:loop` (T11b): `:ack` (default) subscribes the T10 deterministic ack
-      # loop — the fallback, not a casualty (AC9); `:none` leaves "received"
-      # to the LLM stack (`Kyber.Agent.attach/1` wires it post-boot)
-      if Keyword.get(opts, :loop, :ack) == :ack do
+      # `:loop` (T11b + T14a): `:ack` (default) subscribes the T10
+      # deterministic ack loop — the fallback, not a casualty (AC9);
+      # `:none` leaves "received" to the LLM stack
+      # (`Kyber.Agent.attach/1` wires it post-boot); `:reactor` (T14a,
+      # OPT-IN — the shipped default stays `:ack`, pin 25/H7) makes the
+      # reactor the owner of all five kinds wholesale — the daemon's own
+      # gather holds no reactor subscriptions (pin 25's own-container)
+      loop = Keyword.get(opts, :loop, :ack)
+
+      if loop == :ack do
         {:ok, _ref} = Gather.subscribe("received", AgentLoop.handler(seed))
       end
 
@@ -163,14 +206,46 @@ defmodule Kyber.Daemon do
         tick_ms: Keyword.get(opts, :tick_ms, @default_tick_ms),
         pulse_only: Keyword.get(opts, :pulse_only, []),
         narrate: Keyword.get(opts, :narrate, false),
+        loop: loop,
+        channel_socket: channel_socket,
+        reactor: nil,
+        adapter: nil,
         fired: 0,
         persisted: 0,
         pulsed: 0,
         skipped: 0
       }
 
-      schedule(state)
-      {:ok, state}
+      case loop do
+        :reactor ->
+          # pin 17: the oracle_seed boot-opt assertion — `:present` appends
+          # ONE fixed-content seed delta at boot, signed by the daemon's
+          # existing boot key (fixed content => fixed content-derived id =>
+          # the two-boot AC5 companion holds). M2: retraction-detection (a
+          # negates pointer targeting the seed id) is the gate's closing
+          # mechanism — the reactor reads it from store state.
+          reactor_opts = reactor_opts(opts, seed)
+
+          with :ok <- assert_oracle_seed(state, opts),
+               {:ok, reactor} <- start_reactor(reactor_opts),
+               # T15: the federation peer — opens a TCP listener so a sibling
+               # agent (e.g. Liet) can import Wisp's signed claims. Only when
+               # --peer-port is supplied; absent = no listener (the default).
+               {:ok, _peer} <- start_peer(opts),
+               # T14i (H9): the gateway adapter — daemon-owned like the
+               # socket, one per boot, never in the app tree
+               {:ok, adapter} <- start_gateway(state, opts) do
+            state = %{state | reactor: reactor, adapter: adapter}
+            schedule(state)
+            {:ok, state}
+          else
+            {:error, reason} -> {:stop, reason}
+          end
+
+        _ack_or_none ->
+          schedule(state)
+          {:ok, state}
+      end
     else
       {:error, reason} -> {:stop, reason}
     end
@@ -199,11 +274,27 @@ defmodule Kyber.Daemon do
   # the gather is link-coupled: if it dies abnormally the daemon stops with
   # it (the supervisor's :transient restart re-inits both)
   def handle_info({:EXIT, pid, reason}, %{gather: pid} = state), do: {:stop, reason, state}
+  # the reactor is link-coupled exactly like the gather: an abnormal death
+  # stops the daemon (the supervisor's :transient restart re-inits both)
+  def handle_info({:EXIT, pid, reason}, %{reactor: pid} = state), do: {:stop, reason, state}
+  # the gateway adapter is link-coupled the same way (T14i H9)
+  def handle_info({:EXIT, pid, reason}, %{adapter: pid} = state), do: {:stop, reason, state}
   def handle_info({:EXIT, _pid, _reason}, state), do: {:noreply, state}
 
   @impl true
   def terminate(_reason, state) do
     File.rm(state.lock)
+
+    # T14i (H2): the stale <log>.sock is removed under the held lock before
+    # bind AND here — a kill -9 leaves the file behind and the next boot's
+    # bind fails :eaddrinuse (only File.rm unblocks)
+    if is_pid(state.channel_socket) and Process.alive?(state.channel_socket) do
+      case :sys.get_state(state.channel_socket) do
+        %{path: path} -> File.rm(path)
+        _other -> :ok
+      end
+    end
+
     :ok
   end
 
@@ -215,10 +306,42 @@ defmodule Kyber.Daemon do
   defp do_tick(state) do
     {consumed, deltas} = collect(state)
     state = %{state | cursor: state.cursor + consumed}
-    {outputs, state} = dispatch(deltas, state)
-    state = Enum.reduce(outputs, state, fn wire, s -> sink(wire, s, 0) |> elem(1) end)
-    state = maybe_checkpoint(deltas, state)
-    heartbeat(state)
+
+    case state.loop do
+      :reactor ->
+        # pin 26/H1: under loop: :reactor the flush does NOT route through
+        # the daemon's own Gather (which holds no reactor subscriptions);
+        # it collects cursor deltas exactly as today and FORWARDS each as an
+        # {:ingest, delta} cast — the pin-1 seam — then performs the :sync
+        # barrier AFTER the forwarding casts (mailbox ordering: the casts are
+        # processed before the :sync reply), so tick returning means the
+        # forwarded deltas were ingested. Pin 8's once-per-delta-id routing
+        # dedupe drops any delta the push cast already delivered — only
+        # genuine log-tail dead letters actually dispatch.
+        state = forward_to_reactor(state, deltas)
+        state = maybe_checkpoint(deltas, state)
+        heartbeat(state)
+
+      _ack_or_none ->
+        {outputs, state} = dispatch(deltas, state)
+        state = Enum.reduce(outputs, state, fn wire, s -> sink(wire, s, 0) |> elem(1) end)
+        state = maybe_checkpoint(deltas, state)
+        heartbeat(state)
+    end
+  end
+
+  # the reactor-mode flush: cast each cursor delta into the reactor (the
+  # pin-1 seam), then the sync barrier. The reactor NEVER makes a
+  # synchronous call to the daemon (pin 26(c)) — daemon->reactor traffic is
+  # casts plus this single :sync call inside tick.
+  defp forward_to_reactor(state, deltas) do
+    Enum.each(deltas, fn delta ->
+      narrate(state, "forwarded #{kind(delta)} #{short(delta.id)}")
+      GenServer.cast(Kyber.Agent.Reactor, {:ingest, delta})
+    end)
+
+    GenServer.call(Kyber.Agent.Reactor, :sync)
+    state
   end
 
   # the log-channel intake: everything past the cursor, classified exactly
@@ -378,9 +501,16 @@ defmodule Kyber.Daemon do
     build_signed(state, [%{role: "tick", target: {:entity, "cron:daemon-ticker", "fired"}}])
   end
 
-  defp build_signed(state, pointers) do
+  defp build_signed(state, pointers), do: build_signed(state, pointers, now_ts())
+
+  # pin 17: the oracle seed's timestamp is FIXED (never now) — the seed's
+  # content-derived id must be identical across boots for the two-boot AC5
+  # companion (identical seeded commit sequence => identical delta-id sets)
+  @oracle_seed_ts 1_700_000_000_000.0
+
+  defp build_signed(state, pointers, ts) do
     raw = %{
-      timestamp: 1.0 * System.system_time(:millisecond),
+      timestamp: ts,
       author: state.author,
       pointers: pointers
     }
@@ -389,6 +519,8 @@ defmodule Kyber.Daemon do
     {:ok, sig} = Keys.sign(claims, state.seed)
     Wire.envelope({claims, sig})
   end
+
+  defp now_ts, do: 1.0 * System.system_time(:millisecond)
 
   # the cursor is derived, never a source of truth: the highest checkpoint
   # position in the replayed set
@@ -438,6 +570,220 @@ defmodule Kyber.Daemon do
       {:error, {:already_started, pid}} ->
         Process.link(pid)
         {:ok, pid}
+    end
+  end
+
+  # T14a (H3): the reactor boot path. Started only under loop: :reactor; the
+  # boot opts budget_cap:/engine:/test_pid are threaded UNTOUCHED to the
+  # reactor (pins 12/21, H6). T14c (D6): :operator_seed (caller-resolved
+  # hex — the daemon loads no keyring itself) rides the same whitelist,
+  # which would otherwise drop the opt before Reactor.start_link.
+  defp reactor_opts(opts, seed) do
+    llm_opts = [
+      api_key: Keyword.get(opts, :api_key),
+      base_url: Keyword.get(opts, :base_url),
+      model: Keyword.get(opts, :model),
+      system_prompt: Keyword.get(opts, :system_prompt)
+    ]
+
+    # an explicit engine: opt (e.g. a test-injected stub) wins; otherwise
+    # build one from the daemon's llm opts so a :reactor boot actually runs
+    # the model (defaulting to :none here would leave delegate_to_engine
+    # with a nil engine and never call the model).
+    engine =
+      case Keyword.get(opts, :engine) do
+        nil -> build_daemon_engine(seed, llm_opts)
+        explicit -> explicit
+      end
+
+    # engine may be {:error, reason} if LlmHandler construction failed (e.g.
+    # no api key resolved from --api-key-env). Rather than booting a reactor
+    # with a dead engine that silently answers nothing, we still boot but
+    # warn LOUDLY so the operator knows the daemon cannot actually run the
+    # model. See ADLC P5 (PR #5), round 4 medium-severity finding: the prior
+    # :none path was silent. Fail-fast (returning {:error, :no_api_key}) would
+    # break the many degraded-reactor boots used to exercise the socket /
+    # attestation paths; a loud warning keeps the suite honest without that
+    # blast radius.
+    engine =
+      case engine do
+        {:error, :no_api_key} ->
+          Logger.warning(
+            "kyber: daemon booting :reactor loop without an api key — the engine " <>
+              "is disabled and the model will not run. Pass --api-key-env (or " <>
+              "engine: in opts) to enable inference."
+          )
+
+          :none
+
+        {:error, other} ->
+          Logger.warning("kyber: engine construction failed (#{inspect(other)}); reactor boots without a model")
+          :none
+
+        ok ->
+          ok
+      end
+
+    [
+      seed: seed,
+      budget_cap: Keyword.get(opts, :budget_cap, 32),
+      engine: engine,
+      test_pid: Keyword.get(opts, :test_pid),
+      operator_seed: Keyword.get(opts, :operator_seed),
+      # T14i (D3 — the threading): :profile rides the same whitelist into
+      # Reactor.start_link, where the boot_context helper resolves the
+      # engine's :boot tuple and the H8 intersect
+      profile: Keyword.get(opts, :profile),
+      # T15: model/provider identity for an isolated sibling agent (Wisp).
+      # llm_for/2 threads these to LlmHandler.new; absent => k3 defaults.
+      api_key: Keyword.get(opts, :api_key),
+      base_url: Keyword.get(opts, :base_url),
+      model: Keyword.get(opts, :model),
+      system_prompt: Keyword.get(opts, :system_prompt),
+      peer_port: Keyword.get(opts, :peer_port)
+    ]
+  end
+
+  # builds the engine opt list [llm: llm, tools: []] from daemon llm opts.
+  # Returns {:error, reason} if LlmHandler construction fails (e.g. no
+  # api key), so the caller can fail the boot loudly instead of starting a
+  # reactor with a dead engine.
+  defp build_daemon_engine(seed, llm_opts) do
+    case Kyber.Agent.Reactor.llm_for(seed, llm_opts) do
+      {:ok, llm} -> [llm: llm, tools: []]
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp start_reactor(opts) do
+    case Kyber.Agent.Reactor.start_link(opts) do
+      {:ok, pid} ->
+        {:ok, pid}
+
+      {:error, {:already_started, pid}} ->
+        Process.link(pid)
+        {:ok, pid}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  # T15: federation peer — opens a TCP listener (Kyber.Peer) when --peer-port
+  # is set, so a sibling agent can import this one's signed claims. Absent
+  # port => no listener (the default; most boots don't federate).
+  defp start_peer(opts) do
+    case Keyword.get(opts, :peer_port) do
+      nil -> {:ok, nil}
+      port when is_integer(port) -> Kyber.Peer.start_link(port: port)
+    end
+  end
+
+  # pin 17: the oracle_seed assertion — :present appends ONE fixed-content
+  # seed delta (fixed timestamp + fixed pointers, signed by the daemon's
+  # boot key) so its content-derived id is deterministic across boots; the
+  # reactor's gate reads it from store state. :absent (the default) appends
+  # nothing. A failed append refuses the boot.
+  defp assert_oracle_seed(state, opts) do
+    case Keyword.get(opts, :oracle_seed, :absent) do
+      :present ->
+        wire =
+          build_signed(
+            state,
+            [%{role: "seed", target: {:entity, "oracle", "seed"}}],
+            @oracle_seed_ts
+          )
+
+        case DurableStore.append(wire) do
+          :ok -> :ok
+          {:error, reason} -> {:error, {:oracle_seed, reason}}
+        end
+
+      :absent ->
+        :ok
+    end
+  end
+
+  # ------------------------------------------------------------------ T14i
+
+  # H7: the channel daemon boot consumes the SAME boot_context/1 helper as
+  # attach (agent.ex:103; {_name, nil} -> {:error, {:unknown_profile, name}}):
+  # `--profile` with an absent/unnamed operator-seed env REFUSES boot; an
+  # unknown profile name refuses with the same reason.
+  defp guard_profile(opts) do
+    case Profile.boot_context(
+           profile: Keyword.get(opts, :profile),
+           operator_seed: Keyword.get(opts, :operator_seed)
+         ) do
+      {:ok, _boot} -> :ok
+      {:error, _reason} = err -> err
+    end
+  end
+
+  # D6/H2: the daemon-owned channel socket. Under the HELD lock the stale
+  # <log>.sock is File.rm'd BEFORE bind (a kill -9 leaves it behind and the
+  # next bind fails :eaddrinuse — only File.rm unblocks); :default resolves
+  # to <log>.sock (the discovery file IS the socket); nil = disabled.
+  defp start_channel_socket(opts, log_path) do
+    case Keyword.get(opts, :channel_socket) do
+      nil ->
+        {:ok, nil}
+
+      :default ->
+        do_start_channel_socket(log_path <> ".sock", opts)
+
+      path when is_binary(path) ->
+        do_start_channel_socket(path, opts)
+    end
+  end
+
+  defp do_start_channel_socket(path, opts) do
+    File.rm(path)
+
+    case Kyber.Channel.Socket.start_link(
+           socket_path: path,
+           log_path: Application.get_env(:kyber, :log_path),
+           operator_seed: Keyword.get(opts, :operator_seed)
+         ) do
+      {:ok, pid} -> {:ok, pid}
+      {:error, reason} -> {:error, {:channel_socket, reason}}
+    end
+  end
+
+  # H9: the gateway adapter — daemon-owned, one per boot, never in the app
+  # tree. The per-server seed derives from the operator seed (M4); the token
+  # rides the delivery seam as a CLOSURE (M12 — outside inspectable state);
+  # a gateway without an operator seed is fail-closed (the CLI's
+  # profile-mandatory refusal already guards the surface).
+  defp start_gateway(_state, opts) do
+    case Keyword.get(opts, :gateway) do
+      nil ->
+        {:ok, nil}
+
+      gw ->
+        operator_seed = Keyword.get(opts, :operator_seed)
+
+        if is_nil(operator_seed) do
+          {:error, {:unknown_profile, Keyword.get(opts, :profile)}}
+        else
+          server_id = Keyword.fetch!(gw, :server_id)
+          server_seed = Keys.derive_seed(operator_seed, "kyber:discord-server:" <> server_id)
+
+          adapter_opts = [
+            server: server_id,
+            seed: server_seed,
+            token_holder: Keyword.get(gw, :token, fn -> nil end),
+            intents: Keyword.get(gw, :intents, 33_280),
+            url: Keyword.get(gw, :url, "wss://gateway.discord.gg/?v=10&encoding=json"),
+            transport: {Kyber.Channel.Transport.Ws, %{}},
+            delivery: {Kyber.Channel.Delivery.Httpc, %{}}
+          ]
+
+          case Kyber.Channel.Adapter.start_link(adapter_opts) do
+            {:ok, pid} -> {:ok, pid}
+            {:error, reason} -> {:error, reason}
+          end
+        end
     end
   end
 

@@ -24,12 +24,10 @@ defmodule Kyber.Agent.Engine do
   use GenServer
 
   alias Kyber.{DurableStore, Schema, Wire}
-  alias Kyber.Agent.{ContextBuilder, Events, LlmHandler, ToolExecutor}
+  alias Rhizomatic.Delta
+  alias Kyber.Agent.{ContextBuilder, Digest, Events, Liveness, LlmHandler, Prompt, ToolExecutor}
 
   @default_window 8
-  @system_prompt "You are kyber, an agent living in a claims substrate. " <>
-                   "Ground your answer in the conversation and memory notes provided. " <>
-                   "Use the provided tools when they help."
 
   @type status :: %{
           answered: non_neg_integer(),
@@ -49,7 +47,9 @@ defmodule Kyber.Agent.Engine do
   carry dots, so a real registry wires this map),
   `:store` (thunk answering the delta set, default the durable store),
   `:sink` (wire consumer, default `Kyber.Daemon.emit/1`), `:name` (default
-  `#{inspect(__MODULE__)}`; `nil` for anonymous).
+  `#{inspect(__MODULE__)}`; `nil` for anonymous), `:boot` (T14g R1 — the
+  boot context `{profile | nil, operator_author | nil}`, default `{nil,
+  nil}`: the nil-seed leg is fail-closed — no identity block, no crash).
   """
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
@@ -96,6 +96,12 @@ defmodule Kyber.Agent.Engine do
        window: Keyword.get(opts, :window, @default_window),
        tools: Keyword.get(opts, :tools, ToolExecutor.tool_specs()),
        tool_keys: Keyword.get(opts, :tool_keys),
+       # T14g (R1 — the keystone): one boot context {profile | nil,
+       # operator_author | nil} threaded attach -> start_link -> state ->
+       # BOTH assemble sites + replayed_prompt + resume/1. The nil-seed leg
+       # ({nil, nil}) is FAIL-CLOSED: no operator seed => no identity block,
+       # never a crash.
+       boot: Keyword.get(opts, :boot, {nil, nil}),
        store: Keyword.get(opts, :store, fn -> DurableStore.set() end),
        sink: Keyword.get(opts, :sink, &Kyber.Daemon.emit/1),
        notify: Keyword.get(opts, :notify),
@@ -157,9 +163,17 @@ defmodule Kyber.Agent.Engine do
         tool_result(id, typed, state)
 
       {"decides",
-       %{type: "GateDecision", verdict: verdict, decides: {:delta, call_id, _ctx}} = typed}
-      when verdict != :allow ->
-        refusal(call_id, typed, state)
+       %{type: "GateDecision", verdict: verdict, decides: {:delta, call_id, _ctx}} = typed} ->
+        # E1 (T14e): the resolved verdict is a WIRE STRING ("allow"/"refuse").
+        # The pinned compare is `to_string(verdict) != "allow"` — dialect-
+        # agnostic (a hypothetical atom verdict still compares correctly) —
+        # but to_string/1 is NOT guard-safe, so it lives in the clause body,
+        # not a guard. Decided-allow falls through: no fabricated refusal.
+        if to_string(verdict) != "allow" do
+          refusal(call_id, typed, state)
+        else
+          state
+        end
 
       _other ->
         state
@@ -168,6 +182,18 @@ defmodule Kyber.Agent.Engine do
 
   # ------------------------------------------------------------- inference
 
+  # T14c D2 store-then-send, in pinned order: (a) set = store.(); (b)
+  # answered-skip — an answered request is a counted skip, never re-fired
+  # (first-role match; the sessionId-first PromptAssembled can never
+  # saturate it); (c) replay pre-check — an unretracted PromptAssembled
+  # with requestRef to this request exists => decode and send THOSE bytes,
+  # emit nothing (the crash-between-emit-and-answer window that id-dedupe
+  # alone leaves open); (d) else assemble -> canonical -> emit -> decode ->
+  # chat. The model only ever sees bytes decoded from a store artifact —
+  # sent==stored is structural, never compared after the fact. A decode
+  # failure on a stored claim is store corruption: raise, never re-assemble
+  # (a silent re-assemble would mint a SECOND PromptAssembled and break
+  # AC1's exactly-one).
   defp infer(request_id, typed, state) do
     set = state.store.()
 
@@ -175,20 +201,213 @@ defmodule Kyber.Agent.Engine do
       notify(state, {:skipped, request_id})
       %{state | skipped: state.skipped + 1}
     else
-      {:delta, prompt_id, _} = typed.promptRef
-      {:entity, session_id, _} = typed.sessionId
-      memory_ids = for {:delta, id, _ctx} <- typed.memoryPointers, do: id
+      case replayed_prompt(set, request_id, typed.timestamp, state) do
+        {:ok, messages} ->
+          complete(turn(request_id, typed, messages), set, state)
 
-      turn = %{
-        request_id: request_id,
-        prompt_id: prompt_id,
-        session_id: session_id,
-        memory_ids: memory_ids,
-        messages: build_messages(set, session_id, memory_ids, state.window)
-      }
+        :none ->
+          # T14f first-assembly fix (rides R1): the PRIMARY infer path passes
+          # prompt_text — the skill lens fires on first assembly, not just on
+          # rebuild_pending (the pre-fix merged-site miss: :200 never passed
+          # prompt_text and the lens was DARK on first assembly).
+          messages =
+            Prompt.assemble(
+              set,
+              session_id(typed),
+              memory_ids(typed),
+              state.window,
+              Prompt.prompt_text(set, prompt_id(typed)),
+              state.boot
+            )
 
-      complete(turn, set, state)
+          canonical = Prompt.canonical(messages)
+          # D1: ts = the triggering InferenceRequested's claims.timestamp —
+          # never wall-clock (AC5)
+          ts = typed.timestamp
+
+          # T14g (N2/H4) + T14h (N5/H3): the mint site rides the profile
+          # key — profile-less boots mint BYTE-IDENTICAL unkeyed claims
+          # (prompt_assembled/7 emits no pointer for nil); keyed-vs-unkeyed
+          # is a MISS at the replay check, never a cross-serve. Under a
+          # profile the key-material delta (the sorted {family, epoch-id}
+          # roster + the ProfileSet head id) rides FIRST and the PA points
+          # at its content id (match-or-rederive; the digest id is NEVER
+          # the key).
+          km = key_material(set, ts, state)
+
+          if km do
+            state.sink.(Wire.envelope(km.signed))
+          end
+
+          case Events.prompt_assembled(
+                 state.llm.seed,
+                 ts,
+                 request_id,
+                 session_id(typed),
+                 canonical,
+                 elem(state.boot, 0),
+                 km && km.id
+               ) do
+            {:ok, signed} ->
+              wire = Wire.envelope(signed)
+              state.sink.(wire)
+
+              case Prompt.decode(canonical) do
+                {:ok, decoded} ->
+                  complete(turn(request_id, typed, decoded), set, state)
+
+                {:error, :malformed} ->
+                  raise "PromptAssembled store corruption: canonical does not decode"
+              end
+
+            {:error, reason} ->
+              # C1 (T14d): a PromptAssembled CONSTRUCTION failure fails HARD —
+              # never a silent skip. The tuple IS engine-reachable via the
+              # raw-admission door (a hand-crafted InferenceRequested with a
+              # non-number timestamp — the schema compiler merges
+              # claims.timestamp unchecked), and a silent skip would leave
+              # the chain to resume/1 and hide the corruption.
+              raise "PromptAssembled construction failed: " <> inspect(reason)
+          end
+      end
     end
+  end
+
+  defp turn(request_id, typed, messages) do
+    {:delta, prompt_id, _} = typed.promptRef
+    {:entity, session_id, _} = typed.sessionId
+
+    %{
+      request_id: request_id,
+      # T14h (H7): the digest mint's trigger ts — the request's
+      # claims.timestamp, threaded from the dispatch (deterministic whether
+      # or not the request delta rides the store)
+      request_ts: typed.timestamp,
+      prompt_id: prompt_id,
+      session_id: session_id,
+      memory_ids: memory_ids(typed),
+      messages: messages
+    }
+  end
+
+  defp session_id(%{sessionId: {:entity, session_id, _ctx}}), do: session_id
+
+  defp prompt_id(%{promptRef: {:delta, prompt_id, _ctx}}), do: prompt_id
+
+  defp memory_ids(%{memoryPointers: pointers}),
+    do: for({:delta, id, _ctx} <- pointers, do: id)
+
+  # the replay pre-check: an UNRETRACTED PromptAssembled pointing at this
+  # request exists in the store — decode and re-send THOSE bytes, emit
+  # nothing. A stored claim that does not decode is store corruption.
+  # T14g (N2/H4): the replay pre-check is PROFILE-KEYED — a stored claim
+  # matches iff its profile key equals the boot's (nil==nil for profile-less
+  # boots); keyed-vs-unkeyed is a MISS BOTH ways (a legacy unkeyed claim
+  # never serves a profiled boot, a keyed claim never serves a profile-less
+  # boot). Exactly-one is per (request, profile).
+  defp replayed_prompt(set, request_id, trigger_ts, state) do
+    retracted = retracted_ids(set)
+
+    # T14h (N2/H3): the expected key-material id, re-derived from the
+    # CURRENT set + boot — nil for profile-less boots; a rotated roster
+    # (or a moved ProfileSet head) re-derives a DIFFERENT id and MISSES
+    # (match-or-rederive — the rotation door closes; stored-claim-wins
+    # stands only where the key matches). The material's ts is the
+    # DISPATCHED request's claims.timestamp (the same ts the mint used) —
+    # deterministic whether or not the request delta rides the store.
+    km_id = key_material_id(set, trigger_ts, state)
+
+    case Enum.find(set, fn {id, {claims, _sig}} ->
+           not MapSet.member?(retracted, id) and
+             kind(claims) == "sessionId" and
+             match?(%{type: "PromptAssembled"}, Schema.resolve(claims)) and
+             match?({:delta, ^request_id, _ctx}, pointer(claims, "requestRef")) and
+             profile_key_matches?(claims, state.boot, km_id)
+         end) do
+      {_id, {claims, _sig}} ->
+        case pointer(claims, "content") do
+          {:string, canonical} ->
+            case Prompt.decode(canonical) do
+              {:ok, messages} -> {:ok, messages}
+              {:error, :malformed} -> raise "PromptAssembled store corruption: decode failed"
+            end
+
+          _other ->
+            raise "PromptAssembled store corruption: no content pointer"
+        end
+
+      nil ->
+        :none
+    end
+  end
+
+  # the N2/H3 key matrix: keyed==keyed on the same name matches; keyed vs
+  # unkeyed is a MISS in both directions; both unkeyed matches. Under a
+  # profiled boot the (profile, sorted {family, epoch-id} roster + ProfileSet
+  # head id) material door is CLOSED: the stored claim must carry the EXACT
+  # current key-material id (a legacy profile-keyed claim without the
+  # material is a MISS — the roster cannot be verified — and the digest id
+  # is NEVER the key).
+  defp profile_key_matches?(claims, {boot_profile, _operator_author}, km_id) do
+    case pointer(claims, "profile") do
+      {:string, ^boot_profile} -> km_matches?(claims, km_id)
+      nil -> boot_profile == nil
+      _other -> false
+    end
+  end
+
+  defp km_matches?(_claims, nil), do: false
+
+  defp km_matches?(claims, km_id) do
+    match?({:delta, ^km_id, _ctx}, pointer(claims, "replayKey"))
+  end
+
+  # T14h (N2/H3): the signed key-material delta + its content id under a
+  # profile — nil for profile-less boots and on construction failure (the
+  # material is best-effort: a failed build keys nothing; the PA mint's own
+  # raise (C1) is untouched). Deterministic at mint AND replay (same
+  # material + same trigger ts + same seed => same id).
+  defp key_material(set, ts, state) do
+    case Prompt.replay_key(set, state.boot) do
+      nil ->
+        nil
+
+      material ->
+        case Events.epoch_key_material(
+               state.llm.seed,
+               ts,
+               material.profile,
+               material.roster,
+               material.head
+             ) do
+          {:ok, signed} ->
+            %{id: Delta.id_hex(elem(signed, 0)), signed: signed}
+
+          _error ->
+            nil
+        end
+    end
+  end
+
+  defp key_material_id(set, ts, state) do
+    case key_material(set, ts, state) do
+      %{id: id} -> id
+      nil -> nil
+    end
+  end
+
+  defp request_ts(set, request_id) do
+    case Map.get(set, request_id) do
+      {claims, _sig} -> claims.timestamp
+      nil -> nil
+    end
+  end
+
+  defp retracted_ids(set) do
+    for {_id, {claims, _sig}} <- set,
+        %{role: "negates", target: {:delta, target, _ctx}} <- claims.pointers,
+        into: MapSet.new(),
+        do: target
   end
 
   defp complete(turn, set, state) do
@@ -222,6 +441,18 @@ defmodule Kyber.Agent.Engine do
     response_wire = Wire.envelope(signed)
     state.sink.(response_wire)
     deliver(turn, response_wire["id"], content, set, ts, state)
+
+    # T14h (H7): the digest mint — a ZERO-CHARGE side emission (no
+    # Budget.charge, no turn attribution, no GateDecision), deriving over
+    # the dispatch-entry `set` (H1 — PRE-EMISSION: the just-emitted
+    # ResponseDelta's wall-clock ts is NOT in it; a mint-time re-read would
+    # break AC5). trigger ts = the answered request's claims.timestamp,
+    # never wall-clock. Construction errors SWALLOW inside Digest.mint (M9).
+    # The mint rides BEFORE the completion signal: {:answered} means the
+    # whole answer — side emissions included — has landed (the reactor's
+    # lifecycle and the tests' no-sleep choreography both key on it).
+    mint_digest(set, turn, state)
+
     notify(state, {:answered, turn.request_id})
 
     state = %{
@@ -231,6 +462,19 @@ defmodule Kyber.Agent.Engine do
     }
 
     maybe_summarize(turn, set, ts, state)
+  end
+
+  # T14h (H7): trigger-ts mints, session-scoped at mint AND read; the
+  # change-guard + empty-derivation no-mint + the swallowing arm all live
+  # in Digest.mint — the engine never raises on a digest.
+  defp mint_digest(set, turn, state) do
+    trigger_ts = turn.request_ts || request_ts(set, turn.request_id)
+
+    if is_number(trigger_ts) do
+      Digest.mint(state.llm.seed, state.sink, set, turn.session_id, trigger_ts)
+    end
+
+    :ok
   end
 
   # the delivery leg: message.sent via the prompt's channel — a prompt with
@@ -329,7 +573,7 @@ defmodule Kyber.Agent.Engine do
         if answered?(set, turn.request_id) do
           %{state | skipped: state.skipped + 1, pending: Map.delete(state.pending, call_id)}
         else
-          reason = typed.reason || Atom.to_string(typed.verdict)
+          reason = typed.reason || to_string(typed.verdict)
 
           turn = %{
             turn
@@ -403,10 +647,21 @@ defmodule Kyber.Agent.Engine do
       %{
         turn: %{
           request_id: request_id,
+          # T14h (H7): the digest mint's trigger ts (the rebuild path reads
+          # the request from the store — same deterministic value)
+          request_ts: request_claims.timestamp,
           prompt_id: prompt_id,
           session_id: session_id,
           memory_ids: memory_ids,
-          messages: build_messages(set, session_id, memory_ids, state.window)
+          messages:
+            Prompt.assemble(
+              set,
+              session_id,
+              memory_ids,
+              state.window,
+              Prompt.prompt_text(set, prompt_id),
+              state.boot
+            )
         },
         tool_id: tool_id,
         args: call.args
@@ -416,74 +671,19 @@ defmodule Kyber.Agent.Engine do
     end
   end
 
-  # where did this request's chain stop? (resume/1's classification)
-  defp chain_position(set, request_id) do
-    calls =
-      for {id, {claims, _sig}} <- set,
-          kind(claims) == "tool",
-          match?(
-            %{type: "ToolCall", requestRef: {:delta, ^request_id, _}},
-            Schema.resolve(claims)
-          ),
-          do: {id, claims}
-
-    case Enum.sort_by(calls, fn {_id, claims} -> claims.timestamp end) |> List.last() do
-      nil ->
-        :top
-
-      {call_id, _claims} ->
-        set
-        |> Enum.find(fn {_id, {claims, _sig}} ->
-          kind(claims) == "call" and
-            match?(%{type: "ToolResult", call: {:delta, ^call_id, _}}, Schema.resolve(claims))
-        end)
-        |> case do
-          {id, {claims, _sig}} -> {:tool_result, %{id: id, claims: claims}}
-          nil -> :tool_waiting
-        end
-    end
-  end
+  # where did this request's chain stop? (resume/1's classification — the
+  # SHARED ContextBuilder.chain_position/2, T14h M2)
+  defp chain_position(set, request_id), do: ContextBuilder.chain_position(set, request_id)
 
   # ----------------------------------------------------------- rehydration
 
-  defp build_messages(set, session_id, memory_ids, window) do
-    turns = ContextBuilder.conversation(set, session_id)
-    {elided, windowed} = ContextBuilder.window(turns, window)
-
-    memory_notes =
-      for id <- memory_ids,
-          {claims, _sig} <- [Map.get(set, id)],
-          {:string, content} <- [pointer(claims, "content")],
-          do: %{"role" => "system", "content" => "Memory: " <> content}
-
-    summary_notes =
-      for {_id, {claims, _sig}} <- Enum.sort_by(set, fn {_id, {c, _s}} -> c.timestamp end),
-          declared_type(claims) == "ConversationSummary",
-          match?({:entity, ^session_id, _}, pointer(claims, "sessionId")),
-          {:string, content} <- [pointer(claims, "content")],
-          do: %{"role" => "system", "content" => "Summary of earlier turns: " <> content}
-
-    elision_note =
-      case elided do
-        [] -> []
-        turns -> [%{"role" => "system", "content" => "#{length(turns)} earlier turns elided."}]
-      end
-
-    [%{"role" => "system", "content" => @system_prompt}] ++
-      memory_notes ++
-      summary_notes ++
-      elision_note ++
-      Enum.map(windowed, &%{"role" => &1.role, "content" => &1.content})
-  end
-
   # -------------------------------------------------------------- machinery
 
-  defp answered?(set, request_id) do
-    Enum.any?(set, fn {_id, {claims, _sig}} ->
-      kind(claims) == "requestRef" and
-        match?({:delta, ^request_id, _ctx}, pointer(claims, "requestRef"))
-    end)
-  end
+  # T14h (M2): the answered oracle + chain-position classification are the
+  # SHARED ContextBuilder helpers (ONE implementation, never a re-
+  # implementation — a requestRef-anywhere match would go dark exactly in
+  # the crash window the open-threads fold exists to surface)
+  defp answered?(set, request_id), do: ContextBuilder.answered?(set, request_id)
 
   # spine-8 checkpoint (folded from B): once a session's conversation exceeds
   # twice the window, emit ONE deterministic ConversationSummary covering the
@@ -494,7 +694,8 @@ defmodule Kyber.Agent.Engine do
   defp maybe_summarize(turn, set, ts, state) do
     turns = ContextBuilder.conversation(set, turn.session_id)
 
-    if length(turns) > 2 * state.window and not summarized?(set, turn.session_id) do
+    if length(turns) > 2 * state.window and
+         not summarized?(set, turn.session_id, elem(state.boot, 0)) do
       {elided, _kept} = Enum.split(turns, length(turns) - state.window)
       covered = Enum.map(elided, & &1.id)
 
@@ -518,11 +719,24 @@ defmodule Kyber.Agent.Engine do
     state
   end
 
-  defp summarized?(set, session_id) do
-    Enum.any?(set, fn {_id, {claims, _sig}} ->
+  # T14j (C3): (session, profile)-scoped AND liveness-aware (NEW-4 — the
+  # pre-slice oracle was retraction-blind: a negated summary still counted).
+  # The profile arg comes from the boot tuple (profile-less boots pass nil —
+  # nil == nil matches unkeyed summaries only, never keyed ones).
+  defp summarized?(set, session_id, profile_name) do
+    Enum.any?(set, fn {id, {claims, _sig}} ->
       declared_type(claims) == "ConversationSummary" and
-        match?({:entity, ^session_id, _ctx}, pointer(claims, "sessionId"))
+        match?({:entity, ^session_id, _ctx}, pointer(claims, "sessionId")) and
+        summary_profile(claims) == profile_name and
+        Liveness.live?(set, id, fn _claims -> true end)
     end)
+  end
+
+  defp summary_profile(claims) do
+    case pointer(claims, "profile") do
+      {:string, profile} -> profile
+      _none -> nil
+    end
   end
 
   # the no-sleep observation seam: tests (and the CLI's narrate mode) get a

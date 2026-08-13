@@ -47,6 +47,13 @@ defmodule Kyber.CLI do
     migrate <legacy.jsonl> --keyring <dir> Migration.migrate; prints the migration report; exit 0
     serve --port <N>                       start a federation peer; prints "listening on <port>"; then blocks
     send <host> <port>                     Federation.export -> the peer; prints its status line; exit 0
+    tui [--log <path>] [--socket <path>]   non-booting client: connect to a running daemon's channel
+                                           socket, stream the log tail, send operator messages; blocks
+    ctl --log <path> <send|status|tail|tick> [msg]   non-interactive control client over the
+                                           daemon's channel socket; exit-coded; never boots :kyber
+    discord --server <id> --token-env <VAR> [daemon opts]
+                                           boot the channel daemon + the Discord gateway (profile
+                                           MANDATORY; the token env NAME only, never a value); blocks
     help | (no args)                       this text; exit 0
     <unknown> | help <extra>               this text; exit 2
   """
@@ -86,6 +93,12 @@ defmodule Kyber.CLI do
       {:ok, command_argv, log_path} ->
         boot_and_run(command_argv, log_path)
 
+      # H6: the THIRD preflight outcome — a RECOGNIZED, NON-BOOTING command
+      # (kyber tui) runs WITHOUT ever booting :kyber (a booting TUI is a
+      # second DurableStore on the live log — the N1 trap)
+      {:no_boot, command_argv, _log_path} ->
+        command_argv |> run() |> print_and_halt()
+
       {:usage, exit_code} ->
         IO.puts(@usage)
         System.halt(exit_code)
@@ -108,22 +121,38 @@ defmodule Kyber.CLI do
   end
 
   defp preflight_command(argv) do
-    case strip_log_prefix(argv) do
-      {:error, :usage} ->
-        {:usage, 2}
+    # the command class is checked FIRST — `kyber tui --log X` carries its
+    # --log AFTER the command (M14) and must never trip reject_stray_log
+    case command_class(argv) do
+      {:usage, exit_code} ->
+        {:usage, exit_code}
 
-      {:ok, rest} ->
-        case check_command(rest) do
-          {:usage, exit_code} -> {:usage, exit_code}
-          :run -> {:ok, rest, extract_log_path(argv)}
+      :no_boot ->
+        {:no_boot, argv, nil}
+
+      :run ->
+        case strip_log_prefix(argv) do
+          {:error, :usage} ->
+            {:usage, 2}
+
+          {:ok, rest} ->
+            {:ok, rest, extract_log_path(argv)}
         end
     end
   end
 
-  defp check_command([]), do: {:usage, 0}
-  defp check_command(["help"]), do: {:usage, 0}
-  defp check_command(["help" | _rest]), do: {:error, :usage}
-  defp check_command(_command), do: :run
+  # H6: check_command's `_command -> :run` auto-admits ANY new command name
+  # into the BOOTING path — the dispatch gets a THIRD outcome: usage |
+  # booting | recognized-non-booting, with `tui` in the third class
+  defp command_class([]), do: {:usage, 0}
+  defp command_class(["help"]), do: {:usage, 0}
+  defp command_class(["help" | _rest]), do: {:usage, 2}
+  defp command_class(["tui" | _rest]), do: :no_boot
+  # T15: `ctl` is a non-booting client like `tui` — its --log rides AFTER the
+  # command (M14), so it must NOT trip the stray-log rejection that the :run
+  # class applies. Route it to :no_boot so run/1 dispatches it directly.
+  defp command_class(["ctl" | _rest]), do: :no_boot
+  defp command_class(_command), do: :run
 
   defp boot_and_run(command_argv, log_path) do
     with :ok <- load_kyber() do
@@ -179,6 +208,13 @@ defmodule Kyber.CLI do
     block_forever()
   end
 
+  # TUI (T14i H6): print the marker, then block — the TUI process runs
+  # concurrently on the group leader; SIGTERM's init:stop unwinds cleanly
+  defp print_and_halt({:ok, {:tui, line, _pid}}) do
+    IO.puts(line)
+    block_forever()
+  end
+
   defp print_and_halt({:ok, message}) do
     print(message)
     System.halt(0)
@@ -224,11 +260,91 @@ defmodule Kyber.CLI do
   def run(argv) do
     # daemon first (T10): its `--log` is admitted AFTER the command (AC1's
     # pinned spelling — see the rev 2 grammar note in .adlc/specs/T10-fable.md),
-    # so it must not reach the stray---log rejection below
+    # so it must not reach the stray---log rejection below. T14i (M14): the
+    # TUI's --log is TUI-scoped (after the command) and the discord command
+    # carries the daemon opts — both parse before run_command's
+    # reject_stray_log.
     case parse_daemon(argv) do
       {:ok, opts} -> cmd_daemon(opts)
       {:error, :usage} -> {:error, :usage, @usage}
-      :not_daemon -> run_command(argv)
+      :not_daemon -> run_channel(argv)
+    end
+  end
+
+  defp run_channel(argv) do
+    case parse_tui(argv) do
+      {:ok, opts} -> cmd_tui(opts)
+      {:error, :usage} -> {:error, :usage, @usage}
+      :not_tui -> run_ctl(argv)
+    end
+  end
+
+  # T15: the `ctl` control client — a non-interactive, exit-coded operator
+  # surface over the daemon's channel socket (the SAME JSONL protocol the TUI
+  # and Discord gateway speak). `ctl` never boots :kyber.
+  defp run_ctl(argv) do
+    case parse_ctl(argv) do
+      {:ok, opts} -> cmd_ctl(opts)
+      {:error, :usage} -> {:error, :usage, @usage}
+      :not_ctl -> run_discord(argv)
+    end
+  end
+
+  defp parse_ctl(["ctl" | rest]), do: ctl_opts(rest, %{log: nil, socket: nil, verb: nil, content: nil})
+  defp parse_ctl(_argv), do: :not_ctl
+
+  defp ctl_opts([], %{verb: nil} = _opts), do: {:error, :usage}
+  defp ctl_opts([], opts), do: {:ok, opts}
+  defp ctl_opts(["--log", path | rest], %{log: nil} = opts), do: ctl_opts(rest, %{opts | log: path})
+  defp ctl_opts(["--socket", path | rest], %{socket: nil} = opts), do: ctl_opts(rest, %{opts | socket: path})
+  defp ctl_opts(["send", content | rest], %{verb: nil} = opts), do: ctl_opts(rest, %{opts | verb: "send", content: content})
+  defp ctl_opts(["status" | rest], %{verb: nil} = opts), do: ctl_opts(rest, %{opts | verb: "status"})
+  defp ctl_opts(["tail" | rest], %{verb: nil} = opts), do: ctl_opts(rest, %{opts | verb: "tail"})
+  defp ctl_opts(["tick" | rest], %{verb: nil} = opts), do: ctl_opts(rest, %{opts | verb: "tick"})
+  defp ctl_opts(_other, _opts), do: {:error, :usage}
+
+  defp cmd_ctl(opts) do
+    log_path = opts.log || default_log_path()
+    socket_path = opts.socket || log_path <> ".sock"
+
+    case Kyber.CLI.TUI.connect(socket_path) do
+      {:ok, socket} ->
+        :gen_tcp.close(socket)
+
+        result =
+          case opts.verb do
+            "send" -> Kyber.CLI.TUI.send_message(socket_path, opts.content)
+            "status" -> Kyber.CLI.TUI.status(socket_path)
+            "tail" -> Kyber.CLI.TUI.request(socket_path, %{"verb" => "tail"})
+            "tick" -> Kyber.CLI.TUI.tick(socket_path)
+          end
+
+        case result do
+          {:ok, map} ->
+            # A daemon response carrying an "error" key is a failed request,
+            # not success — surface it as an error so the CLI exits non-zero
+            # (AC3: ctl exits 0/1). Otherwise the calling automation cannot
+            # tell a rejected command from a successful one.
+            if Map.get(map, "error") do
+              {:error, format_error(map["error"])}
+            else
+              {:ok, inspect(map)}
+            end
+
+          {:error, reason} ->
+            {:error, format_error(reason)}
+        end
+
+      {:error, _reason} ->
+        {:error, "daemon not running on #{socket_path}"}
+    end
+  end
+
+  defp run_discord(argv) do
+    case parse_discord(argv) do
+      {:ok, opts} -> cmd_discord(opts)
+      {:error, :usage} -> {:error, :usage, @usage}
+      :not_discord -> run_command(argv)
     end
   end
 
@@ -284,16 +400,52 @@ defmodule Kyber.CLI do
   # both at once is ambiguous. --keyring is required; --tick-ms (positive
   # integer) and --pulse-only (repeatable, the AC6 knob) are optional.
   defp parse_daemon(["--log", path, "daemon" | rest]),
-    do: daemon_opts(rest, %{log: path, keyring: nil, tick_ms: nil, pulse_only: []})
+    do: daemon_opts(rest, daemon_base(%{log: path}))
 
   defp parse_daemon(["daemon" | rest]),
-    do: daemon_opts(rest, %{log: nil, keyring: nil, tick_ms: nil, pulse_only: []})
+    do: daemon_opts(rest, daemon_base(%{}))
 
   defp parse_daemon(_argv), do: :not_daemon
 
+  # T14i (N4): the channel-capable daemon surface — the base opts map shared
+  # by the daemon and the discord command classes
+  defp daemon_base(extra) do
+    Map.merge(
+      %{
+        log: nil,
+        keyring: nil,
+        tick_ms: nil,
+        pulse_only: [],
+        loop: nil,
+        profile: nil,
+        operator_seed_env: nil,
+        channel_socket: nil,
+        # T15: model/provider identity for the engine (default k3, overridden
+        # for isolated sibling agents like Wisp). api_key is an ENV NAME
+        # (never a value on argv — ps-visible), resolved at boot like
+        # --operator-seed-env.
+        model: nil,
+        base_url: nil,
+        api_key_env: nil,
+        system_prompt: nil,
+        peer_port: nil,
+        oracle_seed: :absent
+      },
+      extra
+    )
+  end
+
+  # L8: `--channel-socket` WITHOUT `--loop reactor` is a usage error, exit 2
+  # (under :ack sends persist but get the T10 ack-loop answer — the refusal
+  # is evidence-backed)
   defp daemon_opts([], %{log: log, keyring: keyring} = opts)
-       when is_binary(log) and is_binary(keyring),
-       do: {:ok, opts}
+       when is_binary(log) and is_binary(keyring) do
+    if opts.channel_socket != nil and opts.loop != :reactor do
+      {:error, :usage}
+    else
+      {:ok, opts}
+    end
+  end
 
   defp daemon_opts([], _incomplete), do: {:error, :usage}
 
@@ -313,23 +465,272 @@ defmodule Kyber.CLI do
   defp daemon_opts(["--pulse-only", role | rest], opts) when role != "",
     do: daemon_opts(rest, %{opts | pulse_only: opts.pulse_only ++ [role]})
 
+  defp daemon_opts(["--loop", "reactor" | rest], %{loop: nil} = opts),
+    do: daemon_opts(rest, %{opts | loop: :reactor})
+
+  defp daemon_opts(["--profile", name | rest], %{profile: nil} = opts) when name != "",
+    do: daemon_opts(rest, %{opts | profile: name})
+
+  # N4/M5: --operator-seed-env takes the env NAME (never a value); the VALUE
+  # is 64-hex-validated at the CLI (usage exit 2) — a garbage env value
+  # raises ArgumentError at boot otherwise
+  defp daemon_opts(["--operator-seed-env", var | rest], %{operator_seed_env: nil} = opts)
+       when var != "",
+       do: daemon_opts(rest, %{opts | operator_seed_env: var})
+
+  # --channel-socket [<path>]: a bare flag defaults to <log>.sock (the
+  # discovery file IS the socket); a path rides explicitly. A following
+  # "--"-prefixed token is the next flag, never a path.
+  defp daemon_opts(["--channel-socket" | rest], %{channel_socket: nil} = opts) do
+    case rest do
+      [path | rest2] when is_binary(path) ->
+        if String.starts_with?(path, "--") do
+          daemon_opts(rest, %{opts | channel_socket: :default})
+        else
+          daemon_opts(rest2, %{opts | channel_socket: path})
+        end
+
+      _other ->
+        daemon_opts(rest, %{opts | channel_socket: :default})
+    end
+  end
+
+  # T15: model/provider identity flags for an isolated sibling agent.
+  defp daemon_opts(["--model", m | rest], %{model: nil} = opts) when m != "",
+    do: daemon_opts(rest, %{opts | model: m})
+  defp daemon_opts(["--base-url", u | rest], %{base_url: nil} = opts) when u != "",
+    do: daemon_opts(rest, %{opts | base_url: u})
+  # api_key is an ENV NAME (never a value on argv — ps-visible); resolved at boot
+  defp daemon_opts(["--api-key-env", var | rest], %{api_key_env: nil} = opts) when var != "",
+    do: daemon_opts(rest, %{opts | api_key_env: var})
+  defp daemon_opts(["--system-prompt", p | rest], %{system_prompt: nil} = opts) when p != "",
+    do: daemon_opts(rest, %{opts | system_prompt: p})
+  defp daemon_opts(["--peer-port", p | rest], %{peer_port: nil} = opts) do
+    case Integer.parse(p) do
+      {port, ""} when port > 0 and port < 65536 -> daemon_opts(rest, %{opts | peer_port: port})
+      _ -> {:error, :usage}
+    end
+  end
+
+  # T15: oracle seed presence — :present makes the reactor's own signing
+  # seed available so the prompt gate (oracle_gate) allows dispatch; :absent
+  # (default) keeps a bare daemon refuse-only.
+  defp daemon_opts(["--oracle-seed", "present" | rest], opts),
+    do: daemon_opts(rest, %{opts | oracle_seed: :present})
+  defp daemon_opts(["--oracle-seed", "absent" | rest], opts),
+    do: daemon_opts(rest, %{opts | oracle_seed: :absent})
+
   defp daemon_opts(_other, _opts), do: {:error, :usage}
 
   # boot the daemon into the supervision tree and hand main/1 the blocking
   # marker; the printed path comes from the daemon's own status (the store it
   # actually watches), not the argv
   defp cmd_daemon(opts) do
-    boot_opts =
-      [keyring_dir: opts.keyring, pulse_only: opts.pulse_only, narrate: true] ++
-        if(opts.tick_ms, do: [tick_ms: opts.tick_ms], else: [])
+    case resolve_operator_seed(opts) do
+      {:ok, operator_seed} ->
+        # T15: resolve the model identity (env NAME -> value, never on argv)
+        api_key = resolve_env_value(opts.api_key_env)
+        boot_opts =
+          [
+            keyring_dir: opts.keyring,
+            pulse_only: opts.pulse_only,
+            narrate: true,
+            loop: opts.loop || :ack,
+            profile: opts.profile,
+            operator_seed: operator_seed,
+            channel_socket: opts.channel_socket,
+            api_key: api_key,
+            base_url: opts.base_url,
+            model: opts.model,
+            system_prompt: opts.system_prompt,
+            peer_port: opts.peer_port,
+            oracle_seed: opts.oracle_seed || :absent
+          ] ++
+            if(opts.tick_ms, do: [tick_ms: opts.tick_ms], else: [])
 
-    case Daemon.boot(boot_opts) do
-      {:ok, pid} ->
-        %{log_path: log_path} = Daemon.status()
-        {:ok, {:daemon, "daemon running on #{log_path}", pid}}
+        case Daemon.boot(boot_opts) do
+          {:ok, pid} ->
+            %{log_path: log_path} = Daemon.status()
+            {:ok, {:daemon, "daemon running on #{log_path}", pid}}
+
+          {:error, reason} ->
+            {:error, format_error(reason)}
+        end
+
+      {:error, :usage} ->
+        {:error, :usage, @usage}
 
       {:error, reason} ->
         {:error, format_error(reason)}
+    end
+  end
+
+  # M5: --operator-seed-env's VALUE is 64-hex-validated at the CLI (usage
+  # exit 2); an unset env is a nil seed (sends refuse — the no_operator_seed
+  # gate); an absent env NAME is nil too. The value NEVER rides argv.
+  defp resolve_operator_seed(%{operator_seed_env: nil}), do: {:ok, nil}
+
+  defp resolve_operator_seed(%{operator_seed_env: var}) do
+    case System.get_env(var) do
+      nil ->
+        {:ok, nil}
+
+      value ->
+        case Base.decode16(String.trim(value), case: :mixed) do
+          {:ok, <<_::binary-32>>} -> {:ok, String.downcase(String.trim(value))}
+          _garbage -> {:error, :usage}
+        end
+    end
+  end
+
+  # T15: generic ENV-NAME -> VALUE resolver for the model api key. An unset or
+  # empty env yields nil (the handler refuses a missing key); the value NEVER
+  # rides argv. Mirrors resolve_operator_seed's ps-safety posture.
+  defp resolve_env_value(nil), do: nil
+  defp resolve_env_value(var) when is_binary(var), do: System.get_env(var)
+
+  # -------------------------------------------------------------- T14i
+
+  # M14: the TUI argv shape is pinned — a TUI-scoped --log/--socket opt
+  # AFTER the command (the global-prefix form is stripped before dispatch);
+  # the no-flag default replicates application.ex's default_log_path/0
+  # (including the HOME-unset raise)
+  defp parse_tui(["tui" | rest]), do: tui_opts(rest, %{log: nil, socket: nil})
+  defp parse_tui(_argv), do: :not_tui
+
+  defp tui_opts([], opts), do: {:ok, opts}
+  defp tui_opts(["--log", path | rest], %{log: nil} = opts), do: tui_opts(rest, %{opts | log: path})
+  defp tui_opts(["--socket", path | rest], %{socket: nil} = opts), do: tui_opts(rest, %{opts | socket: path})
+  defp tui_opts(_other, _opts), do: {:error, :usage}
+
+  # H6: the NON-booting TUI command. The socket probe happens here (before
+  # any marker): a running daemon yields the blocking marker tuple; a
+  # missing daemon is the clean one-liner, exit 1. Never boots :kyber —
+  # the escript-level witness asserts `kyber tui` boots NOTHING.
+  defp cmd_tui(opts) do
+    log_path = opts.log || default_log_path()
+    socket_path = opts.socket || log_path <> ".sock"
+
+    case Kyber.CLI.TUI.connect(socket_path) do
+      {:ok, socket} ->
+        :gen_tcp.close(socket)
+        pid = spawn(fn -> Kyber.CLI.TUI.interactive(log_path, socket_path) end)
+        {:ok, {:tui, "tui connected to #{log_path}", pid}}
+
+      {:error, _reason} ->
+        {:error, "daemon not running on #{socket_path}"}
+    end
+  end
+
+  defp default_log_path do
+    case System.user_home() do
+      "" ->
+        raise "kyber: cannot resolve the default log_path — HOME is unset " <>
+                "(System.user_home() is empty). Pass --log explicitly."
+
+      home ->
+        Path.join(home, ".kyber/store.jsonl")
+    end
+  end
+
+  # H9: `kyber discord …` — the gateway boot surface. argv carries
+  # --server <id> and --token-env <VAR> (the env NAME, never a value — a
+  # `--token <value>` on argv is a usage error, exit 2, ps-visible), plus
+  # the daemon opts (--log/--keyring/--profile/--operator-seed-env/
+  # --channel-socket/--tick-ms). Profile is MANDATORY; the gateway URL
+  # defaults to the pinned Discord gateway; intents 33280.
+  defp parse_discord(["discord" | rest]) do
+    case extract_gateway_flags(rest, %{server: nil, token_env: nil}) do
+      {:ok, gateway, rest2} ->
+        case daemon_opts(rest2, daemon_base(%{})) do
+          {:ok, opts} when is_binary(gateway.server) and is_binary(gateway.token_env) ->
+            {:ok, Map.merge(opts, gateway)}
+
+          {:ok, _opts} ->
+            {:error, :usage}
+
+          {:error, :usage} ->
+            {:error, :usage}
+        end
+
+      {:error, :usage} ->
+        {:error, :usage}
+    end
+  end
+
+  defp parse_discord(_argv), do: :not_discord
+
+  defp extract_gateway_flags([], gateway), do: {:ok, gateway, []}
+
+  defp extract_gateway_flags(["--server", id | rest], %{server: nil} = gateway) when id != "",
+    do: extract_gateway_flags(rest, %{gateway | server: id})
+
+  defp extract_gateway_flags(["--token-env", var | rest], %{token_env: nil} = gateway) when var != "",
+    do: extract_gateway_flags(rest, %{gateway | token_env: var})
+
+  # token hygiene: a token VALUE on argv is a usage error, exit 2 (ps-visible)
+  defp extract_gateway_flags(["--token" | _rest], _gateway), do: {:error, :usage}
+
+  # the first non-gateway flag ends the gateway segment — the rest are daemon opts
+  defp extract_gateway_flags([flag | rest], gateway) when is_binary(flag) do
+    if String.starts_with?(flag, "--") do
+      {:ok, gateway, [flag | rest]}
+    else
+      {:error, :usage}
+    end
+  end
+
+  defp cmd_discord(opts) do
+    with :ok <- require_gateway_profile(opts),
+         {:ok, operator_seed} <- resolve_operator_seed(opts),
+         {:ok, token} <- resolve_discord_token(opts) do
+      boot_opts =
+        [
+          keyring_dir: opts.keyring,
+          pulse_only: opts.pulse_only,
+          narrate: true,
+          loop: :reactor,
+          oracle_seed: :present,
+          profile: opts.profile,
+          operator_seed: operator_seed,
+          channel_socket: opts.channel_socket || :default,
+          gateway: [
+            server_id: opts.server,
+            # M12: the token rides as a closure — outside inspectable state
+            token: fn -> token end,
+            intents: 33_280,
+            url: "wss://gateway.discord.gg/?v=10&encoding=json"
+          ]
+        ] ++
+          if(opts.tick_ms, do: [tick_ms: opts.tick_ms], else: [])
+
+      case Daemon.boot(boot_opts) do
+        {:ok, pid} ->
+          %{log_path: log_path} = Daemon.status()
+          {:ok, {:daemon, "discord gateway running on #{log_path}", pid}}
+
+        {:error, reason} ->
+          {:error, format_error(reason)}
+      end
+    else
+      {:error, :usage} -> {:error, :usage, @usage}
+      {:error, reason} -> {:error, format_error(reason)}
+    end
+  end
+
+  # H9: the PROFILE-MANDATORY refusal — a profile-less gateway boot is
+  # {:error, {:unknown_profile, nil}}; a profile-without-seed boot is the
+  # H7 refusal at Daemon.boot (the same reason)
+  defp require_gateway_profile(%{profile: nil}), do: {:error, {:unknown_profile, nil}}
+  defp require_gateway_profile(_opts), do: :ok
+
+  # fail-closed token resolution: absent env => boot error, no default, no
+  # retry, no file fallback (D2)
+  defp resolve_discord_token(%{token_env: var}) do
+    case System.get_env(var) do
+      nil -> {:error, {:discord_token_missing, var}}
+      token when is_binary(token) and token != "" -> {:ok, token}
+      _empty -> {:error, {:discord_token_missing, var}}
     end
   end
 
@@ -503,5 +904,11 @@ defmodule Kyber.CLI do
   defp format_error({:peer_unreachable, host, port}), do: "peer unreachable: #{host} #{port}"
   defp format_error({:peer_timeout, host, port}), do: "peer timeout: #{host} #{port}"
   defp format_error({:peer_closed, host, port}), do: "peer closed: #{host} #{port}"
+  # T14i: the profile/gateway one-liners — the H9 profile-mandatory refusal
+  # and the H7 profile-without-seed refusal share the {:unknown_profile, _}
+  # family; the fail-closed token boot error
+  defp format_error({:unknown_profile, nil}), do: "gateway requires a profile"
+  defp format_error({:unknown_profile, name}), do: "unknown profile: #{name}"
+  defp format_error({:discord_token_missing, var}), do: "no discord token: #{var}"
   defp format_error(other), do: "error: #{inspect(other)}"
 end

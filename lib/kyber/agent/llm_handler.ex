@@ -24,7 +24,15 @@ defmodule Kyber.Agent.LlmHandler do
                    "Answer the user's latest message, grounded in the conversation so far."
 
   @enforce_keys [:seed, :author, :api_key, :http]
-  defstruct [:seed, :author, :api_key, :http, base_url: @base_url, model: @model]
+  defstruct [
+    :seed,
+    :author,
+    :api_key,
+    :http,
+    base_url: @base_url,
+    model: @model,
+    system_prompt: @system_prompt
+  ]
 
   @type t :: %__MODULE__{
           seed: String.t(),
@@ -32,14 +40,16 @@ defmodule Kyber.Agent.LlmHandler do
           api_key: String.t(),
           http: {module(), term()},
           base_url: String.t(),
-          model: String.t()
+          model: String.t(),
+          system_prompt: String.t()
         }
 
   @doc """
   Build a handler. Options: `:seed` (agent signing seed, 32-byte hex,
   required), `:api_key` (required — an absent key is refused, never fetched
   from the environment here), `:http` (`{module, state}`, default the real
-  `:httpc` adapter), `:base_url`, `:model`.
+  `:httpc` adapter), `:base_url`, `:model`, `:system_prompt` (per-agent
+  persona voice; defaults to the kyber substrate prompt — T15).
   """
   @spec new(keyword()) :: {:ok, t()} | {:error, term()}
   def new(opts) do
@@ -61,7 +71,8 @@ defmodule Kyber.Agent.LlmHandler do
            api_key: api_key,
            http: Keyword.get(opts, :http, {Kyber.Agent.HttpClient.Httpc, nil}),
            base_url: Keyword.get(opts, :base_url, @base_url),
-           model: Keyword.get(opts, :model, @model)
+           model: Keyword.get(opts, :model, @model),
+           system_prompt: Keyword.get(opts, :system_prompt, @system_prompt)
          }}
     end
   end
@@ -74,7 +85,7 @@ defmodule Kyber.Agent.LlmHandler do
   """
   @spec gather(t(), [map()]) :: {:ok, [map()]} | {:error, term()}
   def gather(%__MODULE__{} = handler, deltas) when is_list(deltas) do
-    with {:ok, messages, prompt_id} <- conversation(deltas),
+    with {:ok, messages, prompt_id} <- conversation(handler, deltas),
          {:ok, content} <- chat(handler, messages) do
       respond(handler, prompt_id, content)
     end
@@ -85,7 +96,7 @@ defmodule Kyber.Agent.LlmHandler do
   # deltas -> OpenAI messages, by kind (the first pointer's role): received
   # is the user, sent/responds are the agent's own prior turns; everything
   # else (checkpoints, ticks, annotations) is mechanism, not conversation
-  defp conversation(deltas) do
+  defp conversation(handler, deltas) do
     messages =
       deltas
       |> Enum.flat_map(fn delta ->
@@ -107,7 +118,7 @@ defmodule Kyber.Agent.LlmHandler do
         {:error, :no_prompt}
 
       {messages, %{id: prompt_id}} ->
-        {:ok, [%{"role" => "system", "content" => @system_prompt} | messages], prompt_id}
+        {:ok, [%{"role" => "system", "content" => handler.system_prompt} | messages], prompt_id}
     end
   end
 

@@ -248,7 +248,8 @@ defmodule Kyber.Agent.ToolChainTest do
     {_call, call_delta} = sink_typed("ToolCall")
 
     {wire1, _} = run_executor(store, call_delta)
-    [_gate_wire2, wire2] = executor_handler(store).([call_delta])
+    # T14b: the re-fire adds the ToolCallDuplicate observation, answer first
+    [_gate_wire2, wire2, _dup_wire] = executor_handler(store).([call_delta])
     assert wire1 == wire2
   end
 

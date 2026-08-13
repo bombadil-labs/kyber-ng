@@ -42,7 +42,8 @@ defmodule Kyber.Agent.HttpClient do
       http_options = [
         ssl: ssl_options(),
         timeout: 120_000,
-        connect_timeout: 10_000
+        connect_timeout: 10_000,
+        autoredirect: false
       ]
 
       case apply(:httpc, :request, [:post, request, http_options, [body_format: :binary]]) do
@@ -54,22 +55,28 @@ defmodule Kyber.Agent.HttpClient do
       end
     end
 
-    # mix's runtime prunes the code path to the project + declared apps
-    # (observed: :inets/:ssl absent from :code.get_path() under mix run /
-    # mix test), and mix.exs is a frozen rail — so the real adapter repairs
-    # the path from the OTP install at first use, then starts the apps.
-    # Proven live by the AC4 operational run (inets.app unreachable →
-    # MatchError in the engine's LLM exchange, silent turn).
-    defp ensure_http_apps do
+    @doc """
+    The recorded code-path repair (M13, shared with the channel gateway's
+    `:ssl` arm — `Kyber.Channel.Delivery.Httpc` and
+    `Kyber.Channel.Transport.Ws` call this). mix's runtime prunes the code
+    path to the project + declared apps (observed: :inets/:ssl absent from
+    :code.get_path() under mix run / mix test), and mix.exs is a frozen
+    rail — so the real adapters repair the path from the OTP install at
+    first use, then start the apps. Proven live by the AC4 operational run
+    (inets.app unreachable → MatchError in the engine's LLM exchange,
+    silent turn).
+    """
+    @spec ensure_http_apps() :: {:ok, [atom()]} | {:error, term()}
+    def ensure_http_apps do
       # the full ssl dependency closure is pruned by mix's runtime code path:
       # inets -> ssl -> public_key -> asn1, crypto (crypto is declared)
       for app <- [:asn1, :public_key, :ssl, :inets], do: otp_ebin_on_path(app)
       :application.ensure_all_started([:inets, :ssl])
     end
 
-    # the OTP lib dir is resolved from the install ROOT (code:lib_dir/1
-    # fails once the code path is pruned — it consults the path too)
-    defp otp_ebin_on_path(app) do
+    @doc "The OTP lib dir is resolved from the install ROOT (code:lib_dir/1 fails once the code path is pruned — it consults the path too)."
+    @spec otp_ebin_on_path(atom()) :: :ok
+    def otp_ebin_on_path(app) do
       prefix = Atom.to_string(app) <> "-"
       lib = Path.join(:code.root_dir(), "lib")
 
@@ -95,7 +102,8 @@ defmodule Kyber.Agent.HttpClient do
       http_options = [
         ssl: ssl_options(),
         timeout: 30_000,
-        connect_timeout: 10_000
+        connect_timeout: 10_000,
+        autoredirect: false
       ]
 
       case apply(:httpc, :request, [:get, request, http_options, [body_format: :binary]]) do

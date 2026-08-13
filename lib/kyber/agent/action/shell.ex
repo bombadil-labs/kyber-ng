@@ -13,6 +13,13 @@ defmodule Kyber.Agent.Action.Shell do
   commands; the gate should hold side-effecting commands at `prompt` /
   `deny` (the executor's answer-from-the-store rule covers crash-window
   re-fires after the `ToolResult` persists).
+
+  The containment contract is EXACTLY four bounds (T14d D8): (1) the cwd
+  is sandboxed to the workspace root; (2) the environment is scrubbed to
+  exactly PATH/HOME/TMPDIR; (3) a 5_000 ms hard tree-kill; (4) a capped
+  output with a truncation marker. fs-escape RUNS as the DECLARED HOLE —
+  lexical command screening is a placebo and is never the boundary;
+  GOVERNANCE (the permission gate) is the control.
   """
 
   alias Kyber.Agent.Action
