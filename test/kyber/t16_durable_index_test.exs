@@ -316,18 +316,44 @@ defmodule Kyber.T16DurableIndexTest do
     test "seed+attach is atomic: deltas committed between seed and attach are never lost" do
       # the OLD race: seed from set/0, then subscribe — a delta committed in
       # between is lost. The fix: subscribe_seeded does both in ONE store
-      # call. Exercise it by starting the server, then IMMEDIATELY appending
-      # a message (the server's init call and this append serialize in the
-      # store — whichever order, the server ends up consistent).
-      {:ok, server} = Kyber.IndexServer.start_link(seed_from_set: true)
+      # call. To actually exercise the race (fable-5 P5 low — a single
+      # server+append serializes cleanly and cannot fail against the bug),
+      # spawn N servers and interleave N appends: with the OLD
+      # seed-then-attach, some server would miss its message; with the
+      # atomic call, every server sees every message regardless of
+      # interleaving (each message is either in a server's seed snapshot or
+      # delivered by its feed — the store serializes subscribe_seeded and
+      # appends).
       now = System.system_time(:millisecond) * 1.0
-      msg_id = append_message(@content, now)
 
-      # the message is either in the server's seed OR delivered by the feed
-      # (the store serializes subscribe_seeded and the append); either way
-      # the view must know it
-      assert Kyber.IndexServer.open_duplicate?(server, @content, 30_000)
-      refute Kyber.IndexServer.answered?(server, msg_id)
+      servers =
+        for _i <- 1..8 do
+          {:ok, server} = Kyber.IndexServer.start_link(seed_from_set: true)
+          server
+        end
+
+      contents = for i <- 1..8, do: "T16_ATOMIC_#{i}"
+
+      # interleave: start a server, append a message, next server, next
+      # message... (the race window is widest when seed and append alternate)
+      Enum.zip(servers, contents)
+      |> Enum.each(fn {_server, content} ->
+        append_message(content, now)
+      end)
+
+      # every server must know every content (either from its seed or its
+      # feed — never neither)
+      for server <- servers, content <- contents do
+        assert Kyber.IndexServer.open_duplicate?(server, content, 30_000),
+               "server #{inspect(server)} lost content #{content}"
+      end
+
+      # and a freshly seeded server agrees (PM3 parity)
+      {:ok, fresh} = Kyber.IndexServer.start_link(seed_from_set: true)
+
+      for content <- contents do
+        assert Kyber.IndexServer.open_duplicate?(fresh, content, 30_000)
+      end
     end
   end
 end
