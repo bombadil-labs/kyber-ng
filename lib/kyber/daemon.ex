@@ -179,6 +179,7 @@ defmodule Kyber.Daemon do
          # name}}), never a silent profile-less render with keyed claims
          # minting (AC3)
          :ok <- guard_profile(opts),
+         :ok <- guard_operator_authority(opts),
          {:ok, seed} <- ensure_agent_seed(keyring_dir),
          :ok <- take_lock(log_path),
          {:ok, channel_socket} <- start_channel_socket(opts, log_path) do
@@ -614,7 +615,14 @@ defmodule Kyber.Daemon do
       api_key: Keyword.get(opts, :api_key),
       base_url: Keyword.get(opts, :base_url),
       model: Keyword.get(opts, :model),
-      system_prompt: Keyword.get(opts, :system_prompt)
+      system_prompt: Keyword.get(opts, :system_prompt),
+      # AC22 (P5 M1): known secret values seeded into the handler's redact
+      # list at BOOT — the operator seed must never survive to the wire
+      redact:
+        Enum.filter(
+          [Keyword.get(opts, :api_key), Keyword.get(opts, :operator_seed)],
+          &is_binary/1
+        )
     ]
 
     # an explicit engine: opt (e.g. a test-injected stub) wins; otherwise
@@ -819,6 +827,25 @@ defmodule Kyber.Daemon do
     end
   end
 
+  # M2 (P5): the rekey handoff is enforced at boot — when the caller
+  # supplies the pointer's operator author CHAIN, the boot seed must derive
+  # the chain's CURRENT (last) author. A boot with a rotated-away seed
+  # refuses loudly instead of signing with dead authority.
+  defp guard_operator_authority(opts) do
+    with [_ | _] = chain <- Keyword.get(opts, :operator_authors),
+         seed when is_binary(seed) <- Keyword.get(opts, :operator_seed) do
+      author = Keys.author_for_seed(seed)
+
+      if author == List.last(chain) do
+        :ok
+      else
+        {:error, {:not_operator, author, List.last(chain)}}
+      end
+    else
+      _absent -> :ok
+    end
+  end
+
   # D6/H2: the daemon-owned channel socket. Under the HELD lock the stale
   # <log>.sock is File.rm'd BEFORE bind (a kill -9 leaves it behind and the
   # next bind fails :eaddrinuse — only File.rm unblocks); :default resolves
@@ -902,13 +929,26 @@ defmodule Kyber.Daemon do
         # folded and re-delivered — the hot-swap re-fold is idempotent
         :ok = DurableStore.subscribe(self())
 
+        operator_seed = Keyword.get(opts, :operator_seed)
+
+        # H2 pin: the operator author chain is CALLER-ATTESTED — the pointer
+        # file's chain when supplied, else derived from the boot operator
+        # seed. Never inferred from store timestamps (a backdated delta must
+        # not seize operatorship).
+        operator_authors =
+          case Keyword.get(opts, :operator_authors) do
+            [_ | _] = chain -> chain
+            _absent -> if operator_seed, do: [Keys.author_for_seed(operator_seed)]
+          end
+
         state
         |> Map.merge(%{
           agent: agent,
-          operator_seed: Keyword.get(opts, :operator_seed),
+          operator_seed: operator_seed,
+          operator_authors: operator_authors,
           overrides: Keyword.get(opts, :overrides, []),
           rollback_threshold: Keyword.get(opts, :rollback_threshold, 2),
-          fold_view: agent_fold(agent),
+          fold_view: agent_fold(agent, operator_authors),
           live: %{
             model: Keyword.get(opts, :model),
             base_url: Keyword.get(opts, :base_url)
@@ -917,14 +957,21 @@ defmodule Kyber.Daemon do
           armed: nil,
           failures: 0,
           rollbacks: 0,
-          redact: Enum.filter([Keyword.get(opts, :api_key)], &is_binary/1)
+          # AC22: known secret VALUES the wire must never carry — the boot
+          # api key and the operator seed itself (M1: the seed leaked through
+          # a fold field or agent message must hit the wire as [REDACTED])
+          redact:
+            Enum.filter(
+              [Keyword.get(opts, :api_key), operator_seed],
+              &is_binary/1
+            )
         })
         |> mint_soul()
     end
   end
 
-  defp agent_fold(agent) do
-    case Config.resolve(DurableStore.set(), agent) do
+  defp agent_fold(agent, operators) do
+    case Config.resolve(DurableStore.set(), agent, operators) do
       {:ok, view} -> view
       :not_found -> nil
     end
@@ -965,20 +1012,21 @@ defmodule Kyber.Daemon do
     end
   end
 
-  # an AgentSet on this agent: hot-swap, then ARM the harness — the source
-  # classification (operator vs agent author) decides rollback-vs-detection
-  # when the next inference fails config-class (AC12)
+  # an AgentSet on this agent: ARM the harness FIRST, then hot-swap — a
+  # swap-time config-class failure (missing key env, dead decrypt) must hit
+  # an ARMED harness and count toward the rollback threshold exactly like an
+  # inference-time failure (AC12; P5 H1). The source classification
+  # (operator vs agent author) decides rollback-vs-detection.
   defp agent_config_changed(state, id, claims, resolved) do
-    state = agent_hot_swap(state)
-
-    source =
-      case state.fold_view do
-        %{operator_author: author} when author == claims.author -> :operator
-        _other -> :agent
-      end
-
+    source = if operator_authored?(state, claims.author), do: :operator, else: :agent
     fields = agent_delta_fields(resolved)
-    %{state | armed: %{source: source, id: id, fields: fields}, failures: 0}
+    state = %{state | armed: %{source: source, id: id, fields: fields}, failures: 0}
+    agent_hot_swap(state)
+  end
+
+  # membership in the PINNED chain — never a store-derived comparison
+  defp operator_authored?(state, author) do
+    author in List.wrap(Map.get(state, :operator_authors))
   end
 
   defp agent_delta_fields(resolved) do
@@ -998,38 +1046,45 @@ defmodule Kyber.Daemon do
   # defaults — the terminal step-back state), and swap it into the live
   # engine. Only a :reactor loop has an engine to swap.
   defp agent_hot_swap(%{loop: :reactor} = state) do
-    view = agent_fold(state.agent)
+    view = agent_fold(state.agent, state.operator_authors)
     state = %{state | fold_view: view}
     fold_opts = if view, do: Config.boot_opts(view, state.overrides), else: state.overrides
     sync_oracle_gate(state, fold_opts)
 
     with {:ok, api_key} <- agent_swap_key(fold_opts[:api_key], state),
+         redact = Enum.uniq(Enum.filter([api_key | state.redact], &is_binary/1)),
          llm_opts =
            [
              api_key: api_key,
              base_url: fold_opts[:base_url],
              model: fold_opts[:model],
-             system_prompt: fold_opts[:system_prompt]
+             system_prompt: fold_opts[:system_prompt],
+             redact: redact
            ]
            |> Enum.reject(fn {_k, v} -> is_nil(v) end),
          {:ok, handler} <- Kyber.Agent.Reactor.llm_for(state.seed, llm_opts),
-         changes = Map.take(handler, [:model, :base_url, :system_prompt, :api_key]),
+         changes = Map.take(handler, [:model, :base_url, :system_prompt, :api_key, :redact]),
          :ok <- Kyber.Agent.Reactor.swap_llm_config(changes) do
       narrate(state, "config hot-swap #{state.agent}: model #{handler.model}")
 
       %{
         state
         | live: %{model: handler.model, base_url: handler.base_url},
-          redact: Enum.uniq(Enum.filter([api_key | state.redact], &is_binary/1))
+          redact: redact
       }
     else
       {:error, reason} ->
         narrate(state, "config hot-swap failed #{inspect(reason)}")
-        agent_failure(state, reason)
+
+        # P5 H1: a CONFIG-CLASS swap failure feeds the armed harness (the
+        # broken delta is exactly what armed it); a transient swap error
+        # (network brownout mid-swap) must neither count nor roll back.
+        if config_class?(reason), do: agent_failure(state, reason), else: state
     end
   end
 
-  defp agent_hot_swap(state), do: %{state | fold_view: agent_fold(state.agent)}
+  defp agent_hot_swap(state),
+    do: %{state | fold_view: agent_fold(state.agent, state.operator_authors)}
 
   # the tagged key resolves to a VALUE only here, at the swap boundary; a
   # fold with no key falls back to the boot-resolved key (the engine keeps
@@ -1109,7 +1164,6 @@ defmodule Kyber.Daemon do
   # re-delivers the retractions and the hot-swap restores the live engine.
   defp agent_rollback(state, armed, reason) do
     set = DurableStore.set()
-    operator_author = with %{operator_author: author} <- state.fold_view, do: author
 
     offends =
       armed.fields
@@ -1118,7 +1172,7 @@ defmodule Kyber.Daemon do
       |> Enum.uniq()
       |> Enum.filter(fn head_id ->
         case set[head_id] do
-          {claims, _sig} -> claims.author != operator_author
+          {claims, _sig} -> not operator_authored?(state, claims.author)
           nil -> false
         end
       end)

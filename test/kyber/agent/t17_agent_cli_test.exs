@@ -11,7 +11,7 @@ defmodule Kyber.Agent.T17AgentCliTest do
 
   import ExUnit.CaptureIO
 
-  alias Kyber.{CLI, DeltaSet, Log, Schema, Store}
+  alias Kyber.{CLI, DeltaSet, Keys, Log, Schema, Store}
   alias Kyber.Agent.{Config, Secrets}
 
   @operator_seed String.duplicate("7f", 32)
@@ -81,6 +81,7 @@ defmodule Kyber.Agent.T17AgentCliTest do
       # the registry pointer (recorded spec-contradiction resolution: the
       # pointer JSON lives INSIDE the agent dir, at <registry>/<name>/agent.json)
       pointer = Path.join([registry, "wisp", "agent.json"])
+
       assert {:ok, %{"log_path" => log_path, "keyring_dir" => keyring}} =
                JSON.decode(File.read!(pointer))
 
@@ -115,7 +116,15 @@ defmodule Kyber.Agent.T17AgentCliTest do
 
       assert {:ok, _} =
                agent(
-                 ["new", "wisp", "--soul", "renewed", "--force", "--operator-seed-env", "T17_OP_SEED"],
+                 [
+                   "new",
+                   "wisp",
+                   "--soul",
+                   "renewed",
+                   "--force",
+                   "--operator-seed-env",
+                   "T17_OP_SEED"
+                 ],
                  registry
                )
 
@@ -128,7 +137,10 @@ defmodule Kyber.Agent.T17AgentCliTest do
       System.delete_env("T17_OP_SEED")
 
       assert {:error, message} =
-               agent(["new", "wisp", "--soul", "x", "--operator-seed-env", "T17_OP_SEED"], registry)
+               agent(
+                 ["new", "wisp", "--soul", "x", "--operator-seed-env", "T17_OP_SEED"],
+                 registry
+               )
 
       assert message =~ "T17_OP_SEED"
       refute File.exists?(store_path(registry))
@@ -140,7 +152,10 @@ defmodule Kyber.Agent.T17AgentCliTest do
       System.delete_env("DEEPSEEK_API_KEY")
 
       assert {:error, message} =
-               agent(["new", "wisp", "--soul", "x", "--operator-seed-env", "T17_OP_SEED"], registry)
+               agent(
+                 ["new", "wisp", "--soul", "x", "--operator-seed-env", "T17_OP_SEED"],
+                 registry
+               )
 
       assert message =~ "DEEPSEEK_API_KEY"
       refute File.exists?(store_path(registry))
@@ -354,6 +369,60 @@ defmodule Kyber.Agent.T17AgentCliTest do
       assert {:enc, ciphertext} = fold!(registry).api_key
       assert Secrets.decrypt(ciphertext, @new_seed) == {:ok, secret}
       assert Secrets.decrypt(ciphertext, @operator_seed) == {:error, :decrypt_failed}
+    end
+
+    test "rekey moves SIGNING authority in the same operation: B signs, A fails loudly (P5 M2)",
+         %{registry: registry} do
+      new!(registry)
+      secret = "sk-live-supersecret-value-123456"
+
+      capture_io([input: secret <> "\n"], fn ->
+        send(self(), CLI.run(["agent", "set", "wisp", "--api-key", "--registry", registry]))
+      end)
+
+      assert_received {:ok, _}
+
+      System.put_env("T17_NEW_SEED", @new_seed)
+      assert {:ok, message} = agent(["rekey", "wisp", "--new-seed-env", "T17_NEW_SEED"], registry)
+      assert message =~ "authority"
+
+      old_author = Keys.author_for_seed(@operator_seed)
+      new_author = Keys.author_for_seed(@new_seed)
+
+      # the pointer chain gains the new author (oldest -> newest)
+      pointer = JSON.decode!(File.read!(Path.join([registry, "wisp", "agent.json"])))
+      assert pointer["operator_authors"] == [old_author, new_author]
+
+      # the handoff delta carries the new seed env — the plain verbs resolve
+      # the NEW seed automatically and its deltas fold under the chain pin
+      assert {:ok, _} = agent(["set", "wisp", "--model", "kimi-k3"], registry)
+
+      {:ok, view} = Config.resolve(load_set(registry), "wisp", [old_author, new_author])
+      assert view.model == "kimi-k3"
+      assert view.operator_author == new_author
+      assert view.heads[:model] != nil
+      {claims, _sig} = load_set(registry)[view.heads[:model]]
+      assert claims.author == new_author
+
+      # signing with the ROTATED-AWAY seed fails loudly, appends nothing
+      before = length(store_lines(registry))
+
+      assert {:error, message} =
+               agent(
+                 ["set", "wisp", "--soul", "seized?", "--operator-seed-env", "T17_OP_SEED"],
+                 registry
+               )
+
+      assert message =~ "not the CURRENT operator"
+      assert length(store_lines(registry)) == before
+    end
+
+    test "a fresh agent's pointer records the operator author chain (P5 H2 anchor)", %{
+      registry: registry
+    } do
+      new!(registry)
+      pointer = JSON.decode!(File.read!(Path.join([registry, "wisp", "agent.json"])))
+      assert pointer["operator_authors"] == [Keys.author_for_seed(@operator_seed)]
     end
   end
 

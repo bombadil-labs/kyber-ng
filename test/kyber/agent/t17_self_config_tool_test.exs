@@ -160,6 +160,26 @@ defmodule Kyber.Agent.T17SelfConfigToolTest do
     assert result_status(outputs) == "error"
   end
 
+  test "operator_seed_env can NEVER be set by the agent (P5 H3) — even under the grant" do
+    outputs =
+      call!(
+        granted_set(),
+        JSON.encode!(%{"fields" => %{"operator_seed_env" => "ATTACKER_SEED"}})
+      )
+
+    assert agent_sets(outputs) == []
+    assert result_status(outputs) == "error"
+    assert result_text(outputs) =~ "operator"
+  end
+
+  test "operator_seed_env can NEVER be unset by the agent (P5 H3)" do
+    outputs =
+      call!(granted_set(), JSON.encode!(%{"fields" => %{"unset" => ["operator_seed_env"]}}))
+
+    assert agent_sets(outputs) == []
+    assert result_status(outputs) == "error"
+  end
+
   test "the AC17 door runs at the tool boundary: secret-shaped value refused, NO delta" do
     outputs =
       call!(

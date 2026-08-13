@@ -145,7 +145,10 @@ defmodule Kyber.Agent.ToolExecutor do
         parameters: %{
           "type" => "object",
           "properties" => %{
-            "name" => %{"type" => "string", "description" => "The skill name (the aggregate key)."},
+            "name" => %{
+              "type" => "string",
+              "description" => "The skill name (the aggregate key)."
+            },
             "description" => %{"type" => "string", "description" => "What the skill is for."},
             "body" => %{"type" => "string", "description" => "The procedure."},
             "metadata" => %{
@@ -578,18 +581,19 @@ defmodule Kyber.Agent.ToolExecutor do
   end
 
   # T17 AC5/AC9 — the agent's own (opt-in) write path onto its AgentSet
-  # stream. The boundary contract, in order: base_url is refused ALWAYS
-  # (set AND unset — the proxy-exfiltration P0, checked before the grant so
-  # the refusal names the operator regardless); the grant (`self_config:
-  # true` on the LIVE fold) is checked at call time, not boot time; the
-  # AC17 door (Config.validate_fields — secret shapes, unknown fields)
-  # runs before any mint. A refusal mints NO delta. The mint claims the
-  # CALL's timestamp (M6 crash-window dedupe) and the AGENT's seed — the
-  # delta folds only while the grant is live (prospective, negatable).
+  # stream. The boundary contract, in order: base_url AND operator_seed_env
+  # are refused ALWAYS (set AND unset — the proxy-exfiltration P0 and the
+  # P5 HIGH-3 harness-disarm twin, checked before the grant so the refusal
+  # names the operator regardless); the grant (`self_config: true` on the
+  # LIVE fold) is checked at call time, not boot time; the AC17 door
+  # (Config.validate_fields — secret shapes, unknown fields) runs before
+  # any mint. A refusal mints NO delta. The mint claims the CALL's
+  # timestamp (M6 crash-window dedupe) and the AGENT's seed — the delta
+  # folds only while the grant is live (prospective, negatable).
   defp write_and_run(set, seed, ts, _call_id, "self_config.set", args, _tools, context) do
     with {:agent, agent} when is_binary(agent) <- {:agent, context[:agent]},
          {:ok, fields} <- decode_self_config_args(args),
-         :ok <- refuse_agent_base_url(fields),
+         :ok <- refuse_operator_attested(fields),
          :ok <- self_config_granted(set, agent),
          :ok <- door(fields) do
       case Events.agent_set(seed, ts, agent, fields) do
@@ -633,11 +637,23 @@ defmodule Kyber.Agent.ToolExecutor do
     end)
   end
 
-  defp refuse_agent_base_url(fields) do
-    if Map.has_key?(fields, :base_url) or "base_url" in Map.get(fields, :unset, []) do
-      {:error, "base_url is operator-attested — only the operator can set or unset it"}
-    else
-      :ok
+  # the fold-level twin lives in Config.apply_fields (@operator_only) — a
+  # hand-appended agent delta naming these fields is fold-inert even when
+  # this boundary is bypassed
+  @operator_attested [:base_url, :operator_seed_env]
+
+  defp refuse_operator_attested(fields) do
+    unset = Map.get(fields, :unset, [])
+
+    case Enum.find(@operator_attested, fn field ->
+           Map.has_key?(fields, field) or
+             Enum.any?(unset, &(to_string(&1) == Atom.to_string(field)))
+         end) do
+      nil ->
+        :ok
+
+      field ->
+        {:error, "#{field} is operator-attested — only the operator can set or unset it"}
     end
   end
 
@@ -746,7 +762,9 @@ defmodule Kyber.Agent.ToolExecutor do
       {listing, "ok"} when is_binary(listing) ->
         case String.split(listing, "\n") do
           entries when length(entries) > @fs_list_cap ->
-            {Enum.take(entries, @fs_list_cap) |> Enum.join("\n") |> Kernel.<>("\n" <> @fs_list_marker), "ok"}
+            {Enum.take(entries, @fs_list_cap)
+             |> Enum.join("\n")
+             |> Kernel.<>("\n" <> @fs_list_marker), "ok"}
 
           _within_cap ->
             {listing, "ok"}

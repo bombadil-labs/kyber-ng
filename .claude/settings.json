@@ -13,10 +13,10 @@
       "Bash(mix format --check-formatted *)",
       "Bash(mix escript.build)",
       "Bash(git status *)",
+      "Bash(git log *)",
       "Bash(git diff *)",
       "Bash(git diff --stat *)",
-      "Bash(mkdir -p *)",
-      "Bash(rm -f *)"
+      "Bash(mkdir -p *)"
     ],
     "deny": [
       "Bash(git commit *)",

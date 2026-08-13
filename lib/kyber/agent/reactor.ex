@@ -523,7 +523,7 @@ defmodule Kyber.Agent.Reactor do
         # fallbacks apply; passing `base_url: nil` would override them.
         llm_opts =
           opts
-          |> Keyword.take([:api_key, :base_url, :model, :system_prompt])
+          |> Keyword.take([:api_key, :base_url, :model, :system_prompt, :redact])
           |> Enum.reject(fn {_k, v} -> is_nil(v) end)
 
         LlmHandler.new([seed: seed] ++ llm_opts)

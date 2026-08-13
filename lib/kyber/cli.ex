@@ -641,7 +641,7 @@ defmodule Kyber.CLI do
 
     with :ok <- agent_mkdir(paths.dir),
          :ok <- Keys.import_human_seed(seed, paths.keyring),
-         :ok <- agent_write_pointer(paths),
+         :ok <- agent_write_pointer(paths, [Keys.author_for_seed(seed)]),
          {:ok, genesis} <- AgentEvents.agent_set(seed, ts, name, @agent_genesis),
          {:ok, seed_delta} <- AgentEvents.agent_set(seed, ts + 1, name, fields),
          :ok <- agent_append(paths.store, [genesis, seed_delta]) do
@@ -656,12 +656,32 @@ defmodule Kyber.CLI do
     end
   end
 
-  defp agent_write_pointer(paths) do
-    json = JSON.encode!(%{"log_path" => paths.store, "keyring_dir" => paths.keyring})
+  # the pointer is the LOCAL trust anchor (P5 H2): `operator_authors` pins
+  # the operator author chain (oldest -> newest; last = current) so the fold
+  # never infers operatorship from self-asserted store timestamps. Rekey
+  # APPENDS to the chain — history stays legible.
+  defp agent_write_pointer(paths, operator_authors) do
+    json =
+      JSON.encode!(%{
+        "log_path" => paths.store,
+        "keyring_dir" => paths.keyring,
+        "operator_authors" => operator_authors
+      })
 
     case File.write(paths.pointer, json) do
       :ok -> :ok
       {:error, reason} -> {:error, {:pointer_write_failed, paths.pointer, reason}}
+    end
+  end
+
+  # nil for a pre-chain (legacy) pointer or an unreadable one — resolve/3
+  # then falls back to legacy first-writer display semantics
+  defp agent_pointer_chain(paths) do
+    with {:ok, content} <- File.read(paths.pointer),
+         {:ok, %{"operator_authors" => [_ | _] = chain}} <- JSON.decode(content) do
+      chain
+    else
+      _legacy -> nil
     end
   end
 
@@ -679,9 +699,9 @@ defmodule Kyber.CLI do
           entries
           |> Enum.sort()
           |> Enum.flat_map(fn name ->
-            store = Path.join([registry, name, "store.jsonl"])
+            paths = agent_paths(registry, name)
 
-            case Config.resolve(agent_load_set(store), name) do
+            case Config.resolve(agent_load_set(paths.store), name, agent_pointer_chain(paths)) do
               {:ok, view} -> [agent_list_line(view)]
               :not_found -> []
             end
@@ -707,7 +727,7 @@ defmodule Kyber.CLI do
     if File.exists?(paths.pointer) do
       set = agent_load_set(paths.store)
 
-      case Config.resolve(set, opts.name) do
+      case Config.resolve(set, opts.name, agent_pointer_chain(paths)) do
         {:ok, view} ->
           {:ok, agent_render(view, set)}
 
@@ -778,7 +798,7 @@ defmodule Kyber.CLI do
     with {:ok, paths, set, view} <- agent_open(opts),
          fields = agent_with_unsets(opts.fields, opts.unset),
          :ok <- Config.validate_fields(fields),
-         {:ok, seed, _var} <- agent_signing_seed(opts, view, set),
+         {:ok, seed, _var} <- agent_signing_seed(opts, view, set, agent_pointer_chain(paths)),
          {:ok, fields} <- agent_stdin_key(opts, fields, seed) do
       case Config.changed_fields(view, fields) do
         changed when changed == %{} ->
@@ -804,7 +824,7 @@ defmodule Kyber.CLI do
   defp agent_retract_cmd(opts) do
     with {:ok, paths, set, view} <- agent_open(opts),
          :ok <- agent_known_delta(set, opts.target),
-         {:ok, seed, _var} <- agent_signing_seed(opts, view, set),
+         {:ok, seed, _var} <- agent_signing_seed(opts, view, set, agent_pointer_chain(paths)),
          {:ok, signed} <- AgentEvents.agent_retract(seed, agent_now_ms(), opts.name, opts.target),
          :ok <- agent_append(paths.store, [signed]) do
       {:ok, "retracted #{opts.target}"}
@@ -815,18 +835,36 @@ defmodule Kyber.CLI do
 
   defp agent_rekey(%{new_seed_env: nil}), do: {:error, :usage, @usage}
 
+  # ONE atomic operation (P5 M2): re-encrypt the secret AND move signing/
+  # attestation authority to the new seed. The handoff delta is signed by
+  # the OLD seed (chain of custody in-store: the outgoing operator attests
+  # the incoming env NAME), then the pointer chain gains the new author and
+  # the keyring's human seed is replaced. After this, the old seed fails
+  # loudly ({:not_operator}) at every signing and boot surface.
   defp agent_rekey(opts) do
     with {:ok, paths, _set, view} <- agent_open(opts),
          :ok <- agent_live_view(view, opts.name),
-         {:ok, old_seed, _var} <- agent_signing_seed(opts, view),
+         chain = agent_pointer_chain(paths),
+         {:ok, old_seed, _var} <- agent_signing_seed(opts, view, nil, chain),
          {:ok, new_seed} <- agent_seed_from_env(opts.new_seed_env),
          {:ok, ciphertext} <- agent_enc_key(view, opts.name),
          {:ok, plaintext} <- agent_decrypt(ciphertext, old_seed, opts.name),
          {:ok, reencrypted} <- Secrets.encrypt(plaintext, new_seed),
          {:ok, signed} <-
-           AgentEvents.agent_set(old_seed, agent_now_ms(), opts.name, %{api_key_enc: reencrypted}),
-         :ok <- agent_append(paths.store, [signed]) do
-      {:ok, "rekeyed #{opts.name}: api_key_enc now decrypts under #{opts.new_seed_env}"}
+           AgentEvents.agent_set(old_seed, agent_now_ms(), opts.name, %{
+             api_key_enc: reencrypted,
+             operator_seed_env: opts.new_seed_env
+           }),
+         :ok <- agent_append(paths.store, [signed]),
+         :ok <- Keys.import_human_seed(new_seed, paths.keyring),
+         :ok <-
+           agent_write_pointer(
+             paths,
+             (chain || [Keys.author_for_seed(old_seed)]) ++ [Keys.author_for_seed(new_seed)]
+           ) do
+      {:ok,
+       "rekeyed #{opts.name}: api_key_enc now decrypts under #{opts.new_seed_env} and " <>
+         "operator authority moved to its author (the old seed no longer signs)"}
     end
   end
 
@@ -849,7 +887,7 @@ defmodule Kyber.CLI do
 
     with {:ok, paths, set, view} <- agent_open(opts),
          :ok <- agent_known_delta(set, opts.target),
-         {:ok, seed, _var} <- agent_signing_seed(opts, view, set),
+         {:ok, seed, _var} <- agent_signing_seed(opts, view, set, agent_pointer_chain(paths)),
          {:ok, retraction} <- AgentEvents.agent_retract(seed, ts, opts.name, opts.target),
          {:ok, tombstone} <-
            AgentEvents.secret_tombstone(
@@ -906,7 +944,7 @@ defmodule Kyber.CLI do
       set = agent_load_set(paths.store)
 
       view =
-        case Config.resolve(set, opts.name) do
+        case Config.resolve(set, opts.name, agent_pointer_chain(paths)) do
           {:ok, view} -> view
           :not_found -> nil
         end
@@ -917,8 +955,8 @@ defmodule Kyber.CLI do
     end
   end
 
-  defp agent_view_or_nil(store_path, name) do
-    case Config.resolve(agent_load_set(store_path), name) do
+  defp agent_view_or_nil(store_path, name, chain) do
+    case Config.resolve(agent_load_set(store_path), name, chain) do
       {:ok, view} -> view
       :not_found -> nil
     end
@@ -936,12 +974,26 @@ defmodule Kyber.CLI do
   # BYTES (retraction negates the config value, but the store only learns —
   # a fully-retracted stream must still be amendable by its operator), else
   # KYBER_OPERATOR_SEED — the VALUE only ever rides the environment (M5/N4)
-  defp agent_signing_seed(opts, view, set \\ nil) do
+  defp agent_signing_seed(opts, view, set \\ nil, chain \\ nil) do
     var =
       opts.operator_seed_env || (view && view.operator_seed_env) ||
         agent_recorded_seed_env(set, opts.name) || "KYBER_OPERATOR_SEED"
 
-    with {:ok, seed} <- agent_seed_from_env(var), do: {:ok, seed, var}
+    with {:ok, seed} <- agent_seed_from_env(var),
+         :ok <- agent_operator_check(seed, var, chain) do
+      {:ok, seed, var}
+    end
+  end
+
+  # M2 (P5): under a pointer chain, the signing seed must derive the CURRENT
+  # (last) operator author — a rotated-away seed fails loudly instead of
+  # minting deltas the pinned fold treats as agent-authored
+  defp agent_operator_check(_seed, _var, nil), do: :ok
+
+  defp agent_operator_check(seed, var, chain) do
+    if Keys.author_for_seed(seed) == List.last(chain),
+      do: :ok,
+      else: {:error, {:not_operator, var}}
   end
 
   defp agent_recorded_seed_env(nil, _name), do: nil
@@ -1025,9 +1077,15 @@ defmodule Kyber.CLI do
     paths = agent_paths(agent_registry(opts), opts.agent)
 
     with {:ok, content} <- File.read(paths.pointer),
-         {:ok, %{"log_path" => log, "keyring_dir" => keyring}}
+         {:ok, %{"log_path" => log, "keyring_dir" => keyring} = decoded}
          when is_binary(log) and is_binary(keyring) <- JSON.decode(content) do
-      {:ok, %{log_path: log, keyring_dir: keyring}}
+      chain =
+        case decoded do
+          %{"operator_authors" => [_ | _] = authors} -> authors
+          _legacy -> nil
+        end
+
+      {:ok, %{log_path: log, keyring_dir: keyring, operator_authors: chain}}
     else
       _other -> {:error, {:unknown_agent, opts.agent}}
     end
@@ -1302,7 +1360,7 @@ defmodule Kyber.CLI do
   # decrypted under the operator seed in the unlogged window.
   defp cmd_daemon(%{agent: agent} = opts) when is_binary(agent) do
     with {:ok, pointer} <- agent_read_pointer(opts),
-         view = agent_view_or_nil(pointer.log_path, agent),
+         view = agent_view_or_nil(pointer.log_path, agent, pointer.operator_authors),
          {:ok, operator_seed} <- agent_boot_operator_seed(opts, view),
          {:ok, api_key} <- agent_boot_api_key(opts, view, operator_seed) do
       overrides = daemon_override_opts(opts)
@@ -1322,7 +1380,10 @@ defmodule Kyber.CLI do
           # feed and hot-swaps on AgentSet deltas, with the CLI overrides
           # pinned across every re-fold
           agent: agent,
-          overrides: overrides
+          overrides: overrides,
+          # P5 H2: the pointer's operator author chain pins the fold — the
+          # daemon never derives operatorship from store timestamps
+          operator_authors: pointer.operator_authors
         )
         |> Keyword.put_new(:loop, :ack)
         |> Keyword.put_new(:oracle_seed, :absent)
@@ -1773,6 +1834,16 @@ defmodule Kyber.CLI do
 
   defp format_error({:decrypt_failed, name}),
     do: "agent #{name}: the current operator seed cannot decrypt the stored key — wrong seed?"
+
+  defp format_error({:not_operator, var}),
+    do:
+      "the seed in #{var} is not the CURRENT operator (authority was rekeyed away) — " <>
+        "export the newest operator seed and retry"
+
+  defp format_error({:not_operator, author, expected}),
+    do:
+      "boot seed derives #{author} but the pointer's current operator is #{expected} — " <>
+        "export the newest operator seed (the rekey moved authority)"
 
   defp format_error(other), do: "error: #{inspect(other)}"
 end

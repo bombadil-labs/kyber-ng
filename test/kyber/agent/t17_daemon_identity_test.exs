@@ -295,6 +295,75 @@ defmodule Kyber.Agent.T17DaemonIdentityTest do
     assert live_model() == "kimi-broken"
   end
 
+  test "a SWAP-TIME config-class failure counts: the broken agent delta is retracted (P5 H1)",
+       %{key_dir: key_dir} do
+    table = :ets.new(:t17_stub, [:public])
+    :ets.insert(table, {:mode, :ok})
+
+    append_set!(@operator_seed, @base_ts, %{
+      model: "kimi-base",
+      api_key_env: "T17_DI_KEY",
+      self_config: "true"
+    })
+
+    boot!(key_dir, stub_llm(table, model: "kimi-base"),
+      model: "kimi-base",
+      test_pid: self(),
+      rollback_threshold: 1
+    )
+
+    # the agent self-configures a key env that is NOT set: the failure
+    # happens AT THE SWAP, before any inference — the harness must already
+    # be armed with this delta and roll it back (never `failures: 0` reset
+    # after the failing swap)
+    agent_delta = append_set!(@agent_seed, @base_ts + 10, %{api_key_env: "T17_DI_MISSING"})
+
+    assert eventually(fn -> agent_delta in retract_targets() end),
+           "the swap-time key failure never fed the harness (status: #{inspect(Daemon.status())})"
+
+    assert [rollback | _rest] = rollback_claims()
+    assert Enum.any?(rollback.offends, &match?({:delta, ^agent_delta, _ctx}, &1))
+
+    # the retraction's own feed delivery re-swaps back onto the good key
+    assert eventually(fn -> live_model() == "kimi-base" end)
+    assert Daemon.status().rollbacks == 1
+    assert retract_targets() == [agent_delta]
+  end
+
+  test "the operator seed is redacted from the wire even when leaked into content (P5 M1)",
+       %{key_dir: key_dir} do
+    table = :ets.new(:t17_stub, [:public])
+    :ets.insert(table, {:mode, :ok})
+
+    append_set!(@operator_seed, @base_ts, %{model: "kimi-base", api_key_env: "T17_DI_KEY"})
+    boot!(key_dir, stub_llm(table, model: "kimi-base"), model: "kimi-base")
+
+    # a hot-swap pushes the daemon's redact list (api key + operator seed)
+    # into the live handler
+    append_set!(@operator_seed, @base_ts + 10, %{model: "kimi-hot"})
+    assert eventually(fn -> live_model() == "kimi-hot" end)
+
+    # the seed value leaks into ordinary channel content — the wire must
+    # carry the marker, never the value (the shape scan deliberately skips
+    # bare 64-hex, so only the exact-value redact list can catch this)
+    {:ok, _id} =
+      Harness.ingest(
+        %{
+          "message_id" => "message:t17di:seedleak",
+          "channel_id" => "channel:t17di",
+          "session_id" => "session:t17di",
+          "content" => "psst, the operator seed is #{@operator_seed}",
+          "ts" => 1_754_710_000_000
+        },
+        key_dir
+      )
+
+    assert_receive {:t17_llm_body, body}, 60_000
+    encoded = JSON.encode!(body)
+    refute encoded =~ @operator_seed
+    assert encoded =~ "[REDACTED]"
+  end
+
   test "an operator-attested bad delta is detection-only — never auto-retracted (AC12)", %{
     key_dir: key_dir
   } do
@@ -357,6 +426,25 @@ defmodule Kyber.Agent.T17DaemonIdentityTest do
     assert message =~ "DEEPSEEK_API_KEY"
     assert message =~ "export"
     refute message =~ "sk-"
+  end
+
+  test "boot with a rotated-away operator seed refuses loudly (P5 M2)", %{key_dir: key_dir} do
+    append_set!(@operator_seed, @base_ts, %{model: "kimi-base", api_key_env: "T17_DI_KEY"})
+
+    # the pointer chain says authority moved to another author; the boot
+    # seed still derives the OLD author — refuse, never sign with dead
+    # authority
+    current = Keys.author_for_seed(@agent_seed)
+    old = Keys.author_for_seed(@operator_seed)
+
+    assert {:error, {:not_operator, ^old, ^current}} =
+             Daemon.boot(
+               keyring_dir: key_dir,
+               tick_ms: :manual,
+               agent: "wisp",
+               operator_seed: @operator_seed,
+               operator_authors: [old, current]
+             )
   end
 
   test "boot mints identity:soul from the fold exactly once (AC6)", %{key_dir: key_dir} do

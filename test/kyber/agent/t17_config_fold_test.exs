@@ -62,7 +62,11 @@ defmodule Kyber.Agent.T17ConfigFoldTest do
 
       assert claims.author == Keys.author_for_seed(@operator_seed)
       assert hd(claims.pointers) == %{role: "agent", target: {:entity, "wisp", "agents"}}
-      assert List.last(claims.pointers) == %{role: "type", target: {:entity, "AgentSet", "instances"}}
+
+      assert List.last(claims.pointers) == %{
+               role: "type",
+               target: {:entity, "AgentSet", "instances"}
+             }
 
       resolved = Schema.resolve(claims)
       assert %{type: "AgentSet", agent: {:entity, "wisp", _}, soul: "I am wisp."} = resolved
@@ -70,7 +74,9 @@ defmodule Kyber.Agent.T17ConfigFoldTest do
     end
 
     test "unset field names ride as many-role strings" do
-      {:ok, {claims, _sig}} = Events.agent_set(@operator_seed, @ts, "wisp", %{unset: ["model", "soul"]})
+      {:ok, {claims, _sig}} =
+        Events.agent_set(@operator_seed, @ts, "wisp", %{unset: ["model", "soul"]})
+
       assert %{type: "AgentSet", unset: ["model", "soul"]} = Schema.resolve(claims)
     end
 
@@ -180,7 +186,8 @@ defmodule Kyber.Agent.T17ConfigFoldTest do
       {genesis_id, _} = genesis = agent_set("wisp", @genesis_fields, ts: @ts)
       rogue = agent_retract("wisp", genesis_id, seed: @intruder_seed, ts: @ts + 1)
 
-      assert {:ok, %{model: "deepseek-v4-flash"}} = Config.resolve(set_of([genesis, rogue]), "wisp")
+      assert {:ok, %{model: "deepseek-v4-flash"}} =
+               Config.resolve(set_of([genesis, rogue]), "wisp")
     end
   end
 
@@ -252,11 +259,47 @@ defmodule Kyber.Agent.T17ConfigFoldTest do
       assert view.base_url == "https://api.deepseek.com/v1"
     end
 
+    test "operator_seed_env is operator-attested ALWAYS: a granted agent delta never folds it (P5 H3)" do
+      pairs = [
+        agent_set("wisp", @genesis_fields, ts: @ts),
+        agent_set("wisp", %{operator_seed_env: "KYBER_OPERATOR_SEED"}, ts: @ts + 1),
+        agent_set("wisp", %{self_config: "true"}, ts: @ts + 2),
+        agent_set("wisp", %{operator_seed_env: "ATTACKER_SEED", model: "agent-choice"},
+          seed: @agent_seed,
+          ts: @ts + 3
+        )
+      ]
+
+      assert {:ok, view} = Config.resolve(set_of(pairs), "wisp")
+      # the model change folds (granted); the seed redirect NEVER does
+      assert view.model == "agent-choice"
+      assert view.operator_seed_env == "KYBER_OPERATOR_SEED"
+    end
+
+    test "a granted agent unset of operator_seed_env is fold-inert too (P5 H3)" do
+      pairs = [
+        agent_set("wisp", @genesis_fields, ts: @ts),
+        agent_set("wisp", %{operator_seed_env: "KYBER_OPERATOR_SEED"}, ts: @ts + 1),
+        agent_set("wisp", %{self_config: "true"}, ts: @ts + 2),
+        agent_set("wisp", %{unset: ["operator_seed_env"], model: "agent-choice"},
+          seed: @agent_seed,
+          ts: @ts + 3
+        )
+      ]
+
+      assert {:ok, view} = Config.resolve(set_of(pairs), "wisp")
+      assert view.model == "agent-choice"
+      assert view.operator_seed_env == "KYBER_OPERATOR_SEED"
+    end
+
     test "an agent retraction can negate its own folded delta but not an operator's" do
       genesis = agent_set("wisp", @genesis_fields, ts: @ts)
       {genesis_id, _} = genesis
       grant = agent_set("wisp", %{self_config: "true"}, ts: @ts + 1)
-      {own_id, _} = own = agent_set("wisp", %{model: "agent-choice"}, seed: @agent_seed, ts: @ts + 2)
+
+      {own_id, _} =
+        own = agent_set("wisp", %{model: "agent-choice"}, seed: @agent_seed, ts: @ts + 2)
+
       own_retract = agent_retract("wisp", own_id, seed: @agent_seed, ts: @ts + 3)
 
       set = set_of([genesis, grant, own, own_retract])
@@ -265,6 +308,116 @@ defmodule Kyber.Agent.T17ConfigFoldTest do
       rogue = agent_retract("wisp", genesis_id, seed: @agent_seed, ts: @ts + 4)
       set = set_of([genesis, grant, own, own_retract, rogue])
       assert {:ok, %{model: "deepseek-v4-flash"}} = Config.resolve(set, "wisp")
+    end
+  end
+
+  # ------------------------------------------- pinned operator identity (H2)
+
+  describe "Config.resolve/3 — the operator is PINNED, never timestamp-derived (P5 H2)" do
+    test "a BACKDATED intruder AgentSet never seizes operatorship under a pin" do
+      operator = Keys.author_for_seed(@operator_seed)
+      genesis = agent_set("wisp", @genesis_fields, ts: @ts)
+
+      # backdated BEFORE the real genesis: under the legacy first-writer
+      # reading this delta's author would become the operator
+      forged =
+        agent_set("wisp", %{model: "evil-model", self_config: "true", soul: "seized"},
+          seed: @intruder_seed,
+          ts: @ts - 1_000_000
+        )
+
+      set = set_of([genesis, forged])
+
+      # the legacy resolve/2 IS seized (the documented hole — display-only)
+      assert {:ok, legacy} = Config.resolve(set, "wisp")
+      assert legacy.operator_author == Keys.author_for_seed(@intruder_seed)
+
+      # the pinned fold treats the forged delta as AGENT-authored: no grant
+      # precedes it, so it is fold-inert and the operator stands
+      assert {:ok, view} = Config.resolve(set, "wisp", operator)
+      assert view.operator_author == operator
+      assert view.model == "deepseek-v4-flash"
+      assert view.soul == nil
+      assert view.self_config == false
+    end
+
+    test "a backdated forgery under a pin cannot even use a real grant retroactively" do
+      operator = Keys.author_for_seed(@operator_seed)
+
+      pairs = [
+        agent_set("wisp", @genesis_fields, ts: @ts),
+        agent_set("wisp", %{self_config: "true"}, ts: @ts + 1),
+        # backdated BEFORE the grant: prospective grant keeps it inert
+        agent_set("wisp", %{model: "evil-model"}, seed: @intruder_seed, ts: @ts - 5)
+      ]
+
+      assert {:ok, view} = Config.resolve(set_of(pairs), "wisp", operator)
+      assert view.model == "deepseek-v4-flash"
+    end
+
+    test "a chain pin folds every chain author; operator_author is the LAST (rekey)" do
+      old_author = Keys.author_for_seed(@operator_seed)
+      new_author = Keys.author_for_seed(@intruder_seed)
+      chain = [old_author, new_author]
+
+      pairs = [
+        agent_set("wisp", @genesis_fields, ts: @ts),
+        # post-rekey: the NEW seed signs operator deltas
+        agent_set("wisp", %{model: "kimi-k3"}, seed: @intruder_seed, ts: @ts + 1)
+      ]
+
+      assert {:ok, view} = Config.resolve(set_of(pairs), "wisp", chain)
+      assert view.model == "kimi-k3"
+      assert view.operator_author == new_author
+      assert view.operator_authors == chain
+    end
+
+    test "under a pin a non-chain retraction of an operator delta stays inert" do
+      operator = Keys.author_for_seed(@operator_seed)
+      {genesis_id, _} = genesis = agent_set("wisp", @genesis_fields, ts: @ts)
+      # the rogue retraction is BACKDATED-author-forged: still inert
+      rogue = agent_retract("wisp", genesis_id, seed: @intruder_seed, ts: @ts - 10)
+
+      assert {:ok, %{model: "deepseek-v4-flash"}} =
+               Config.resolve(set_of([genesis, rogue]), "wisp", operator)
+    end
+  end
+
+  # --------------------------------------------- api_key union unset (LOW-1)
+
+  describe "Config.resolve — api_key union unset (P5 L1 probe)" do
+    test "unset api_key_enc clears the enc arm back to absent" do
+      enc = Base.encode64(:crypto.strong_rand_bytes(44))
+
+      pairs = [
+        agent_set("wisp", %{model: "kimi-k3"}, ts: @ts),
+        agent_set("wisp", %{api_key_enc: enc}, ts: @ts + 1),
+        agent_set("wisp", %{unset: ["api_key_enc"]}, ts: @ts + 2)
+      ]
+
+      assert {:ok, view} = Config.resolve(set_of(pairs), "wisp")
+      assert view.api_key == nil
+    end
+
+    test "setting env clears a stale enc head and vice versa (both clauses live)" do
+      enc = Base.encode64(:crypto.strong_rand_bytes(44))
+
+      pairs = [
+        agent_set("wisp", %{api_key_enc: enc}, ts: @ts),
+        agent_set("wisp", %{api_key_env: "SOME_KEY"}, ts: @ts + 1)
+      ]
+
+      assert {:ok, %{api_key: {:env, "SOME_KEY"}, heads: heads}} =
+               Config.resolve(set_of(pairs), "wisp")
+
+      refute Map.has_key?(heads, :api_key_enc)
+
+      pairs = pairs ++ [agent_set("wisp", %{api_key_enc: enc}, ts: @ts + 2)]
+
+      assert {:ok, %{api_key: {:enc, ^enc}, heads: heads}} =
+               Config.resolve(set_of(pairs), "wisp")
+
+      refute Map.has_key?(heads, :api_key_env)
     end
   end
 

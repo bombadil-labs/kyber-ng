@@ -7,18 +7,23 @@ defmodule Kyber.Agent.Config do
   fold steps back PER FIELD to the previous live setter (the safety
   harness's mechanism).
 
-  The OPERATOR is the author of the earliest `AgentSet` delta for the name
-  (the creator — `agent new` appends the genesis layer before any agent
-  runs), so the fold is a pure function of the set. The H2c author filter
-  applies with a PROSPECTIVE `self_config` grant: an agent-authored delta
-  folds only when a live operator-attested grant precedes it in
-  `{timestamp, id}` order — a pre-grant agent delta stays inert forever,
-  and retracting the grant de-activates everything it admitted.
-  `base_url` folds ONLY when operator-attested, regardless of the grant
-  (premortem P0 — a prompt-injected agent must not point the key at an
-  attacker proxy). Negations are author-filtered per target: an
-  operator delta is negatable only by the operator; an agent delta by the
-  operator or the agent's own author.
+  The OPERATOR is PINNED by the caller (`resolve/3`): the operator author
+  chain is content-derived from the operator seed (`Keys.author_for_seed`)
+  or read from the `agent new`-written registry pointer — NEVER derived
+  from delta ordering. Timestamps are self-asserted, so first-writer-wins
+  would let a backdated delta seize operatorship (P5 HIGH-2); the two-arg
+  `resolve/2` keeps the legacy earliest-author reading for DISPLAY-ONLY
+  paths and must not gate anything. The H2c author filter applies with a
+  PROSPECTIVE `self_config` grant: an agent-authored delta folds only when
+  a live operator-attested grant precedes it in `{timestamp, id}` order —
+  a pre-grant agent delta stays inert forever, and retracting the grant
+  de-activates everything it admitted. `base_url` AND `operator_seed_env`
+  fold ONLY when operator-attested, regardless of the grant (premortem P0
+  and P5 HIGH-3 — a prompt-injected agent must not point the key at an
+  attacker proxy, nor redirect the operator seed to one it controls and
+  disarm the harness). Negations are author-filtered per target: an
+  operator delta is negatable only by an operator-chain author; an agent
+  delta by an operator-chain author or the agent's own author.
 
   Dedup is SEMANTICS-AWARE (`changed_fields/2`): re-asserting the current
   fold value is a true no-op (no delta appended); re-asserting a PREVIOUS
@@ -30,6 +35,12 @@ defmodule Kyber.Agent.Config do
   alias Kyber.Agent.Liveness
 
   @fields ~w(soul base_url model api_key_env api_key_enc system_prompt operator_seed_env oracle_seed loop channel_socket profile self_config)a
+
+  # operator-attested ALWAYS, set AND unset, regardless of the grant:
+  # base_url (premortem P0 — proxy exfiltration) and operator_seed_env
+  # (P5 HIGH-3 — same trust class: redirecting the seed disarms the
+  # rollback harness and seizes signing)
+  @operator_only [:base_url, :operator_seed_env]
 
   @type view :: %{
           name: String.t(),
@@ -45,7 +56,8 @@ defmodule Kyber.Agent.Config do
           profile: String.t() | nil,
           self_config: boolean(),
           heads: %{atom() => String.t()},
-          operator_author: String.t()
+          operator_author: String.t(),
+          operator_authors: [String.t()]
         }
 
   @doc "The AgentSet field vocabulary (atoms, emission order fixed in Events)."
@@ -56,10 +68,21 @@ defmodule Kyber.Agent.Config do
   The fold: `{:ok, view}` when the name has at least one live `AgentSet`
   delta; `:not_found` for unknown or whitespace-only names and for a fully
   retracted stream (AC16 — boot then falls through to the engine's
-  hardcoded defaults). Pure, deterministic, replica-identical.
+  hardcoded defaults). Deterministic and replica-identical for a given
+  operator pin.
+
+  `operators` pins the operator author chain (P5 HIGH-2): a single author
+  (content-derived from the operator seed) or the pointer-recorded chain
+  (oldest first — rekey appends the new seed's author; the LAST entry is
+  the current operator). `nil` falls back to the legacy earliest-author
+  reading, which trusts self-asserted timestamps — display-only; every
+  gate-bearing caller (daemon boot/hot-swap, CLI write verbs) must pin.
   """
-  @spec resolve(DeltaSet.t(), String.t()) :: {:ok, view()} | :not_found
-  def resolve(set, name) when is_binary(name) do
+  @spec resolve(DeltaSet.t(), String.t(), String.t() | [String.t()] | nil) ::
+          {:ok, view()} | :not_found
+  def resolve(set, name, operators \\ nil)
+
+  def resolve(set, name, operators) when is_binary(name) do
     if String.trim(name) == "" do
       :not_found
     else
@@ -68,17 +91,21 @@ defmodule Kyber.Agent.Config do
           :not_found
 
         [{_id, _resolved, first} | _] = deltas ->
-          operator_author = first.author
-          {acc, heads} = walk(set, deltas, operator_author)
+          operators = operator_chain(operators, first)
+          {acc, heads} = walk(set, deltas, operators)
 
           if acc == %{} do
             :not_found
           else
-            {:ok, view(name, acc, heads, operator_author)}
+            {:ok, view(name, acc, heads, operators)}
           end
       end
     end
   end
+
+  defp operator_chain(nil, first), do: [first.author]
+  defp operator_chain(author, _first) when is_binary(author), do: [author]
+  defp operator_chain([_ | _] = authors, _first), do: authors
 
   @doc """
   Semantics-aware dedup (AC8 premortem): the subset of `fields` whose
@@ -229,7 +256,8 @@ defmodule Kyber.Agent.Config do
        when field in [:model, :base_url, :channel_socket, :profile] and is_binary(value),
        do: :ok
 
-  defp validate_field(field, _value), do: {:error, {:invalid_field, field, "unknown or malformed"}}
+  defp validate_field(field, _value),
+    do: {:error, {:invalid_field, field, "unknown or malformed"}}
 
   # the fail-closed entropy scan (AC24 premortem): a long mixed-charset
   # token that shape rules missed — tuned so legitimate prose never trips
@@ -267,12 +295,12 @@ defmodule Kyber.Agent.Config do
   # folded self_config value at each position, so an agent delta folds only
   # under a live operator grant that PRECEDES it — and a retracted grant
   # de-activates everything it admitted (liveness is fold-time)
-  defp walk(set, deltas, operator_author) do
+  defp walk(set, deltas, operators) do
     {acc, heads, _granted} =
       Enum.reduce(deltas, {%{}, %{}, false}, fn {id, resolved, claims}, {acc, heads, granted} ->
         cond do
-          claims.author == operator_author ->
-            if Liveness.live?(set, id, operator_filter(operator_author)) do
+          claims.author in operators ->
+            if Liveness.live?(set, id, operator_filter(operators)) do
               {acc, heads} = apply_fields(acc, heads, id, resolved, :operator)
               {acc, heads, granted_after(acc)}
             else
@@ -280,7 +308,7 @@ defmodule Kyber.Agent.Config do
             end
 
           granted ->
-            if Liveness.live?(set, id, agent_filter(operator_author, claims.author)) do
+            if Liveness.live?(set, id, agent_filter(operators, claims.author)) do
               {acc, heads} = apply_fields(acc, heads, id, resolved, :agent)
               {acc, heads, granted_after(acc)}
             else
@@ -302,8 +330,9 @@ defmodule Kyber.Agent.Config do
       for field <- @fields,
           value = Map.get(resolved, field),
           value != nil,
-          # base_url is operator-attested ALWAYS (premortem P0)
-          source == :operator or field != :base_url,
+          # base_url + operator_seed_env are operator-attested ALWAYS
+          # (premortem P0 / P5 HIGH-3)
+          source == :operator or field not in @operator_only,
           do: {field, value}
 
     {acc, heads} =
@@ -317,31 +346,37 @@ defmodule Kyber.Agent.Config do
         nil ->
           {acc, heads}
 
-        # base_url is operator-attested ALWAYS — the unset arm too (P0):
-        # an agent unset of base_url is fold-inert
-        :base_url when source != :operator ->
-          {acc, heads}
-
         field ->
-          {Map.put(acc, field, nil), Map.put(heads, field, id)}
+          # base_url + operator_seed_env are operator-attested ALWAYS —
+          # the unset arm too (P0 / HIGH-3): an agent unset is fold-inert
+          if source != :operator and field in @operator_only do
+            {acc, heads}
+          else
+            {Map.put(acc, field, nil), Map.put(heads, field, id)}
+          end
       end
     end)
   end
 
   # api_key is a tagged union: setting one arm clears the other
-  defp clear_union(acc, heads, :api_key_env), do: {Map.delete(acc, :api_key_enc), Map.delete(heads, :api_key_enc)}
-  defp clear_union(acc, heads, :api_key_enc), do: {Map.delete(acc, :api_key_env), Map.delete(heads, :api_key_env)}
+  defp clear_union(acc, heads, :api_key_env),
+    do: {Map.delete(acc, :api_key_enc), Map.delete(heads, :api_key_enc)}
+
+  defp clear_union(acc, heads, :api_key_enc),
+    do: {Map.delete(acc, :api_key_env), Map.delete(heads, :api_key_env)}
+
   defp clear_union(acc, heads, _field), do: {acc, heads}
 
-  # negations on an OPERATOR delta must be operator-authored (H2c)
-  defp operator_filter(operator_author) do
-    fn claims -> claims.author == operator_author end
+  # negations on an OPERATOR delta must be operator-chain-authored (H2c)
+  defp operator_filter(operators) do
+    fn claims -> claims.author in operators end
   end
 
-  # an agent delta is negatable by the operator OR its own author — never
-  # a third party, and an agent can never negate an operator delta
-  defp agent_filter(operator_author, agent_author) do
-    fn claims -> claims.author == operator_author or claims.author == agent_author end
+  # an agent delta is negatable by an operator-chain author OR its own
+  # author — never a third party, and an agent can never negate an
+  # operator delta
+  defp agent_filter(operators, agent_author) do
+    fn claims -> claims.author in operators or claims.author == agent_author end
   end
 
   defp safe_field(name) when is_binary(name) do
@@ -352,7 +387,7 @@ defmodule Kyber.Agent.Config do
 
   # ---------------------------------------------------------------- the view
 
-  defp view(name, acc, heads, operator_author) do
+  defp view(name, acc, heads, operators) do
     api_key =
       cond do
         acc[:api_key_env] -> {:env, acc[:api_key_env]}
@@ -374,7 +409,9 @@ defmodule Kyber.Agent.Config do
       profile: acc[:profile],
       self_config: acc[:self_config] == "true",
       heads: heads,
-      operator_author: operator_author
+      # the CURRENT operator is the chain's last author (rekey appends)
+      operator_author: List.last(operators),
+      operator_authors: operators
     }
   end
 
