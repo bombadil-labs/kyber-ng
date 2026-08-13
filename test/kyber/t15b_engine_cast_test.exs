@@ -14,6 +14,14 @@ defmodule Kyber.T15bEngineCastTest do
   """
   use ExUnit.Case, async: false
 
+  # The engine round-trip is load-sensitive: the test's own wait budget (60s
+  # assert_receive + up to 60s poll) exceeds ExUnit's 60s default per-test
+  # timeout, so under full-suite load a late-landing ResponseDelta would be
+  # killed as an ExUnit.TimeoutError instead of failing the assertion. Same
+  # pattern as the repo's other load-sensitive suites
+  # (reactor_operational_test, daemon_smoke_test, memory_assoc_operational_test).
+  @moduletag timeout: 300_000
+
   alias Kyber.{Daemon, Harness, Keys}
   alias Kyber.Agent.LlmHandler
 
