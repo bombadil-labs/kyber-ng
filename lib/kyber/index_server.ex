@@ -99,27 +99,26 @@ defmodule Kyber.IndexServer do
   def init(opts) do
     seed_from_set = Keyword.get(opts, :seed_from_set, true)
 
-    if seed_from_set do
-      # ATOMIC seed+attach (P5 fix): one store call returns the snapshot AND
-      # registers us, so no delta committed between the two is lost.
-      case safe_subscribe_seeded() do
-        {:ok, set, ref} ->
-          {:ok,
-           %__MODULE__{
-             index: DurableIndex.build(set),
-             seed_from_set: true,
-             attached: true,
-             store_ref: ref,
-             retries: 0
-           }}
+    # ALWAYS monitor the store (both modes — P5 medium: a blind or
+    # attach/1-only subscriber whose registration died with the store would
+    # otherwise lose the feed forever on a restart). The DOWN handler
+    # re-subscribes; seeded views also re-seed (a seeded init starts from
+    # the empty index; the atomic subscribe_seeded call folds the set in).
+    case safe_subscribe(seed_from_set, DurableIndex.new()) do
+      {:ok, index, ref} ->
+        {:ok,
+         %__MODULE__{
+           index: index,
+           seed_from_set: seed_from_set,
+           attached: true,
+           store_ref: ref,
+           retries: 0
+         }}
 
-        :unavailable ->
-          # fail at boot: a server that cannot reach the store cannot be a
-          # reliable index (P5 medium — dead code error branches)
-          {:stop, :store_unavailable}
-      end
-    else
-      {:ok, %__MODULE__{seed_from_set: false, attached: false, store_ref: nil, retries: 0}}
+      :unavailable ->
+        # fail at boot: a server that cannot reach the store cannot be a
+        # reliable index (P5 medium — dead code error branches)
+        {:stop, :store_unavailable}
     end
   end
 
@@ -139,21 +138,21 @@ defmodule Kyber.IndexServer do
 
   @impl true
   # a BLIND view (seed_from_set: false) stays blind: it only ever adds the
-  # deltas the feed delivers after attach — never re-attaches, never
-  # rebuilds from the full history (P5 medium — silent conversion to
-  # full-history was a contract violation)
+  # deltas the feed delivers after attach — never rebuilds from the full
+  # history (P5 medium — silent conversion to full-history was a contract
+  # violation)
   def handle_info({:delta, id, claims}, %{seed_from_set: false} = state) do
     {:noreply, %{state | index: DurableIndex.add(state.index, %{id: id, claims: claims})}}
   end
 
-  # an ATTACHED view receiving a delta it has not yet re-synced from: the
-  # store is back (it is delivering), so re-attach + re-seed to be sure the
-  # view is current (P5 — a detached view is incomplete, not blind)
+  # an ATTACHED seeded view receiving a delta it has not yet re-synced
+  # from: the store is back (it is delivering), so re-attach + re-seed to
+  # be sure the view is current (P5 — a detached view is incomplete, not
+  # blind)
   def handle_info({:delta, id, claims}, %{attached: false} = state) do
-    case safe_subscribe_seeded() do
-      {:ok, set, ref} ->
-        {:noreply,
-         %{state | index: DurableIndex.build(set), attached: true, store_ref: ref, retries: 0}}
+    case safe_subscribe(state.seed_from_set, state.index) do
+      {:ok, index, ref} ->
+        {:noreply, %{state | index: index, attached: true, store_ref: ref, retries: 0}}
 
       :unavailable ->
         # store vanished mid-flight; fold the delta in for now, the DOWN
@@ -167,15 +166,20 @@ defmodule Kyber.IndexServer do
   end
 
   # the store restarted: subscriptions are store-owned state and do not
-  # survive a restart, so re-attach + re-seed atomically (P5 medium — a
-  # silent permanent staleness is worse than a re-sync). The DOWN arrives
-  # DURING the stop window, before the supervised restart has booted the new
-  # store — so if the store is not up yet, retry with a bounded send_after.
+  # survive a restart, so re-subscribe AND re-seed (P5 medium: a silent
+  # permanent staleness is worse than a re-sync). Recovery ALWAYS re-seeds
+  # from the set — even a blind view — because deltas committed in the gap
+  # between the store reboot and the re-subscribe are otherwise lost
+  # forever; a view that missed the gap has no way to know what it missed.
+  # (The blind contract governs normal operation: a seed_from_set: false
+  # init starts empty and only folds feed deltas. Recovery is not normal
+  # operation.) The DOWN arrives DURING the stop window, before the
+  # supervised restart has booted the new store — so if the store is not up
+  # yet, retry with a bounded send_after.
   def handle_info({:DOWN, ref, :process, _pid, _reason}, %{store_ref: ref} = state) do
-    case safe_subscribe_seeded() do
-      {:ok, set, new_ref} ->
-        {:noreply,
-         %{state | index: DurableIndex.build(set), attached: true, store_ref: new_ref, retries: 0}}
+    case safe_subscribe(true, state.index) do
+      {:ok, index, new_ref} ->
+        {:noreply, %{state | index: index, attached: true, store_ref: new_ref, retries: 0}}
 
       :unavailable ->
         # schedule the FIRST retry immediately (the retry_attach handler
@@ -189,11 +193,16 @@ defmodule Kyber.IndexServer do
     {:noreply, state}
   end
 
+  def handle_info(:retry_attach, %{attached: true} = state) do
+    # stale timer from a re-attach that has since succeeded — ignore it
+    # (P5 low: redundant full re-seeds)
+    {:noreply, state}
+  end
+
   def handle_info(:retry_attach, state) do
-    case safe_subscribe_seeded() do
-      {:ok, set, new_ref} ->
-        {:noreply,
-         %{state | index: DurableIndex.build(set), attached: true, store_ref: new_ref, retries: 0}}
+    case safe_subscribe(true, state.index) do
+      {:ok, index, new_ref} ->
+        {:noreply, %{state | index: index, attached: true, store_ref: new_ref, retries: 0}}
 
       :unavailable ->
         if state.retries < @max_attach_retries do
@@ -218,17 +227,29 @@ defmodule Kyber.IndexServer do
     {:noreply, state}
   end
 
-  # one re-attach attempt: the store's subscribe_seeded/1 EXITS on a real
-  # outage (noproc / call timeout) — it never returns {:error, _}, so wrap
-  # it (P5 medium: the old {:error, _} branches were dead code and the
-  # server crashed on exactly the restart path it claimed to survive)
-  defp safe_subscribe_seeded do
+  # one (re-)subscribe attempt, mode-aware: a seeded view wants the ATOMIC
+  # seed+subscribe (one store call, no commit gap) — the set is folded into
+  # a fresh index; a blind view just re-subscribes, KEEPING its existing
+  # (feed-only) index (`current_index` is returned unchanged). The store's
+  # calls EXIT on a real outage (noproc / call timeout) — they never return
+  # {:error, _}, so wrap them (P5 medium: the old {:error, _} branches were
+  # dead code and the server crashed on exactly the restart path it claimed
+  # to survive).
+  defp safe_subscribe(seed_from_set, current_index) do
     store_pid = Process.whereis(DurableStore)
 
     if store_pid do
       try do
-        case GenServer.call(DurableStore, {:subscribe_seeded, self()}, @attach_timeout) do
-          {:ok, set} -> {:ok, set, Process.monitor(store_pid)}
+        result =
+          if seed_from_set do
+            GenServer.call(DurableStore, {:subscribe_seeded, self()}, @attach_timeout)
+          else
+            GenServer.call(DurableStore, {:subscribe, self()}, @attach_timeout)
+          end
+
+        case result do
+          {:ok, set} -> {:ok, DurableIndex.build(set), Process.monitor(store_pid)}
+          :ok -> {:ok, current_index, Process.monitor(store_pid)}
           _other -> :unavailable
         end
       catch

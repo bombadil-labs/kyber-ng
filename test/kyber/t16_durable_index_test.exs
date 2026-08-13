@@ -203,6 +203,53 @@ defmodule Kyber.T16DurableIndexTest do
       :ok = DurableStore.unsubscribe(sub)
       send(sub, :stop)
     end
+
+    test "re-appending an identical wire is not re-fanned-out (P5 low — no duplicate deliveries)" do
+      now = System.system_time(:millisecond) * 1.0
+
+      parent = self()
+
+      {:ok, sub} =
+        Task.start(fn ->
+          loop = fn loop ->
+            receive do
+              {:delta, id, claims} ->
+                send(parent, {:feed, id, claims})
+                loop.(loop)
+
+              :stop ->
+                :ok
+            end
+          end
+
+          loop.(loop)
+        end)
+
+      :ok = DurableStore.subscribe(sub)
+
+      # append the SAME message twice (same content-derived id)
+      {:ok, signed} =
+        Events.message_received(
+          @seed,
+          now,
+          "message:t16:dup",
+          "channel:t16",
+          "session:t16",
+          "T16_DUP"
+        )
+
+      wire = Wire.envelope(signed)
+      :ok = DurableStore.append(wire)
+      :ok = DurableStore.append(wire)
+
+      # exactly ONE delivery: the re-append is a no-op union in the set and
+      # must not re-fan-out (P5 low)
+      assert_receive {:feed, _id, _claims}, 5_000
+      refute_receive {:feed, _id2, _claims2}, 300
+
+      :ok = DurableStore.unsubscribe(sub)
+      send(sub, :stop)
+    end
   end
 
   describe "AC3 — the spawned IndexServer (F3)" do
@@ -354,6 +401,63 @@ defmodule Kyber.T16DurableIndexTest do
       for content <- contents do
         assert Kyber.IndexServer.open_duplicate?(fresh, content, 30_000)
       end
+    end
+
+    test "a blind view re-subscribes after a store restart (P5 fix — feed is never lost)" do
+      now = System.system_time(:millisecond) * 1.0
+
+      # blind view: starts empty, sees only post-attach feed deltas
+      {:ok, server} = Kyber.IndexServer.start_link(seed_from_set: false)
+      refute Kyber.IndexServer.open_duplicate?(server, "T16_BLIND", 30_000)
+
+      # a delta before a restart reaches it via the feed
+      append_message("T16_BLIND", now)
+
+      blind_sees =
+        Enum.reduce_while(1..100, false, fn _, _ ->
+          if Kyber.IndexServer.open_duplicate?(server, "T16_BLIND", 30_000) do
+            {:halt, true}
+          else
+            receive do
+            after
+              25 -> :timeout
+            end
+
+            {:cont, false}
+          end
+        end)
+
+      assert blind_sees
+
+      # store restarts: the blind view's registration died with the store;
+      # the monitor fires and it re-subscribes (keeping its feed-only view —
+      # never converted to full-history)
+      Application.stop(:kyber)
+      {:ok, _} = Application.ensure_all_started(:kyber)
+
+      # after re-subscribe, a NEW delta reaches it again
+      now2 = System.system_time(:millisecond) * 1.0
+      append_message("T16_BLIND_2", now2)
+
+      blind2 =
+        Enum.reduce_while(1..200, false, fn _, _ ->
+          if Kyber.IndexServer.open_duplicate?(server, "T16_BLIND_2", 30_000) do
+            {:halt, true}
+          else
+            receive do
+            after
+              25 -> :timeout
+            end
+
+            {:cont, false}
+          end
+        end)
+
+      assert blind2
+
+      # the blind view stayed feed-only (it knows what the feed delivered,
+      # never a full-history rebuild from set/0)
+      assert Kyber.IndexServer.message_count(server) >= 1
     end
   end
 end

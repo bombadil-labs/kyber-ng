@@ -184,14 +184,28 @@ defmodule Kyber.DurableStore do
     # committed branch — never on persist_failed, so the index can never
     # claim a delta the log does not have. The single Store.verify result
     # feeds BOTH the reactor push and the index/fan-out (one verify per
-    # append, not two — P5 low).
+    # append, not two — P5 low). A RE-APPEND of an identical wire (same
+    # content-derived id) is a no-op union in the set — the door deduped
+    # it — so the index and subscribers are NOT updated again (P5 low:
+    # duplicate inf_by_prompt entries / duplicate feed deliveries). The
+    # reactor IS still notified: a re-append after a re-boot is the
+    # crash-window replay discipline (pin 17 — the re-asserted fixed-content
+    # seed re-dispatches so the reactor re-fires idempotently).
     case reply do
       :ok ->
         case Store.verify(wire) do
           {:ok, delta} ->
             notify_reactor(delta)
-            committed = %{new_state | index: DurableIndex.add(new_state.index, delta)}
-            {:reply, :ok, fan_out(committed, delta)}
+
+            if map_size(new_state.set) > map_size(state.set) do
+              committed = %{new_state | index: DurableIndex.add(new_state.index, delta)}
+              {:reply, :ok, fan_out(committed, delta)}
+            else
+              # duplicate re-append: the log got the line (append is
+              # write-ahead, the door accepted it) but the set did not grow
+              # — the index/subscribers already saw this id
+              {:reply, :ok, new_state}
+            end
 
           {:error, _reason} ->
             # door accepted the wire but verify disagrees (should not
