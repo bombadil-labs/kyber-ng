@@ -84,7 +84,11 @@ defmodule Kyber.T15bEngineCastTest do
       # the engine must actually be invoked
       assert_receive {:t15b_body, _body}, 60_000
 
-      # and the answer must land in the store as a ResponseDelta
+      # and the answer must land in the store as a ResponseDelta. The poll
+      # RE-CHECKS until found (a one-shot halt after a timeout-only receive
+      # false-negatives when the delta lands past the first ~2s window under
+      # full-suite load — the repo's no-sleep idiom: `{:cont, _}` after a
+      # timeout-only receive, bounded attempts).
       answered =
         Enum.reduce_while(1..120, false, fn _, _ ->
           if Enum.any?(Kyber.DurableStore.set(), fn {_id, {claims, _sig}} ->
@@ -97,10 +101,10 @@ defmodule Kyber.T15bEngineCastTest do
           else
             receive do
             after
-              2_000 -> :timeout
+              500 -> :timeout
             end
 
-            {:halt, false}
+            {:cont, false}
           end
         end)
 
