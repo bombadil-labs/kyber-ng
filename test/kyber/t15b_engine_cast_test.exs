@@ -14,6 +14,14 @@ defmodule Kyber.T15bEngineCastTest do
   """
   use ExUnit.Case, async: false
 
+  # The engine round-trip is load-sensitive: the test's own wait budget (60s
+  # assert_receive + up to 60s poll) exceeds ExUnit's 60s default per-test
+  # timeout, so under full-suite load a late-landing ResponseDelta would be
+  # killed as an ExUnit.TimeoutError instead of failing the assertion. Same
+  # pattern as the repo's other load-sensitive suites
+  # (reactor_operational_test, daemon_smoke_test, memory_assoc_operational_test).
+  @moduletag timeout: 300_000
+
   alias Kyber.{Daemon, Harness, Keys}
   alias Kyber.Agent.LlmHandler
 
@@ -84,12 +92,19 @@ defmodule Kyber.T15bEngineCastTest do
       # the engine must actually be invoked
       assert_receive {:t15b_body, _body}, 60_000
 
-      # and the answer must land in the store as a ResponseDelta
+      # and the answer must land in the store as a ResponseDelta. The poll
+      # RE-CHECKS until found (a one-shot halt after a timeout-only receive
+      # false-negatives when the delta lands past the first ~2s window under
+      # full-suite load — the repo's no-sleep idiom: `{:cont, _}` after a
+      # timeout-only receive, bounded attempts). It matches the resolved
+      # delta's content pointer against the stubbed reply so a stale or
+      # unrelated ResponseDelta in a leaked store can never satisfy it
+      # (fable-5 P5, PR #7: type-only match looseness).
       answered =
         Enum.reduce_while(1..120, false, fn _, _ ->
           if Enum.any?(Kyber.DurableStore.set(), fn {_id, {claims, _sig}} ->
                case Kyber.Schema.resolve(claims) do
-                 %{type: "ResponseDelta"} -> true
+                 %{type: "ResponseDelta", content: "wisp: hi back"} -> true
                  _other -> false
                end
              end) do
@@ -97,10 +112,10 @@ defmodule Kyber.T15bEngineCastTest do
           else
             receive do
             after
-              2_000 -> :timeout
+              500 -> :timeout
             end
 
-            {:halt, false}
+            {:cont, false}
           end
         end)
 
