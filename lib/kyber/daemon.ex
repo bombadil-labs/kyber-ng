@@ -1095,21 +1095,24 @@ defmodule Kyber.Daemon do
 
         operator_seed = Keyword.get(opts, :operator_seed)
         operator_authors = boot_operator_chain(opts)
+        overrides = Keyword.get(opts, :overrides, [])
+        # P5 HIGH-1: the fold admits agent-sourced deltas ONLY from the
+        # daemon's own boot author (state.author derives from the agent
+        # seed) — a leaked rotated-away seed is fold-inert under any grant
+        fold_view = agent_fold(agent, operator_authors, state.author)
 
         state
         |> Map.merge(%{
           agent: agent,
           operator_seed: operator_seed,
           operator_authors: operator_authors,
-          overrides: Keyword.get(opts, :overrides, []),
+          overrides: overrides,
           rollback_threshold: Keyword.get(opts, :rollback_threshold, 2),
-          # P5 HIGH-1: the fold admits agent-sourced deltas ONLY from the
-          # daemon's own boot author (state.author derives from the agent
-          # seed) — a leaked rotated-away seed is fold-inert under any grant
-          fold_view: agent_fold(agent, operator_authors, state.author),
+          fold_view: fold_view,
           live: %{
             model: Keyword.get(opts, :model),
-            base_url: Keyword.get(opts, :base_url)
+            base_url: Keyword.get(opts, :base_url),
+            api_key_env: live_key_env(overrides[:api_key] || (fold_view && fold_view.api_key))
           },
           boot_api_key: Keyword.get(opts, :api_key),
           armed: %{},
@@ -1318,7 +1321,11 @@ defmodule Kyber.Daemon do
 
       %{
         state
-        | live: %{model: handler.model, base_url: handler.base_url},
+        | live: %{
+            model: handler.model,
+            base_url: handler.base_url,
+            api_key_env: live_key_env(fold_opts[:api_key])
+          },
           redact: redact
       }
     else
@@ -1614,7 +1621,17 @@ defmodule Kyber.Daemon do
   defp fold_value(view, field), do: Map.get(view, field)
 
   defp fold_summary(nil), do: nil
-  defp fold_summary(view), do: Map.take(view, [:model, :base_url, :soul, :self_config])
+
+  defp fold_summary(view) do
+    view
+    |> Map.take([:model, :base_url, :soul, :self_config])
+    |> Map.put(:api_key_env, fold_value(view, :api_key_env))
+  end
+
+  # the env NAME the live credential resolves from (never the value); nil
+  # when the live key is encrypted or inherited from boot
+  defp live_key_env({:env, name}), do: name
+  defp live_key_env(_other), do: nil
 
   # ------------------------------------------------------------------ lock
 

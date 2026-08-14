@@ -1348,7 +1348,11 @@ defmodule Kyber.CLI do
   end
 
   # the CLI flags the operator EXPLICITLY passed — merged LAST over the fold
-  # (AC4: overrides win, never append deltas)
+  # (AC4: overrides win, never append deltas). This is the COMPLETE set of
+  # boot-time fold overrides: the daemon re-applies it after every re-fold,
+  # so a flag missing here is silently lost at the first hot-swap (AC23).
+  # `--api-key-env` rides as the TAGGED union arm the fold itself carries,
+  # so the swap resolves it through the same `agent_swap_key/2` path.
   defp daemon_override_opts(opts) do
     [
       model: opts.model,
@@ -1358,7 +1362,8 @@ defmodule Kyber.CLI do
       channel_socket: opts.channel_socket,
       loop: opts.loop,
       oracle_seed: opts.oracle_seed,
-      peer_port: opts.peer_port
+      peer_port: opts.peer_port,
+      api_key: opts.api_key_env && {:env, opts.api_key_env}
     ]
     |> Enum.reject(fn {_key, value} -> value == nil end)
   end

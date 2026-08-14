@@ -31,6 +31,8 @@ defmodule Kyber.Agent.T17DaemonIdentityTest do
   # chain nor this daemon's agent author (P5 round-11 MEDIUM-2)
   @intruder_seed String.duplicate("3e", 32)
   @key_value "sk-t17-super-secret-value-1234567890"
+  # the operator's boot-time `--api-key-env` choice, distinct from the fold's
+  @override_key_value "sk-t17-operator-override-value-9876543210"
   @base_ts 1_754_700_000_000.0
 
   # the mode-switched stub transport: reads {:mode, _} from a public ETS
@@ -262,6 +264,13 @@ defmodule Kyber.Agent.T17DaemonIdentityTest do
     end
   end
 
+  defp engine_api_key do
+    case :sys.get_state(Kyber.Agent.Reactor).engine do
+      pid when is_pid(pid) -> :sys.get_state(pid).llm.api_key
+      _none -> nil
+    end
+  end
+
   defp retract_targets do
     for {_id, {claims, _sig}} <- DurableStore.set(),
         %{type: "AgentRetract", negates: {:delta, target, _ctx}} <- [Schema.resolve(claims)],
@@ -447,6 +456,114 @@ defmodule Kyber.Agent.T17DaemonIdentityTest do
     ingest!(key_dir, 1)
     assert_receive {:t17_llm_body, body}, 60_000
     assert body["model"] == "kimi-k3"
+  end
+
+  # P5 round-13 MEDIUM-1: the pinned override set used to omit the api key,
+  # so a daemon booted with `--api-key-env FOO` silently fell back to the
+  # FOLD's key at the first hot-swap — AC23 violated for the one field where
+  # it matters most. These two prove the whole chain: the daemon re-applies a
+  # pinned key override (the wire), and the CLI puts it in the set at all.
+
+  test "a pinned api_key override survives the hot-swap — the override's key rides the wire (AC23, P5 r13 M1)",
+       %{key_dir: key_dir} do
+    table = :ets.new(:t17_stub, [:public])
+    :ets.insert(table, {:mode, :ok})
+
+    System.put_env("T17_DI_OVERRIDE", @override_key_value)
+    on_exit(fn -> System.delete_env("T17_DI_OVERRIDE") end)
+
+    # the fold names its OWN key; the operator booted pointing at another
+    append_set!(@operator_seed, @base_ts, %{model: "kimi-base", api_key_env: "T17_DI_KEY"})
+
+    {:ok, _pid} =
+      Daemon.boot(
+        keyring_dir: key_dir,
+        tick_ms: :manual,
+        loop: :reactor,
+        oracle_seed: :present,
+        engine: [llm: stub_llm(table, model: "kimi-base"), tools: []],
+        agent: "wisp",
+        operator_seed: @operator_seed,
+        model: "kimi-base",
+        api_key: @override_key_value,
+        overrides: [model: "kimi-base", api_key: {:env, "T17_DI_OVERRIDE"}]
+      )
+
+    # hot-swap an UNRELATED field: the re-fold must not reclaim the key
+    append_set!(@operator_seed, @base_ts + 10, %{soul: "I am wisp, re-souled."})
+
+    assert eventually(fn ->
+             get_in(Daemon.status(), [:config, :fold, :soul]) == "I am wisp, re-souled."
+           end)
+
+    status = Daemon.status()
+    assert get_in(status, [:config, :live, :api_key_env]) == "T17_DI_OVERRIDE"
+    # ...and the fold's own key is shown DISTINCTLY, never silently merged
+    assert get_in(status, [:config, :fold, :api_key_env]) == "T17_DI_KEY"
+
+    # the wire proof: the boot override, not the fold's key
+    ingest!(key_dir, 1)
+    assert_receive {:t17_llm_auth, auth}, 60_000
+    assert auth == "Bearer " <> @override_key_value
+    refute auth == "Bearer " <> @key_value
+  end
+
+  test "the CLI pins --api-key-env into the override set (AC23, P5 r13 M1)", %{
+    key_dir: key_dir,
+    log_path: log_path
+  } do
+    System.put_env("T17_DI_OVERRIDE", @override_key_value)
+    System.put_env("T17_DI_OP", @operator_seed)
+    on_exit(fn -> System.delete_env("T17_DI_OVERRIDE") end)
+
+    registry =
+      Path.join(System.tmp_dir!(), "kyber-t17di-reg-#{System.unique_integer([:positive])}")
+
+    File.mkdir_p!(Path.join(registry, "wisp"))
+    on_exit(fn -> File.rm_rf(registry) end)
+
+    File.write!(
+      Path.join([registry, "wisp", "agent.json"]),
+      JSON.encode!(%{
+        "log_path" => log_path,
+        "keyring_dir" => key_dir,
+        "operator_authors" => [Keys.author_for_seed(@operator_seed)]
+      })
+    )
+
+    append_set!(@operator_seed, @base_ts, %{
+      model: "kimi-base",
+      api_key_env: "T17_DI_KEY",
+      loop: "reactor"
+    })
+
+    assert {:ok, {:daemon, _message, _pid}} =
+             CLI.run([
+               "daemon",
+               "--agent",
+               "wisp",
+               "--registry",
+               registry,
+               "--operator-seed-env",
+               "T17_DI_OP",
+               "--api-key-env",
+               "T17_DI_OVERRIDE",
+               # the hot-swap rides the T16 feed, not the tick — keep the
+               # cron timer out of the shared suite VM
+               "--tick-ms",
+               "600000"
+             ])
+
+    append_set!(@operator_seed, @base_ts + 10, %{soul: "I am wisp, re-souled."})
+
+    assert eventually(fn ->
+             get_in(Daemon.status(), [:config, :fold, :soul]) == "I am wisp, re-souled."
+           end)
+
+    status = Daemon.status()
+    assert get_in(status, [:config, :live, :api_key_env]) == "T17_DI_OVERRIDE"
+    assert get_in(status, [:config, :fold, :api_key_env]) == "T17_DI_KEY"
+    assert engine_api_key() == @override_key_value
   end
 
   test "N consecutive config-class failures retract the agent's delta (AC12)", %{
