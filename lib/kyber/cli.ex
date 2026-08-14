@@ -635,14 +635,26 @@ defmodule Kyber.CLI do
         :ok
 
       opts.force ->
-        # P5 HIGH-2 defense in depth: the name shape is validated at parse,
-        # but a destructive delete re-proves the target is a DIRECT child
-        # of the registry root before it runs
-        if Path.dirname(Path.expand(paths.dir)) == Path.expand(registry) do
-          File.rm_rf!(paths.dir)
-          :ok
-        else
-          {:error, {:invalid_agent_name, opts.name}}
+        cond do
+          # P5 HIGH-2 defense in depth: the name shape is validated at parse,
+          # but a destructive delete re-proves the target is a DIRECT child
+          # of the registry root before it runs
+          Path.dirname(Path.expand(paths.dir)) != Path.expand(registry) ->
+            {:error, {:invalid_agent_name, opts.name}}
+
+          # P5 round-6 MEDIUM-1: `new --force` is a write — the most
+          # destructive one — so the single-writer rule applies exactly as
+          # on set/retract: a live daemon's store is never rm_rf'd out from
+          # under it (the daemon would keep appending to an unlinked file,
+          # orphaning every later delta, while a second store is born at the
+          # same path). The refusal fires BEFORE any filesystem mutation;
+          # only a dead/absent lock lets the rm_rf run.
+          agent_store_live?(paths.store) ->
+            {:error, {:agent_live_force, opts.name}}
+
+          true ->
+            File.rm_rf!(paths.dir)
+            :ok
         end
 
       true ->
@@ -1979,6 +1991,12 @@ defmodule Kyber.CLI do
       "agent #{name} is live (a daemon holds its store lock) — a direct append would " <>
         "diverge from the running fold; route the change through the daemon: " <>
         "kyber ctl set-config"
+
+  defp format_error({:agent_live_force, name}),
+    do:
+      "agent #{name} is live (a daemon holds its store lock) — refusing to destroy a " <>
+        "running agent's store; stop it first (kyber daemon stop / kill the pid) or " <>
+        "route changes through kyber ctl set-config"
 
   defp format_error({:unknown_delta, id}), do: "unknown delta: #{id}"
 

@@ -1001,6 +1001,45 @@ defmodule Kyber.Agent.T17DaemonIdentityTest do
     assert Daemon.status().rollbacks == 0
   end
 
+  test "the feed folds ONCE per delta and the daemon's fold never diverges from a direct resolve (P5 r6 LOW-2)",
+       %{key_dir: key_dir} do
+    table = :ets.new(:t17_stub, [:public])
+    :ets.insert(table, {:mode, :ok})
+
+    append_set!(@operator_seed, @base_ts, %{model: "kimi-base", api_key_env: "T17_DI_KEY"})
+    boot!(key_dir, stub_llm(table, model: "kimi-base"), model: "kimi-base")
+
+    base = Daemon.status().folds_since_boot
+
+    # N chained AgentSet deltas ride the feed
+    append_set!(@operator_seed, @base_ts + 10, %{model: "kimi-1"})
+    append_set!(@operator_seed, @base_ts + 20, %{soul: "chained soul"})
+    append_set!(@operator_seed, @base_ts + 30, %{model: "kimi-3"})
+
+    # FIFO: the third delta's swap landing proves all three were processed
+    assert eventually(fn -> live_model() == "kimi-3" end)
+
+    status = Daemon.status()
+
+    # ONE fold per delta: N deltas move the counter by exactly N — pre-fix
+    # the hot-swap re-folded after the arming fold (2N full-store walks in
+    # the daemon's serialized loop)
+    assert status.folds_since_boot == base + 3
+
+    # and no divergence: the daemon's fold agrees with a direct pinned
+    # resolve over the same store
+    {:ok, view} =
+      Kyber.Agent.Config.resolve(
+        DurableStore.set(),
+        "wisp",
+        [Keys.author_for_seed(@operator_seed)],
+        Keys.author_for_seed(@daemon_seed)
+      )
+
+    assert get_in(status, [:config, :fold, :model]) == view.model
+    assert get_in(status, [:config, :fold, :soul]) == view.soul
+  end
+
   test "GenServer state dumps redact the seeds and key material (P5 r3 MEDIUM-3)", %{
     key_dir: key_dir
   } do

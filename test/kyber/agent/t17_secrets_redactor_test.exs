@@ -248,5 +248,30 @@ defmodule Kyber.Agent.T17SecretsRedactorTest do
       assert {:error, {:invalid_field, :unset, _}} =
                Config.validate_fields(%{unset: ["nonsense"]})
     end
+
+    # P5 round-6 LOW-1: a malformed unset entry refuses LEGIBLY — the door
+    # serves the channel and the self-config tool, so a raise here is a
+    # remote denial vector, not a bug report
+    test "malformed unset entries are refused legibly, never a raise" do
+      assert {:error, {:invalid_field, :unset, message}} =
+               Config.validate_fields(%{unset: [123]})
+
+      assert message =~ "field names"
+
+      assert {:error, {:invalid_field, :unset, _}} =
+               Config.validate_fields(%{unset: "model"})
+
+      assert {:error, {:invalid_field, :unset, _}} =
+               Config.validate_fields(%{unset: ["model", 42]})
+
+      assert {:error, {:invalid_field, :unset, _}} =
+               Config.validate_fields(%{unset: [nil]})
+
+      assert {:error, {:invalid_field, :unset, _}} =
+               Config.validate_fields(%{unset: %{"model" => true}})
+
+      # the well-formed shape still passes
+      assert :ok = Config.validate_fields(%{unset: ["model"]})
+    end
   end
 end

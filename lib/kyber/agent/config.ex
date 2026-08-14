@@ -256,12 +256,31 @@ defmodule Kyber.Agent.Config do
   defp validate_field(:self_config, _),
     do: {:error, {:invalid_field, :self_config, "one of: true, false"}}
 
+  # P5 round-6 LOW-1: `unset` admits ONLY a list of known field-name
+  # strings — a malformed entry (non-list, or a non-string member) refuses
+  # legibly like every other door failure, never raises: the door serves
+  # the channel and the self-config tool, so a crash here is a denial
+  # vector, not a bug report
+  @unset_repair "a list of config field names, e.g. [\"model\"]"
+
   defp validate_field(:unset, names) when is_list(names) do
-    case Enum.reject(names, &safe_field/1) do
-      [] -> :ok
-      unknown -> {:error, {:invalid_field, :unset, "unknown fields: #{Enum.join(unknown, ", ")}"}}
+    cond do
+      not Enum.all?(names, &is_binary/1) ->
+        {:error, {:invalid_field, :unset, @unset_repair}}
+
+      true ->
+        case Enum.reject(names, &safe_field/1) do
+          [] ->
+            :ok
+
+          unknown ->
+            {:error, {:invalid_field, :unset, "unknown fields: #{Enum.join(unknown, ", ")}"}}
+        end
     end
   end
+
+  defp validate_field(:unset, _non_list),
+    do: {:error, {:invalid_field, :unset, @unset_repair}}
 
   defp validate_field(field, value) when field in @free_text_fields do
     cond do
@@ -417,6 +436,10 @@ defmodule Kyber.Agent.Config do
   end
 
   defp safe_field(name) when is_atom(name), do: if(name in @fields, do: name)
+
+  # a non-string/non-atom name is no field (P5 round-6 LOW-1): the walk and
+  # the dedup treat federated garbage as inert instead of raising
+  defp safe_field(_malformed), do: nil
 
   # ---------------------------------------------------------------- the view
 

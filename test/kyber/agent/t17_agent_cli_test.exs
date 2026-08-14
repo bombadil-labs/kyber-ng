@@ -295,6 +295,49 @@ defmodule Kyber.Agent.T17AgentCliTest do
       assert {:ok, _} = agent(["set", "wisp", "--model", "kimi-k3"], registry)
       assert fold!(registry).model == "kimi-k3"
     end
+
+    test "new --force refuses to destroy a LIVE agent's store (P5 r6 MEDIUM-1)", %{
+      registry: registry
+    } do
+      new!(registry)
+
+      # a live daemon holds the store lock — `new --force` must not rm_rf
+      # the store out from under it (the daemon would keep appending to an
+      # unlinked file; every later delta orphaned, plus a double-writer at
+      # the same path)
+      lock = store_path(registry) <> ".lock"
+      File.write!(lock, System.pid())
+
+      before = File.read!(store_path(registry))
+
+      assert {:error, message} =
+               agent(
+                 ["new", "wisp", "--soul", "usurper", "--force"] ++
+                   ["--operator-seed-env", "T17_OP_SEED"],
+                 registry
+               )
+
+      # legible routing: names the agent, says it is live, points at the
+      # stop-the-daemon / ctl paths — and NOTHING was deleted
+      assert message =~ "wisp"
+      assert message =~ "live"
+      assert message =~ "stop"
+      assert message =~ "ctl"
+      assert File.read!(store_path(registry)) == before
+      assert File.exists?(lock)
+
+      # a dead pid's lock is STALE: --force proceeds and recreates as before
+      File.write!(lock, "999999999")
+
+      assert {:ok, _} =
+               agent(
+                 ["new", "wisp", "--soul", "renewed", "--force"] ++
+                   ["--operator-seed-env", "T17_OP_SEED"],
+                 registry
+               )
+
+      assert fold!(registry).soul == "renewed"
+    end
   end
 
   describe "agent retract (AC13/AC15/AC16)" do
