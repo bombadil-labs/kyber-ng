@@ -21,7 +21,7 @@ defmodule Kyber.Agent.T17AgentBootTest do
   # (same pattern as t15b_engine_cast_test / t17_daemon_identity_test)
   @moduletag timeout: 300_000
 
-  alias Kyber.{CLI, Daemon, DurableStore, Harness, Schema, Wire}
+  alias Kyber.{CLI, Daemon, DurableStore, Events, Schema, Wire}
   alias Kyber.Agent.Events, as: AgentEvents
 
   @operator_seed String.duplicate("7f", 32)
@@ -165,18 +165,32 @@ defmodule Kyber.Agent.T17AgentBootTest do
     pid
   end
 
-  defp ingest!(keyring, n) do
-    {:ok, _id} =
-      Harness.ingest(
-        %{
-          "message_id" => "message:t17ab:#{n}",
-          "channel_id" => "channel:t17ab",
-          "session_id" => "session:t17ab",
-          "content" => "hello #{n}",
-          "ts" => 1_754_720_000_000 + n
-        },
-        keyring
+  # a human message on the live stream, signed with the ENV-held operator
+  # seed — post round-7 HIGH-1 the registry keyring holds NO human.seed, so
+  # the old Harness.ingest(keyring) route (which read it from disk) is gone
+  defp ingest!(n) do
+    {:ok, signed} =
+      Events.message_received(
+        @operator_seed,
+        1.0 * (1_754_720_000_000 + n),
+        "message:t17ab:#{n}",
+        "channel:t17ab",
+        "session:t17ab",
+        "hello #{n}"
       )
+
+    :ok = DurableStore.append(Wire.envelope(signed))
+  end
+
+  # AC21: no file under the registry is (or contains) the operator seed
+  defp assert_no_seed_on_disk!(registry) do
+    files = registry |> Path.join("**") |> Path.wildcard(match_dot: true)
+    assert Enum.filter(files, &(Path.basename(&1) == "human.seed")) == []
+
+    for file <- files, File.regular?(file) do
+      refute File.read!(file) =~ @operator_seed,
+             "operator seed VALUE serialized at #{file}"
+    end
   end
 
   # the no-sleep poll: bounded attempts, clause-free receive (consumes
@@ -252,14 +266,19 @@ defmodule Kyber.Agent.T17AgentBootTest do
        %{registry: registry} do
     port = provider!(self())
     new_agent!(registry, port, ["--oracle-seed", "present"])
-    {log_path, keyring} = pointer!(registry)
+
+    # P5 round-7 HIGH-1 (AC21): the seed lives ONLY in the environment —
+    # `agent new` serialized nothing under the registry
+    assert_no_seed_on_disk!(registry)
+
+    {log_path, _keyring} = pointer!(registry)
     restart_on!(log_path)
     boot_agent!(registry)
 
     # the fold reached the live engine: the model is the fold's, not a default
     assert get_in(Daemon.status(), [:config, :live, :model]) == "kimi-fold"
 
-    ingest!(keyring, 1)
+    ingest!(1)
 
     # the request arrived AT the configured provider (the stub IS the fold's
     # base_url) carrying the fold's model
@@ -290,11 +309,11 @@ defmodule Kyber.Agent.T17AgentBootTest do
     port = provider!(self())
     # genesis default: oracle_seed "absent"
     new_agent!(registry, port)
-    {log_path, keyring} = pointer!(registry)
+    {log_path, _keyring} = pointer!(registry)
     restart_on!(log_path)
     boot_agent!(registry)
 
-    ingest!(keyring, 1)
+    ingest!(1)
 
     # the prompt is refused at the gate — an attested GateDecision, and the
     # provider is NEVER contacted
@@ -320,7 +339,7 @@ defmodule Kyber.Agent.T17AgentBootTest do
     boot_agent!(registry)
 
     # the same prompt path now reaches the model
-    ingest!(keyring, 2)
+    ingest!(2)
     assert_receive {:t17_provider, _headers, body}, 60_000
     assert body["model"] == "kimi-fold"
   end
@@ -330,12 +349,12 @@ defmodule Kyber.Agent.T17AgentBootTest do
     port = provider!(self())
     # genesis default: oracle_seed "absent"
     new_agent!(registry, port)
-    {log_path, keyring} = pointer!(registry)
+    {log_path, _keyring} = pointer!(registry)
     restart_on!(log_path)
     boot_agent!(registry)
 
     # closed at boot: the prompt is refused, the provider never contacted
-    ingest!(keyring, 1)
+    ingest!(1)
 
     assert eventually(fn -> oracle_refusals() != [] end),
            "no oracle_gate refusal landed in the store"
@@ -351,7 +370,7 @@ defmodule Kyber.Agent.T17AgentBootTest do
     assert live_seed?(), "hot-swap appended no live seed claim"
 
     # the same message path now reaches the model — no re-boot anywhere
-    ingest!(keyring, 2)
+    ingest!(2)
     assert_receive {:t17_provider, _headers, body}, 60_000
     assert body["model"] == "kimi-fold"
 
@@ -361,7 +380,7 @@ defmodule Kyber.Agent.T17AgentBootTest do
     refute live_seed?(), "hot-swap did not retract the live seed claim"
 
     refusals_before = length(oracle_refusals())
-    ingest!(keyring, 3)
+    ingest!(3)
 
     assert eventually(fn -> length(oracle_refusals()) > refusals_before end),
            "the gate did not close after the absent hot-flip"
@@ -374,9 +393,33 @@ defmodule Kyber.Agent.T17AgentBootTest do
     Daemon.status()
     assert live_seed?(), "re-open after retraction appended no live seed claim"
 
-    ingest!(keyring, 4)
+    ingest!(4)
     assert_receive {:t17_provider, _headers, body}, 60_000
     assert body["model"] == "kimi-fold"
+  end
+
+  test "a stale pre-fix human.seed in the keyring is IGNORED: boot pins the env seed, the turn runs (P5 r7 HIGH-1 T4)",
+       %{registry: registry} do
+    port = provider!(self())
+    new_agent!(registry, port, ["--oracle-seed", "present"])
+    {log_path, keyring} = pointer!(registry)
+
+    # an agent created BEFORE the fix left the operator seed on disk; worse,
+    # plant a DIFFERENT seed value — if any path read the file instead of
+    # the environment, the operator pin (and the turn) would diverge
+    File.write!(Path.join(keyring, "human.seed"), String.duplicate("9b", 32))
+
+    restart_on!(log_path)
+    boot_agent!(registry)
+
+    assert get_in(Daemon.status(), [:config, :live, :model]) == "kimi-fold"
+
+    ingest!(1)
+    assert_receive {:t17_provider, _headers, body}, 60_000
+    assert body["model"] == "kimi-fold"
+
+    assert eventually(fn -> response_landed?("stub: turn ok") end),
+           "no ResponseDelta landed with a stale human.seed present"
   end
 
   test "oracle hot-flip is idempotent — a gate already matching the fold appends no delta",

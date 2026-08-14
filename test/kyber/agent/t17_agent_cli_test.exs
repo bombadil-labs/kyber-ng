@@ -82,6 +82,18 @@ defmodule Kyber.Agent.T17AgentCliTest do
 
   defp store_lines(registry), do: store_path(registry) |> Log.stream() |> Enum.to_list()
 
+  # P5 round-7 HIGH-1 (AC21): the operator seed VALUE never touches disk —
+  # no human.seed file anywhere under the registry, and no file's bytes
+  # contain any given seed
+  defp assert_no_seed_on_disk!(registry, seeds) do
+    files = registry |> Path.join("**") |> Path.wildcard(match_dot: true)
+    assert Enum.filter(files, &(Path.basename(&1) == "human.seed")) == []
+
+    for file <- files, File.regular?(file), seed <- seeds do
+      refute File.read!(file) =~ seed, "seed VALUE serialized at #{file}"
+    end
+  end
+
   describe "agent new (AC1/AC14)" do
     test "creates the store, the pointer, the keyring, and the genesis + seed deltas", %{
       registry: registry
@@ -104,6 +116,11 @@ defmodule Kyber.Agent.T17AgentCliTest do
 
       assert log_path == store_path(registry)
       assert File.dir?(keyring)
+
+      # P5 round-7 HIGH-1 (AC21): env-held, never serialized — the keyring
+      # dir exists (the daemon mints agent.seed there at first boot) but the
+      # operator seed VALUE is nowhere under the registry
+      assert_no_seed_on_disk!(registry, [@operator_seed])
 
       # AC14: no provider flags given — the genesis layer carries deepseek
       view = fold!(registry)
@@ -462,6 +479,10 @@ defmodule Kyber.Agent.T17AgentCliTest do
       assert {:enc, ciphertext} = fold!(registry).api_key
       assert Secrets.decrypt(ciphertext, @new_seed) == {:ok, secret}
       assert Secrets.decrypt(ciphertext, @operator_seed) == {:error, :decrypt_failed}
+
+      # P5 round-7 HIGH-1 (AC21): rekey serializes NEITHER seed — the new
+      # decrypt key lives only in the environment, never beside the store
+      assert_no_seed_on_disk!(registry, [@operator_seed, @new_seed])
     end
 
     test "rekey moves SIGNING authority in the same operation: B signs, A fails loudly (P5 M2)",

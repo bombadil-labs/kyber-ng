@@ -679,11 +679,16 @@ defmodule Kyber.CLI do
     end
   end
 
+  # P5 round-7 HIGH-1 (AC21): the operator seed VALUE never touches disk —
+  # only its derived AUTHOR lands in the pointer. The keyring dir is created
+  # empty; the daemon mints `agent.seed` (the agent's OWN identity) there at
+  # first boot. Writing the seed beside the store would make the registry
+  # dir alone both the ciphertext and its decrypt key, voiding AC20.
   defp agent_create(paths, seed, name, fields) do
     ts = agent_now_ms()
 
     with :ok <- agent_mkdir(paths.dir),
-         :ok <- Keys.import_human_seed(seed, paths.keyring),
+         :ok <- agent_mkdir(paths.keyring),
          :ok <- agent_write_pointer(paths, [Keys.author_for_seed(seed)]),
          {:ok, genesis} <- AgentEvents.agent_set(seed, ts, name, @agent_genesis),
          {:ok, seed_delta} <- AgentEvents.agent_set(seed, ts + 1, name, fields),
@@ -900,11 +905,14 @@ defmodule Kyber.CLI do
   # {enc} secret re-encrypted) in the same append, and the config survives
   # the authority cut.
   #
-  # P5 LOW-2 — ordering: store append FIRST, keyring import, pointer write
-  # LAST. A crash between the append and the pointer write leaves the OLD
-  # chain live: every verb still resolves (the snapshot folds chain-inert;
-  # the old operator's fold is intact), and the rekey completes on re-run
-  # with `--operator-seed-env <OLD> --new-seed-env <NEW>`. Never a wedge.
+  # P5 LOW-2 — ordering: store append FIRST, pointer write LAST. A crash
+  # between the append and the pointer write leaves the OLD chain live:
+  # every verb still resolves (the snapshot folds chain-inert; the old
+  # operator's fold is intact), and the rekey completes on re-run with
+  # `--operator-seed-env <OLD> --new-seed-env <NEW>`. Never a wedge.
+  #
+  # P5 round-7 HIGH-1 (AC21): the NEW seed is never imported to the keyring
+  # — like at create, only its author reaches disk (the pointer chain).
   defp agent_rekey(opts) do
     with {:ok, paths, _set, view} <- agent_open(opts),
          :ok <- agent_live_view(view, opts.name),
@@ -919,7 +927,6 @@ defmodule Kyber.CLI do
            }),
          {:ok, reassert} <- AgentEvents.agent_set(new_seed, ts + 1, opts.name, snapshot),
          :ok <- agent_append(paths.store, [handoff, reassert]),
-         :ok <- Keys.import_human_seed(new_seed, paths.keyring),
          :ok <- agent_write_pointer(paths, [Keys.author_for_seed(new_seed)]) do
       {:ok,
        "rekeyed #{opts.name}: operator authority REPLACED by #{opts.new_seed_env}'s author — " <>

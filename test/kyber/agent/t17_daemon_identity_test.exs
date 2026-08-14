@@ -846,6 +846,104 @@ defmodule Kyber.Agent.T17DaemonIdentityTest do
     assert Daemon.status().rollbacks == 2
   end
 
+  test "interleaved benign deltas never defer the rollback — only a CONFIG change opens a new window (P5 r7 MEDIUM-1)",
+       %{key_dir: key_dir} do
+    table = :ets.new(:t17_stub, [:public])
+    :ets.insert(table, {:mode, :ok})
+
+    append_set!(@operator_seed, @base_ts, %{
+      model: "kimi-base",
+      api_key_env: "T17_DI_KEY",
+      self_config: "true"
+    })
+
+    boot!(key_dir, stub_llm(table, model: "kimi-base"),
+      model: "kimi-base",
+      test_pid: self(),
+      rollback_threshold: 2
+    )
+
+    broken = append_set!(@daemon_seed, @base_ts + 10, %{model: "kimi-broken"})
+    assert eventually(fn -> live_model() == "kimi-broken" end)
+
+    # failure #1 lands (counter 1)...
+    :ets.insert(table, {:mode, {:fail, 401}})
+    ingest!(key_dir, 1)
+    assert_receive {:engine, {:llm_error, {:llm_http, 401, _body}}}, 60_000
+    assert eventually(fn -> Daemon.status().failures == 1 end)
+
+    # ...then the agent interleaves a BENIGN soul delta. Pre-fix ANY
+    # fold-live delta reset the counter to 0 — an agent alternating
+    # soul-tweak / failing-inference kept the broken model live forever.
+    # The soul field is not LLM config: the measurement window continues.
+    benign = append_set!(@daemon_seed, @base_ts + 20, %{soul: "still me, softly"})
+
+    assert eventually(fn ->
+             get_in(Daemon.status(), [:config, :fold, :soul]) == "still me, softly"
+           end)
+
+    assert Daemon.status().failures == 1,
+           "the benign soul delta reset the failure counter (P5 r7 MEDIUM-1 regression)"
+
+    # failure #2 reaches the threshold: the broken model rolls back
+    ingest!(key_dir, 2)
+    assert_receive {:engine, {:llm_error, {:llm_http, 401, _body}}}, 60_000
+
+    assert eventually(fn -> broken in retract_targets() end),
+           "the interleaved benign delta deferred the rollback forever " <>
+             "(status: #{inspect(Daemon.status())})"
+
+    refute benign in retract_targets()
+    assert get_in(Daemon.status(), [:config, :fold, :soul]) == "still me, softly"
+    assert eventually(fn -> live_model() == "kimi-base" end)
+    assert Daemon.status().rollbacks == 1
+  end
+
+  test "a genuinely NEW operator config value resets the window — and stays detection-only (P5 r7 MEDIUM-1)",
+       %{key_dir: key_dir} do
+    table = :ets.new(:t17_stub, [:public])
+    :ets.insert(table, {:mode, :ok})
+
+    append_set!(@operator_seed, @base_ts, %{
+      model: "kimi-base",
+      api_key_env: "T17_DI_KEY",
+      self_config: "true"
+    })
+
+    boot!(key_dir, stub_llm(table, model: "kimi-base"),
+      model: "kimi-base",
+      test_pid: self(),
+      rollback_threshold: 2
+    )
+
+    broken = append_set!(@daemon_seed, @base_ts + 10, %{model: "kimi-broken"})
+    assert eventually(fn -> live_model() == "kimi-broken" end)
+
+    :ets.insert(table, {:mode, {:fail, 401}})
+    ingest!(key_dir, 1)
+    assert_receive {:engine, {:llm_error, {:llm_http, 401, _body}}}, 60_000
+    assert eventually(fn -> Daemon.status().failures == 1 end)
+
+    # the OPERATOR sets a genuinely new model value: a real config change
+    # opens a NEW measurement window — the counter resets...
+    operator_delta = append_set!(@operator_seed, @base_ts + 20, %{model: "kimi-operator-pick"})
+    assert eventually(fn -> live_model() == "kimi-operator-pick" end)
+    assert Daemon.status().failures == 0
+
+    # ...and failures under the operator's head are detection-only: no
+    # auto-retract, ever (the armed model slot is operator-sourced now)
+    ingest!(key_dir, 2)
+    assert_receive {:engine, {:llm_error, {:llm_http, 401, _body}}}, 60_000
+    ingest!(key_dir, 3)
+    assert_receive {:engine, {:llm_error, {:llm_http, 401, _body}}}, 60_000
+
+    status = Daemon.status()
+    assert status.rollbacks == 0
+    refute operator_delta in retract_targets()
+    refute broken in retract_targets()
+    assert live_model() == "kimi-operator-pick"
+  end
+
   test "a chained broken config is walked PAST the first rollback — the prior broken delta is blamed too (P5 r5 MEDIUM-1)",
        %{key_dir: key_dir} do
     table = :ets.new(:t17_stub, [:public])

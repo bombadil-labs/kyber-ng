@@ -1181,6 +1181,10 @@ defmodule Kyber.Daemon do
   # a value a rollback already blamed (`broken`) PRESERVES the counter —
   # the retry of the same broken delta hits the threshold immediately
   # instead of restarting from zero.
+  # the LLM-config field set an inference/swap failure can implicate — a
+  # config-class failure never blames soul/loop/profile/etc.
+  @llm_config_fields [:model, :base_url, :api_key_env, :api_key_enc, :system_prompt]
+
   defp agent_config_changed(state, id, claims, resolved) do
     # P5 round-6 LOW-2: ONE fold per delta — the arming check and the
     # hot-swap share this view instead of each re-walking the store
@@ -1199,7 +1203,19 @@ defmodule Kyber.Daemon do
       armed =
         Enum.reduce(live_fields, state.armed, &Map.put(&2, &1, %{id: id, source: source}))
 
-      failures = if retry_of_broken?(state, resolved, live_fields), do: state.failures, else: 0
+      # P5 round-7 MEDIUM-1: the counter measures the CURRENT llm-config
+      # window. It resets only when that config actually changed — a delta
+      # whose live fields are all NON-config (soul, loop, profile, ...)
+      # leaves the window open, so interleaved benign deltas can never defer
+      # the rollback threshold. A re-assert of an already-blamed value
+      # (retry_of_broken?) also preserves the counter: the retry floor.
+      failures =
+        cond do
+          not Enum.any?(live_fields, &(&1 in @llm_config_fields)) -> state.failures
+          retry_of_broken?(state, resolved, live_fields) -> state.failures
+          true -> 0
+        end
+
       agent_hot_swap(%{state | armed: armed, failures: failures}, view)
     end
   end
@@ -1387,10 +1403,6 @@ defmodule Kyber.Daemon do
         %{state | failures: state.failures + 1}
     end
   end
-
-  # the LLM-config field set an inference/swap failure can implicate — a
-  # config-class failure never blames soul/loop/profile/etc.
-  @llm_config_fields [:model, :base_url, :api_key_env, :api_key_enc, :system_prompt]
 
   defp failure_fields({:agent_key_missing, _agent, _env}), do: [:api_key_env]
   defp failure_fields({:decrypt_failed, _agent}), do: [:api_key_enc]
