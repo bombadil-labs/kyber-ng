@@ -1259,11 +1259,18 @@ defmodule Kyber.Daemon do
 
   defp agent_engine_event(_event, state), do: state
 
-  # the EXPLICIT classifier (premortem fold): 400/401/404, refused/unknown
-  # host binds, missing key env, decrypt failures are CONFIG-CLASS;
+  # the EXPLICIT classifier (premortem fold): the request-shaped 4xx family
+  # is CONFIG-CLASS — 400 (malformed request), 401 (bad key), 402 (payment
+  # required: provider account state, not a brownout), 403 (this key is not
+  # authorized for this model/endpoint — exactly what an agent repointing
+  # api_key_env at an unauthorized key produces; P5 r5 LOW-1), 404 (bad
+  # base_url/model path), 422 (request semantics rejected) — plus
+  # refused/unknown host binds, missing key env, decrypt failures.
   # 429/5xx/timeouts and everything unrecognized are TRANSIENT (conservative
   # default — a brownout destroys no good deltas).
-  defp config_class?({:llm_http, status, _body}) when status in [400, 401, 404], do: true
+  defp config_class?({:llm_http, status, _body}) when status in [400, 401, 402, 403, 404, 422],
+    do: true
+
   defp config_class?({:llm_transport, reason}) when reason in [:econnrefused, :nxdomain], do: true
   defp config_class?({:agent_key_missing, _agent, _env}), do: true
   defp config_class?({:decrypt_failed, _agent}), do: true
@@ -1397,10 +1404,35 @@ defmodule Kyber.Daemon do
         Map.put(acc, field, fold_value(state.fold_view, field))
       end)
 
+    # P5 round-5 MEDIUM-1: the step-back must not strand a broken CHAIN —
+    # when the post-retraction fold's head for a blamed field is ALSO an
+    # agent-sourced delta, it is the next offender candidate: re-arm on it
+    # with the counter preserved (only a clean inference proves the
+    # surviving config good). Pre-fix the armed slot vanished with the
+    # retracted offender and a still-broken prior delta stayed live
+    # forever — every later failure blamed :none, loud but unrepaired.
+    # The refreshed fold_view keeps the blame live-head check honest even
+    # before the feed re-delivers the retraction.
+    view = agent_fold(state.agent, state.operator_authors, state.author)
+    set = DurableStore.set()
+
+    armed =
+      Enum.reduce(blamed_fields, Map.drop(state.armed, blamed_fields), fn field, acc ->
+        with %{heads: heads} <- view,
+             head when is_binary(head) <- heads[field],
+             {%{author: author}, _sig} <- set[head],
+             true <- author == state.author do
+          Map.put(acc, field, %{id: head, source: :agent})
+        else
+          _operator_head_or_absent -> acc
+        end
+      end)
+
     %{
       state
-      | armed: Map.drop(state.armed, blamed_fields),
+      | armed: armed,
         broken: broken,
+        fold_view: view,
         rollbacks: state.rollbacks + 1
     }
   end

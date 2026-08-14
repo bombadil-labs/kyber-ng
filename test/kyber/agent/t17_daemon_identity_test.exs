@@ -846,6 +846,109 @@ defmodule Kyber.Agent.T17DaemonIdentityTest do
     assert Daemon.status().rollbacks == 2
   end
 
+  test "a chained broken config is walked PAST the first rollback — the prior broken delta is blamed too (P5 r5 MEDIUM-1)",
+       %{key_dir: key_dir} do
+    table = :ets.new(:t17_stub, [:public])
+    :ets.insert(table, {:mode, :ok})
+
+    append_set!(@operator_seed, @base_ts, %{
+      model: "kimi-base",
+      api_key_env: "T17_DI_KEY",
+      self_config: "true"
+    })
+
+    boot!(key_dir, stub_llm(table, model: "kimi-base"),
+      model: "kimi-base",
+      test_pid: self(),
+      rollback_threshold: 2
+    )
+
+    # the agent chains TWO broken deltas on the same field
+    broken_a = append_set!(@daemon_seed, @base_ts + 10, %{model: "kimi-broken-a"})
+    assert eventually(fn -> live_model() == "kimi-broken-a" end)
+    broken_b = append_set!(@daemon_seed, @base_ts + 20, %{model: "kimi-broken-b"})
+    assert eventually(fn -> live_model() == "kimi-broken-b" end)
+
+    :ets.insert(table, {:mode, {:fail, 401}})
+    ingest!(key_dir, 1)
+    assert_receive {:engine, {:llm_error, {:llm_http, 401, _body}}}, 60_000
+    ingest!(key_dir, 2)
+    assert_receive {:engine, {:llm_error, {:llm_http, 401, _body}}}, 60_000
+
+    # rollback #1 retracts B and the fold steps back to A — still broken
+    assert eventually(fn -> broken_b in retract_targets() end),
+           "the newest broken delta was never retracted"
+
+    assert eventually(fn -> live_model() == "kimi-broken-a" end)
+
+    # ONE more failure suffices: the rollback re-armed on A (the surviving
+    # agent-sourced head) and PRESERVED the counter — pre-fix armed.model
+    # was simply dropped, so every later failure blamed :none and the
+    # still-broken A stayed live forever
+    ingest!(key_dir, 3)
+    assert_receive {:engine, {:llm_error, {:llm_http, 401, _body}}}, 60_000
+
+    assert eventually(fn -> broken_a in retract_targets() end),
+           "the rollback stranded the prior broken delta — A was never re-armed " <>
+             "(status: #{inspect(Daemon.status())})"
+
+    # the chain is fully walked: the fold returns to the pre-A good model
+    assert eventually(fn -> live_model() == "kimi-base" end)
+    assert Daemon.status().rollbacks == 2
+  end
+
+  test "403 and 422 are CONFIG-CLASS: an unauthorized key or rejected request retracts (P5 r5 LOW-1)",
+       %{key_dir: key_dir} do
+    table = :ets.new(:t17_stub, [:public])
+    :ets.insert(table, {:mode, :ok})
+
+    append_set!(@operator_seed, @base_ts, %{
+      model: "kimi-base",
+      api_key_env: "T17_DI_KEY",
+      self_config: "true"
+    })
+
+    boot!(key_dir, stub_llm(table, model: "kimi-base"),
+      model: "kimi-base",
+      test_pid: self(),
+      rollback_threshold: 2
+    )
+
+    # 403: "this key is not authorized for this model" — pre-fix it fell to
+    # the transient default and the broken agent delta survived forever
+    broken_403 = append_set!(@daemon_seed, @base_ts + 10, %{model: "kimi-unauthorized"})
+    assert eventually(fn -> live_model() == "kimi-unauthorized" end)
+
+    :ets.insert(table, {:mode, {:fail, 403}})
+    ingest!(key_dir, 1)
+    assert_receive {:engine, {:llm_error, {:llm_http, 403, _body}}}, 60_000
+    ingest!(key_dir, 2)
+    assert_receive {:engine, {:llm_error, {:llm_http, 403, _body}}}, 60_000
+
+    assert eventually(fn -> broken_403 in retract_targets() end),
+           "403 never counted as config-class — the unauthorized-key config survived"
+
+    assert eventually(fn -> live_model() == "kimi-base" end)
+    assert Daemon.status().rollbacks == 1
+
+    # 422: request semantics rejected — likewise config-class (a genuinely
+    # NEW broken value resets the counter, so two failures are needed again)
+    broken_422 = append_set!(@daemon_seed, @base_ts + 20, %{model: "kimi-invalid"})
+    assert eventually(fn -> live_model() == "kimi-invalid" end)
+
+    :ets.insert(table, {:mode, {:fail, 422}})
+    ingest!(key_dir, 3)
+    assert_receive {:engine, {:llm_error, {:llm_http, 422, _body}}}, 60_000
+    ingest!(key_dir, 4)
+    assert_receive {:engine, {:llm_error, {:llm_http, 422, _body}}}, 60_000
+
+    assert eventually(fn -> broken_422 in retract_targets() end),
+           "422 never counted as config-class"
+
+    assert eventually(fn -> live_model() == "kimi-base" end)
+    assert Daemon.status().rollbacks == 2
+  end
+
   test "boot without the operator seed is LOUD: harness :dead, failures narrated, no crash (P5 r4 M2)",
        %{key_dir: key_dir} do
     table = :ets.new(:t17_stub, [:public])
