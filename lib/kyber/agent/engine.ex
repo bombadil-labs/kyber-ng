@@ -86,6 +86,21 @@ defmodule Kyber.Agent.Engine do
   @spec resume(GenServer.server()) :: %{resumed: non_neg_integer(), waiting: non_neg_integer()}
   def resume(engine \\ __MODULE__), do: GenServer.call(engine, :resume, :infinity)
 
+  @doc """
+  T17 (AC10): hot-swap the live LLM configuration — `changes` merges into
+  the handler STRUCT (`struct/2`), so the HTTP transport seam and every
+  unnamed field survive untouched (a test stub stays a stub; the real
+  adapter stays real). The next inference cycle runs the new config; no
+  restart, no re-queue. Delivered as a cast (P5 HIGH-1): the engine may be
+  blocked in a long HTTP inference, and a synchronous call from the swap
+  path would time out and cascade; the mailbox applies the swap as soon as
+  the in-flight request returns.
+  """
+  @spec swap_llm_config(GenServer.server(), map()) :: :ok
+  def swap_llm_config(engine \\ __MODULE__, changes) when is_map(changes) do
+    GenServer.cast(engine, {:swap_llm_config, changes})
+  end
+
   # -------------------------------------------------------------- callbacks
 
   @impl true
@@ -115,6 +130,25 @@ defmodule Kyber.Agent.Engine do
   @impl true
   def handle_cast({:delta, delta}, state) do
     {:noreply, dispatch(delta, state)}
+  end
+
+  def handle_cast({:swap_llm_config, changes}, state) do
+    {:noreply, %{state | llm: struct(state.llm, changes)}}
+  end
+
+  # P5 round-3 M3: a crash report dumps the state — the handler struct's
+  # seed/api_key must never print in plaintext (the D8 log-leak class on
+  # the crash path)
+  @impl true
+  def format_status(status) do
+    Map.new(status, fn
+      {:state, %{llm: %LlmHandler{} = llm} = state} ->
+        {:state,
+         %{state | llm: %{llm | seed: "<redacted>", api_key: "<redacted>", redact: "<redacted>"}}}
+
+      other ->
+        other
+    end)
   end
 
   @impl true
@@ -217,7 +251,8 @@ defmodule Kyber.Agent.Engine do
               memory_ids(typed),
               state.window,
               Prompt.prompt_text(set, prompt_id(typed)),
-              state.boot
+              state.boot,
+              state.llm.system_prompt
             )
 
           canonical = Prompt.canonical(messages)
@@ -660,7 +695,8 @@ defmodule Kyber.Agent.Engine do
               memory_ids,
               state.window,
               Prompt.prompt_text(set, prompt_id),
-              state.boot
+              state.boot,
+              state.llm.system_prompt
             )
         },
         tool_id: tool_id,

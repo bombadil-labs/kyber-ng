@@ -41,8 +41,30 @@ defmodule Kyber.Agent.ToolExecutor do
   """
 
   alias Kyber.{Gather, Schema, Wire}
-  alias Kyber.Agent.{Action, Events, Memory, Policy, Profile, Skill, Tools}
+  alias Kyber.Agent.{Action, Config, Events, Memory, Policy, Profile, Skill, Tools}
   alias Kyber.Agent.Action.Gate
+
+  # the fold-level twin lives in Config.apply_fields (@operator_only) — a
+  # hand-appended agent delta naming these fields is fold-inert even when
+  # this boundary is bypassed. The key source is here too (P5 round-8
+  # HIGH-1): an agent-named api_key_env would exfiltrate any daemon-readable
+  # env var to the provider via the Authorization header. So are the three
+  # P5 round-10 fields: channel_socket (the daemon File.rm's the path
+  # before bind — a file-deletion primitive), oracle_seed (the operator's
+  # inference gate) and profile (the capability envelope). `loop` joined in
+  # round 11: it selects the EXECUTION ENGINE, so an agent setting it to
+  # `ack` disables its own reactor — and the rollback harness with it,
+  # since the harness only ever sees engine events.
+  @operator_attested [
+    :base_url,
+    :operator_seed_env,
+    :api_key_env,
+    :api_key_enc,
+    :channel_socket,
+    :oracle_seed,
+    :profile,
+    :loop
+  ]
 
   @doc "The stub registry: `tool:echo` answers its args."
   @spec stub_tools() :: %{String.t() => (String.t() -> String.t())}
@@ -145,7 +167,10 @@ defmodule Kyber.Agent.ToolExecutor do
         parameters: %{
           "type" => "object",
           "properties" => %{
-            "name" => %{"type" => "string", "description" => "The skill name (the aggregate key)."},
+            "name" => %{
+              "type" => "string",
+              "description" => "The skill name (the aggregate key)."
+            },
             "description" => %{"type" => "string", "description" => "What the skill is for."},
             "body" => %{"type" => "string", "description" => "The procedure."},
             "metadata" => %{
@@ -174,6 +199,40 @@ defmodule Kyber.Agent.ToolExecutor do
             "name" => %{"type" => "string", "description" => "The skill name to read."}
           },
           "required" => ["name"]
+        }
+      }
+    }
+  end
+
+  @doc """
+  The self-config tool listing (T17 AC5/AC9): `self_config.set` for
+  `tool_specs`/`tool_key_map` ONLY — the write itself lives in the
+  dedicated `write_and_run` clause, where the grant (`self_config: true`
+  on the live fold), the `@operator_attested` refusal (set AND unset), and
+  the AC17 door all run BEFORE any mint. The agent name rides in the handler
+  `:context` (`%{agent: name}`), not in the listing.
+  """
+  @spec self_config_tools(String.t()) :: %{String.t() => map()}
+  def self_config_tools(agent) when is_binary(agent) do
+    %{
+      "self_config.set" => %{
+        description:
+          "Update your own agent configuration (#{agent}). fields is an object over " <>
+            "#{Enum.join(Enum.map(Config.fields(), &Atom.to_string/1), ", ")} plus an " <>
+            "optional \"unset\" list of field names. These are operator-only: " <>
+            "#{Enum.map_join(@operator_attested, ", ", &Atom.to_string/1)}. " <>
+            "Secret fields take env NAMES, never key values.",
+        parameters: %{
+          "type" => "object",
+          "properties" => %{
+            "fields" => %{
+              "type" => "object",
+              "description" =>
+                "The field changes: string values per field name, plus optional " <>
+                  "\"unset\": [field names]."
+            }
+          },
+          "required" => ["fields"]
         }
       }
     }
@@ -544,9 +603,125 @@ defmodule Kyber.Agent.ToolExecutor do
     end
   end
 
+  # T17 AC5/AC9 — the agent's own (opt-in) write path onto its AgentSet
+  # stream. The boundary contract, in order: the @operator_attested fields
+  # are refused ALWAYS (set AND unset, checked before the grant so the
+  # refusal names the operator regardless); the grant (`self_config: true` on the
+  # LIVE fold) is checked at call time, not boot time; the AC17 door
+  # (Config.validate_fields — secret shapes, unknown fields) runs before
+  # any mint. A refusal mints NO delta. The mint claims the CALL's
+  # timestamp (M6 crash-window dedupe) and the AGENT's seed — the delta
+  # folds only while the grant is live (prospective, negatable).
+  defp write_and_run(set, seed, ts, _call_id, "self_config.set", args, _tools, context) do
+    with {:agent, agent} when is_binary(agent) <- {:agent, context[:agent]},
+         {:ok, fields} <- decode_self_config_args(args),
+         :ok <- refuse_operator_attested(fields),
+         :ok <-
+           self_config_granted(set, agent, context[:operator_authors], context[:agent_author]),
+         :ok <- door(fields) do
+      case Events.agent_set(seed, ts, agent, fields) do
+        {:ok, signed} -> {[Wire.envelope(signed)], "updated config for " <> agent, "ok"}
+        {:error, reason} -> {[], "self_config refused: " <> inspect(reason), "error"}
+      end
+    else
+      {:agent, _missing} -> {[], "self_config.set requires an agent context", "error"}
+      {:error, reason} -> {[], reason, "error"}
+    end
+  end
+
   defp write_and_run(set, _seed, _ts, _call_id, tool_id, args, tools, context) do
     {result, status} = run(tools, tool_id, args, context, set)
     {[], result, status}
+  end
+
+  defp decode_self_config_args(args) do
+    with {:ok, %{"fields" => raw}} when is_map(raw) <- JSON.decode(args),
+         {:ok, fields} <- atomize_self_config_fields(raw) do
+      {:ok, fields}
+    else
+      {:error, reason} when is_binary(reason) -> {:error, reason}
+      _other -> {:error, "malformed action arguments: " <> args}
+    end
+  end
+
+  defp atomize_self_config_fields(raw) do
+    Enum.reduce_while(raw, {:ok, %{}}, fn
+      {"unset", names}, {:ok, acc} when is_list(names) ->
+        case normalize_unset(names) do
+          {:ok, names} -> {:cont, {:ok, Map.put(acc, :unset, names)}}
+          {:error, reason} -> {:halt, {:error, reason}}
+        end
+
+      {"unset", _malformed}, {:ok, _acc} ->
+        {:halt, {:error, "unset must be a list of field names"}}
+
+      {name, value}, {:ok, acc} ->
+        case Enum.find(Config.fields(), &(Atom.to_string(&1) == name)) do
+          nil -> {:halt, {:error, "unknown field: " <> name}}
+          field -> {:cont, {:ok, Map.put(acc, field, value)}}
+        end
+    end)
+  end
+
+  # P5 round-11 HIGH-1: the tool path is TOTAL — a model-controlled call is
+  # never a raise. `unset` members arrive from the model's JSON, so a map or
+  # a list member would blow `to_string/1` up (Protocol.UndefinedError) in
+  # the operator-attested check below and take the reactor — and with it the
+  # daemon — down on a two-token call. Names are field names: binaries (or
+  # atoms, for the in-process callers); anything else is refused legibly
+  # here, before any check that assumes a name.
+  defp normalize_unset(names) do
+    names
+    |> Enum.reduce_while({:ok, []}, fn
+      name, {:ok, acc} when is_binary(name) ->
+        {:cont, {:ok, [name | acc]}}
+
+      name, {:ok, acc} when is_atom(name) ->
+        {:cont, {:ok, [Atom.to_string(name) | acc]}}
+
+      malformed, {:ok, _acc} ->
+        {:halt, {:error, "unset members must be field names — got #{inspect(malformed)}"}}
+    end)
+    |> case do
+      # the emission order is part of the delta's content address — restore it
+      {:ok, reversed} -> {:ok, Enum.reverse(reversed)}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp refuse_operator_attested(fields) do
+    unset = Map.get(fields, :unset, [])
+
+    case Enum.find(@operator_attested, fn field ->
+           Map.has_key?(fields, field) or Atom.to_string(field) in unset
+         end) do
+      nil ->
+        :ok
+
+      field ->
+        {:error, "#{field} is operator-attested — only the operator can set or unset it"}
+    end
+  end
+
+  # P5 MEDIUM-2: the grant is read through the PINNED operator chain when
+  # the boot threads one (context[:operator_authors]) — unpinned resolve/2
+  # is display-only, and a backdated first-author delta could grant itself
+  # under it. The agent-author pin rides along (P5 HIGH-1) so the grant
+  # read matches the daemon's own fold. nil pins => legacy fallback
+  # (chainless handler tests).
+  defp self_config_granted(set, agent, operators, agent_author) do
+    case Config.resolve(set, agent, operators, agent_author) do
+      {:ok, %{self_config: true}} -> :ok
+      _other -> {:error, "no live self_config grant for " <> agent}
+    end
+  end
+
+  defp door(fields) do
+    case Config.validate_fields(fields) do
+      :ok -> :ok
+      {:error, {_kind, field, message}} -> {:error, "#{field}: #{message}"}
+      {:error, reason} -> {:error, inspect(reason)}
+    end
   end
 
   # N1 (T14f): the trim-reject lives at the TOOL BOUNDARY — skill.set
@@ -639,7 +814,9 @@ defmodule Kyber.Agent.ToolExecutor do
       {listing, "ok"} when is_binary(listing) ->
         case String.split(listing, "\n") do
           entries when length(entries) > @fs_list_cap ->
-            {Enum.take(entries, @fs_list_cap) |> Enum.join("\n") |> Kernel.<>("\n" <> @fs_list_marker), "ok"}
+            {Enum.take(entries, @fs_list_cap)
+             |> Enum.join("\n")
+             |> Kernel.<>("\n" <> @fs_list_marker), "ok"}
 
           _within_cap ->
             {listing, "ok"}

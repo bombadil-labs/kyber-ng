@@ -31,7 +31,17 @@ defmodule Kyber.Agent.Reactor do
   use GenServer
 
   alias Kyber.{DurableStore, Keys, Wire}
-  alias Kyber.Agent.{ContextBuilder, Engine, Events, LlmHandler, MemoryPort, Profile, ToolExecutor}
+
+  alias Kyber.Agent.{
+    ContextBuilder,
+    Engine,
+    Events,
+    LlmHandler,
+    MemoryPort,
+    Profile,
+    ToolExecutor
+  }
+
   alias Kyber.Agent.Action.Gate
   alias Rhizomatic.Delta
 
@@ -138,6 +148,19 @@ defmodule Kyber.Agent.Reactor do
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
 
+  @doc """
+  T17 (AC10): forward a hot-swap of the live LLM config to the hosted
+  engine. Asynchronous end-to-end (P5 HIGH-1): a synchronous call here can
+  time out against a reactor blocked in a long LLM inference and take the
+  linked daemon down with it. The cast is applied by the engine after any
+  in-flight request returns; the next inference rederives the config.
+  Under `engine: :none` the swap is a no-op — a config delta can never
+  conjure an HTTP client where boot refused one.
+  """
+  @spec swap_llm_config(map()) :: :ok
+  def swap_llm_config(changes) when is_map(changes),
+    do: GenServer.cast(__MODULE__, {:swap_llm_config, changes})
+
   # -------------------------------------------------------------- callbacks
 
   @impl true
@@ -181,6 +204,19 @@ defmodule Kyber.Agent.Reactor do
     end
   end
 
+  # P5 round-3 M3: a crash report dumps the state — the signing seed must
+  # never print in plaintext (the D8 log-leak class on the crash path)
+  @impl true
+  def format_status(status) do
+    Map.new(status, fn
+      {:state, %{seed: seed} = state} when not is_nil(seed) ->
+        {:state, %{state | seed: "<redacted>"}}
+
+      other ->
+        other
+    end)
+  end
+
   @impl true
   def handle_cast({:ingest, delta}, state) do
     # pin 8: routing owns once-per-delta-id — a push duplicate (the flush's
@@ -195,14 +231,27 @@ defmodule Kyber.Agent.Reactor do
     end
   end
 
+  def handle_cast({:swap_llm_config, changes}, state) do
+    case state.engine do
+      nil -> :ok
+      engine -> Engine.swap_llm_config(engine, changes)
+    end
+
+    {:noreply, state}
+  end
+
   @impl true
   def handle_call(:sync, _from, state), do: {:reply, :ok, state}
 
   # engine completion signals (notify: defaults to the reactor, pin 6) are
-  # forwarded to the observer when one is watching (the AC4 sleep-free wait),
-  # dropped otherwise — never fatal
+  # forwarded to the daemon's T17 safety harness (a SEND, never a call —
+  # pin 26(c) forbids only synchronous reactor->daemon traffic) and to the
+  # observer when one is watching (the AC4 sleep-free wait). The daemon
+  # send happens FIRST so a status call issued after the observer's copy is
+  # serialized behind the harness's processing. Never fatal.
   @impl true
   def handle_info({:engine, _event} = message, state) do
+    with pid when is_pid(pid) <- Process.whereis(Kyber.Daemon), do: send(pid, message)
     if state.test_pid, do: send(state.test_pid, message)
     {:noreply, state}
   end
@@ -420,12 +469,13 @@ defmodule Kyber.Agent.Reactor do
 
   # pin 16: the gate — open iff an UNRETRACTED seed claim exists (the seed
   # is asserted by the daemon's oracle_seed boot opt, pin 17); M2:
-  # retraction-detection scans for a negates pointer targeting the seed id
+  # retraction-detection scans for a negates pointer targeting the seed id.
+  # ANY-unretracted, not find-first: a D6 hot-flip cycle (close, re-open)
+  # leaves a retracted seed alongside a fresh live one in the store.
   defp gate_open? do
-    case Enum.find(DurableStore.set(), fn {_id, {claims, _sig}} -> kind(claims) == "seed" end) do
-      nil -> false
-      {seed_id, _seed_claims} -> not retracted?(seed_id)
-    end
+    Enum.any?(DurableStore.set(), fn {id, {claims, _sig}} ->
+      kind(claims) == "seed" and not retracted?(id)
+    end)
   end
 
   defp retracted?(seed_id) do
@@ -483,14 +533,16 @@ defmodule Kyber.Agent.Reactor do
   # called). Absent opts => k3 defaults inside LlmHandler.new.
   def llm_for(seed, opts) do
     case Keyword.get(opts, :llm) do
-      %LlmHandler{} = llm -> {:ok, llm}
+      %LlmHandler{} = llm ->
+        {:ok, llm}
+
       nil ->
         # Only forward optional keys that are actually present. Absent keys
         # are dropped so LlmHandler.new's @base_url/@model/@system_prompt
         # fallbacks apply; passing `base_url: nil` would override them.
         llm_opts =
           opts
-          |> Keyword.take([:api_key, :base_url, :model, :system_prompt])
+          |> Keyword.take([:api_key, :base_url, :model, :system_prompt, :redact])
           |> Enum.reject(fn {_k, v} -> is_nil(v) end)
 
         LlmHandler.new([seed: seed] ++ llm_opts)

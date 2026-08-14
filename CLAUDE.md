@@ -29,7 +29,10 @@ this file are both binding.
 
 ## Testing norms (binding)
 
-- TDD: write the failing ExUnit test first, verify it fails for the right reason, then implement.
+- Tests are written ALONGSIDE the implementation, one AC at a time — not as a
+  strict red/green loop. The goal is a well-tested codebase (every AC has a
+  test), not the ceremony. Write the test and the code together; run the
+  suite when a chunk of work is done.
 - **No `Process.sleep` in tests, ever.** Use `assert_receive/3`, `catch_exit`, or explicit state
   polling.
 - Test the claims emitted and the state changed — verify effects, not just state.

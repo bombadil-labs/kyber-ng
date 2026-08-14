@@ -9,8 +9,9 @@ here. Both claude-code and prime-agent read both files by default.*
 - Your reading list is capped at ONE file: the ticket/spec that defines this build. The
   substrate (SPEC.md, spec/) is for LOOKUP when you need a fact — never pre-read "to understand
   the system" before writing. Unbounded reading burns the budget with zero artifacts.
-- Your FIRST tool action must be writing a FAILING test for AC1. Then red→green per AC, one AC
-  at a time.
+- Your FIRST tool action is writing the AC1 test AND its implementation
+  together, then one AC at a time — tests alongside code, not a red/green
+  loop.
 - Never more than 2 consecutive read-only turns. Every 3rd turn MUST modify a file or run the
   tests.
 - The completion gate encodes DELIVERABLE EXISTENCE (`test -f` per named deliverable + the
@@ -49,7 +50,8 @@ here. Both claude-code and prime-agent read both files by default.*
   polling.
 - Rails frozen: `deps/`, `spec/`, `SPEC.md`, `mix.exs`, `config/`. Never touch the real
   `~/.kyber` — tmp store/keyring everywhere.
-- TDD: failing test first, verify it fails for the RIGHT reason, then implement.
+- Tests are written ALONGSIDE the implementation (every AC has a test), not
+  as a strict red/green loop — well-tested codebase over ceremony.
 
 ## Reporting
 

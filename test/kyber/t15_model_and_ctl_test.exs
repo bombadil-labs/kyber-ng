@@ -31,11 +31,15 @@ defmodule Kyber.T15ModelAndCtlTest do
       assert h.system_prompt == "You are Wisp, a twitchy scout."
     end
 
-    test "new/1 defaults to k3 when no override supplied (backward-compatible)" do
+    test "new/1 defaults to deepseek when no override supplied (T17 engine default)" do
       {:ok, h} = LlmHandler.new(seed: @seed, api_key: @api_key)
-      assert h.base_url == "https://api.moonshot.ai/v1"
-      assert h.model == "kimi-k3"
-      assert h.system_prompt =~ "claims substrate"
+      assert h.base_url == "https://api.deepseek.com/v1"
+      assert h.model == "deepseek-v4-flash"
+      # T17 (P5 r9 H1): an unconfigured persona is nil in the struct — nil
+      # means UNCONFIGURED, so the assembly path can fall back to its own
+      # default; the gather path resolves the pinned default here
+      assert h.system_prompt == nil
+      assert LlmHandler.system_prompt(h) =~ "claims substrate"
     end
 
     test "the handler's system_prompt reaches the model via gather/2 (AC1)" do

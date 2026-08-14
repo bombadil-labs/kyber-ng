@@ -87,6 +87,13 @@ defmodule Kyber.Agent.Prompt do
   `set`, so AC1 byte-identity and the replay pre-check are unaffected (the
   stored claim still wins on replay even if the epoch changed after
   emission).
+
+  T17 (P5 r9 H1): the 7th argument is the LIVE HANDLER's `:system_prompt` —
+  the value `Reactor.llm_for/2` resolved from the boot opts / agent fold,
+  and the value a hot-swap replaces. It is the effective system content;
+  `nil` (no configured persona) falls back to `system_prompt/0`. Pre-fix
+  this slot was the module literal, so a fold-supplied persona reached the
+  handler but never the wire.
   """
   @spec assemble(
           Kyber.DeltaSet.t(),
@@ -94,9 +101,18 @@ defmodule Kyber.Agent.Prompt do
           [String.t()],
           non_neg_integer(),
           String.t() | nil,
-          {String.t() | nil, String.t() | nil}
+          {String.t() | nil, String.t() | nil},
+          String.t() | nil
         ) :: [map()]
-  def assemble(set, session_id, memory_ids, window \\ 8, prompt_text \\ nil, boot \\ {nil, nil}) do
+  def assemble(
+        set,
+        session_id,
+        memory_ids,
+        window \\ 8,
+        prompt_text \\ nil,
+        boot \\ {nil, nil},
+        handler_prompt \\ nil
+      ) do
     {profile_name, operator_author} = boot
     # the profile view is resolved ONCE per assemble (folds are recomputed
     # per read, never latched) and threads into the identity block, the
@@ -159,7 +175,7 @@ defmodule Kyber.Agent.Prompt do
     # the pinned order (T14g G3 + T14h H3 — the T14f M3 parent pin,
     # byte-for-byte): system -> IDENTITY -> always-on -> memory_notes ->
     # summary_notes -> skill_notes -> elision -> turns
-    [%{"role" => "system", "content" => @system_prompt}] ++
+    [%{"role" => "system", "content" => handler_prompt || system_prompt()}] ++
       identity_notes ++
       always_on_notes ++
       memory_notes ++
