@@ -251,7 +251,8 @@ defmodule Kyber.Agent.Engine do
               memory_ids(typed),
               state.window,
               Prompt.prompt_text(set, prompt_id(typed)),
-              state.boot
+              state.boot,
+              state.llm.system_prompt
             )
 
           canonical = Prompt.canonical(messages)
@@ -694,7 +695,8 @@ defmodule Kyber.Agent.Engine do
               memory_ids,
               state.window,
               Prompt.prompt_text(set, prompt_id),
-              state.boot
+              state.boot,
+              state.llm.system_prompt
             )
         },
         tool_id: tool_id,

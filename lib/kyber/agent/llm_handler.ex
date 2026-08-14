@@ -41,7 +41,10 @@ defmodule Kyber.Agent.LlmHandler do
     :http,
     base_url: @base_url,
     model: @model,
-    system_prompt: @system_prompt,
+    # nil means UNCONFIGURED, never "the default": the two paths resolve
+    # their own default (gather: `system_prompt/1` below; assembly:
+    # `Prompt.system_prompt/0`), while a configured value overrides both
+    system_prompt: nil,
     redact: []
   ]
 
@@ -52,7 +55,7 @@ defmodule Kyber.Agent.LlmHandler do
           http: {module(), term()},
           base_url: String.t(),
           model: String.t(),
-          system_prompt: String.t(),
+          system_prompt: String.t() | nil,
           redact: [String.t()]
         }
 
@@ -84,11 +87,22 @@ defmodule Kyber.Agent.LlmHandler do
            http: Keyword.get(opts, :http, {Kyber.Agent.HttpClient.Httpc, nil}),
            base_url: Keyword.get(opts, :base_url, @base_url),
            model: Keyword.get(opts, :model, @model),
-           system_prompt: Keyword.get(opts, :system_prompt, @system_prompt),
+           system_prompt: Keyword.get(opts, :system_prompt),
            redact: Keyword.get(opts, :redact, [])
          }}
     end
   end
+
+  @doc """
+  The handler's EFFECTIVE system prompt for the gather path: the configured
+  persona when one was supplied (boot opt or agent fold), otherwise the
+  pinned gather default. The assembly path (`Prompt.assemble/7`) reads the
+  raw `:system_prompt` field instead — a `nil` there falls back to
+  `Prompt.system_prompt/0`, which carries its own (different) default.
+  """
+  @spec system_prompt(t()) :: String.t()
+  def system_prompt(%__MODULE__{system_prompt: nil}), do: @system_prompt
+  def system_prompt(%__MODULE__{system_prompt: configured}), do: configured
 
   @doc """
   The gather contract: verified conversation deltas in (log order), signed
@@ -131,7 +145,7 @@ defmodule Kyber.Agent.LlmHandler do
         {:error, :no_prompt}
 
       {messages, %{id: prompt_id}} ->
-        {:ok, [%{"role" => "system", "content" => handler.system_prompt} | messages], prompt_id}
+        {:ok, [%{"role" => "system", "content" => system_prompt(handler)} | messages], prompt_id}
     end
   end
 

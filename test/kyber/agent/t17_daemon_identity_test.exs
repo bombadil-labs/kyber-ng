@@ -216,6 +216,14 @@ defmodule Kyber.Agent.T17DaemonIdentityTest do
 
   defp live_model, do: get_in(Daemon.status(), [:config, :live, :model])
 
+  # the live handler's persona, read off the reactor's hosted engine
+  defp engine_system_prompt do
+    case :sys.get_state(Kyber.Agent.Reactor).engine do
+      pid when is_pid(pid) -> :sys.get_state(pid).llm.system_prompt
+      _none -> nil
+    end
+  end
+
   defp retract_targets do
     for {_id, {claims, _sig}} <- DurableStore.set(),
         %{type: "AgentRetract", negates: {:delta, target, _ctx}} <- [Schema.resolve(claims)],
@@ -252,6 +260,80 @@ defmodule Kyber.Agent.T17DaemonIdentityTest do
     ingest!(key_dir, 1)
     assert_receive {:t17_llm_body, body}, 60_000
     assert body["model"] == "kimi-hot"
+  end
+
+  # ---------------------------------------------------- the persona on the WIRE
+  #
+  # P5 r9 HIGH-1: the pre-fix suite asserted the fold's system_prompt reached
+  # the HANDLER (llm_for's opts) and stopped there — the request assembler
+  # hardcoded the module literal, so AC2's boot threading and AC10's hot-swap
+  # were silent no-ops at the provider. These three assert the WIRE.
+
+  test "the boot handler's system_prompt is the system role ON THE WIRE (AC2, P5 r9 H1)", %{
+    key_dir: key_dir
+  } do
+    table = :ets.new(:t17_stub, [:public])
+    :ets.insert(table, {:mode, :ok})
+
+    append_set!(@operator_seed, @base_ts, %{model: "kimi-base", api_key_env: "T17_DI_KEY"})
+
+    # exactly the handler llm_for/2 builds from a fold carrying system_prompt
+    boot!(key_dir, stub_llm(table, model: "kimi-base", system_prompt: "FOLD PROMPT v1"),
+      model: "kimi-base"
+    )
+
+    ingest!(key_dir, 1)
+    assert_receive {:t17_llm_body, body}, 60_000
+
+    assert hd(body["messages"]) == %{"role" => "system", "content" => "FOLD PROMPT v1"}
+    refute Enum.any?(body["messages"], &(&1["content"] == Kyber.Agent.Prompt.system_prompt()))
+  end
+
+  test "a hot-swapped system_prompt reaches the NEXT request's system role (AC10, P5 r9 H1)", %{
+    key_dir: key_dir
+  } do
+    table = :ets.new(:t17_stub, [:public])
+    :ets.insert(table, {:mode, :ok})
+
+    append_set!(@operator_seed, @base_ts, %{model: "kimi-base", api_key_env: "T17_DI_KEY"})
+
+    boot!(key_dir, stub_llm(table, model: "kimi-base", system_prompt: "FOLD PROMPT v1"),
+      model: "kimi-base"
+    )
+
+    ingest!(key_dir, 1)
+    assert_receive {:t17_llm_body, first}, 60_000
+    assert hd(first["messages"])["content"] == "FOLD PROMPT v1"
+
+    # the operator re-voices the agent mid-session
+    append_set!(@operator_seed, @base_ts + 10, %{system_prompt: "FOLD PROMPT v2"})
+
+    assert eventually(fn -> engine_system_prompt() == "FOLD PROMPT v2" end),
+           "the handler never took the swapped persona"
+
+    ingest!(key_dir, 2)
+    assert_receive {:t17_llm_body, second}, 60_000
+
+    assert hd(second["messages"]) == %{"role" => "system", "content" => "FOLD PROMPT v2"}
+    refute Enum.any?(second["messages"], &(&1["content"] == "FOLD PROMPT v1"))
+  end
+
+  test "no configured persona: the wire carries the assembly default (P5 r9 H1 fallback)", %{
+    key_dir: key_dir
+  } do
+    table = :ets.new(:t17_stub, [:public])
+    :ets.insert(table, {:mode, :ok})
+
+    append_set!(@operator_seed, @base_ts, %{model: "kimi-base", api_key_env: "T17_DI_KEY"})
+    boot!(key_dir, stub_llm(table, model: "kimi-base"), model: "kimi-base")
+
+    ingest!(key_dir, 1)
+    assert_receive {:t17_llm_body, body}, 60_000
+
+    assert hd(body["messages"]) == %{
+             "role" => "system",
+             "content" => Kyber.Agent.Prompt.system_prompt()
+           }
   end
 
   test "a hot-swap landing mid-LLM-call never kills the daemon (P5 HIGH-1)", %{
@@ -369,6 +451,66 @@ defmodule Kyber.Agent.T17DaemonIdentityTest do
     # the fold steps back and the LIVE engine follows
     assert eventually(fn -> live_model() == "kimi-base" end)
     assert Daemon.status().rollbacks == 1
+  end
+
+  test "a rollback whose retraction the store REFUSES is never narrated as a success (P5 r9 M1)",
+       %{key_dir: key_dir, log_dir: log_dir} do
+    table = :ets.new(:t17_stub, [:public])
+    :ets.insert(table, {:mode, :ok})
+
+    append_set!(@operator_seed, @base_ts, %{
+      model: "kimi-base",
+      api_key_env: "T17_DI_KEY",
+      self_config: "true"
+    })
+
+    boot!(key_dir, stub_llm(table, model: "kimi-base"),
+      model: "kimi-base",
+      test_pid: self(),
+      rollback_threshold: 1
+    )
+
+    agent_delta = append_set!(@daemon_seed, @base_ts + 10, %{model: "kimi-broken"})
+    assert eventually(fn -> live_model() == "kimi-broken" end)
+
+    # break the store's write path: close the device behind its back AND
+    # remove the directory, so the lazy reopen fails too — every append the
+    # harness attempts now answers {:error, :persist_failed}
+    :ok = File.close(:sys.get_state(DurableStore).io)
+    File.rm_rf!(log_dir)
+
+    daemon = Process.whereis(Kyber.Daemon)
+
+    failed_log =
+      capture_log(fn ->
+        # the reactor's own forwarding shape — the harness sees a
+        # config-class failure and reaches its terminal action
+        send(daemon, {:engine, {:llm_error, {:llm_http, 401, "stub refusal"}}})
+        # the status CALL serializes behind the info message above
+        assert Daemon.status().rollbacks == 0
+      end)
+
+    # LOUD, and honest about what did not happen
+    assert failed_log =~ "rollback FAILED"
+    assert failed_log =~ "STILL LIVE"
+
+    # nothing was retracted and the broken config is untouched
+    assert retract_targets() == []
+    assert rollback_claims() == []
+    assert get_in(Daemon.status(), [:config, :fold, :model]) == "kimi-broken"
+    assert live_model() == "kimi-broken"
+    assert Process.alive?(daemon)
+
+    # the armed slot and the counter survived: with the store writable
+    # again the NEXT config-class failure retries the step-back and lands
+    File.mkdir_p!(log_dir)
+    send(daemon, {:engine, {:llm_error, {:llm_http, 401, "stub refusal"}}})
+    assert Daemon.status().rollbacks == 1
+
+    assert agent_delta in retract_targets()
+    assert [rollback] = rollback_claims()
+    assert Enum.any?(rollback.offends, &match?({:delta, ^agent_delta, _ctx}, &1))
+    assert eventually(fn -> live_model() == "kimi-base" end)
   end
 
   test "transient failures (429) never retract — a brownout destroys no deltas (AC12)", %{

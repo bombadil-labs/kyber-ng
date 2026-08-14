@@ -1435,17 +1435,48 @@ defmodule Kyber.Daemon do
   # auto-retracted; a benign agent delta on an unimplicated field
   # survives), then the ConfigRollback notification. The feed then
   # re-delivers the retractions and the hot-swap restores the live engine.
+  # P5 round-9 MEDIUM-1: the appends are CHECKED. A retraction the store
+  # refused means the step-back never happened — the harness's terminal
+  # action must never narrate a success it did not perform.
   defp agent_rollback(state, offenders, reason) do
     offends = offenders |> Enum.map(fn {_field, id} -> id end) |> Enum.uniq()
     blamed_fields = Enum.map(offenders, fn {field, _id} -> field end)
     ts = now_ts()
 
-    Enum.each(offends, fn target_id ->
+    case append_retractions(state, offends, ts) do
+      {:ok, _landed} ->
+        commit_rollback(state, offends, blamed_fields, reason, ts)
+
+      {:error, why, landed} ->
+        # the broken config is STILL LIVE: leave `armed` and `failures`
+        # exactly as they were (the next config-class failure retries the
+        # step-back) and never count a rollback that did not land
+        message =
+          "config rollback FAILED #{state.agent}: retraction not stored " <>
+            "(#{inspect(why)}) — #{landed}/#{length(offends)} retraction(s) landed, " <>
+            "the broken config is STILL LIVE (run `kyber agent retract` to step back)"
+
+        Logger.warning("kyber: " <> message)
+        narrate(state, message)
+        state
+    end
+  end
+
+  # every retraction must land; the FIRST refusal halts the sequence and
+  # carries how many landed before it (a partial step-back is reported, not
+  # dressed up as a success)
+  defp append_retractions(state, offends, ts) do
+    Enum.reduce_while(offends, {:ok, 0}, fn target_id, {:ok, landed} ->
       {:ok, signed} = AgentEvents.agent_retract(state.operator_seed, ts, state.agent, target_id)
 
-      DurableStore.append(Wire.envelope(signed))
+      case DurableStore.append(Wire.envelope(signed)) do
+        :ok -> {:cont, {:ok, landed + 1}}
+        {:error, why} -> {:halt, {:error, why, landed}}
+      end
     end)
+  end
 
+  defp commit_rollback(state, offends, blamed_fields, reason, ts) do
     restored = Enum.map(blamed_fields, &Atom.to_string/1)
 
     {:ok, rollback} =
@@ -1458,13 +1489,25 @@ defmodule Kyber.Daemon do
         restored
       )
 
-    DurableStore.append(Wire.envelope(rollback))
-
-    narrate(
-      state,
+    stepped_back =
       "config rollback #{state.agent}: retracted #{length(offends)} delta(s), " <>
         "restored #{Enum.join(restored, ", ")}"
-    )
+
+    # the retractions ARE stored — the step-back happened. A refused
+    # NOTIFICATION does not undo it, so it is reported separately (loudly)
+    # rather than turning the whole rollback into a failure.
+    case DurableStore.append(Wire.envelope(rollback)) do
+      :ok ->
+        narrate(state, stepped_back)
+
+      {:error, why} ->
+        message =
+          stepped_back <>
+            " — but the ConfigRollback notification was NOT stored (#{inspect(why)})"
+
+        Logger.warning("kyber: " <> message)
+        narrate(state, message)
+    end
 
     # P5 round-4 HIGH-1: remember the VALUE each blamed field failed with —
     # a later re-arm re-asserting it preserves the counter (retry floor) —

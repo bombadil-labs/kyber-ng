@@ -133,12 +133,14 @@ defmodule Kyber.T15bEngineCastTest do
 
       refute is_nil(handler.base_url)
       refute is_nil(handler.model)
-      refute is_nil(handler.system_prompt)
       # the defaults must be the kyber substrate persona, not nil/empty
       # (T17 engine default: deepseek — the terminal step-back state)
       assert handler.base_url == "https://api.deepseek.com/v1"
       assert handler.model == "deepseek-v4-flash"
-      assert handler.system_prompt =~ "claims substrate"
+      # T17 (P5 r9 H1): the field is nil = UNCONFIGURED; the RESOLVED
+      # persona (what the gather path sends) is still the substrate default
+      assert handler.system_prompt == nil
+      assert Kyber.Agent.LlmHandler.system_prompt(handler) =~ "claims substrate"
     end
 
     test "explicit model/base_url override the defaults (no regression)" do

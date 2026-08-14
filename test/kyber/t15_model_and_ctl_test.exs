@@ -35,7 +35,11 @@ defmodule Kyber.T15ModelAndCtlTest do
       {:ok, h} = LlmHandler.new(seed: @seed, api_key: @api_key)
       assert h.base_url == "https://api.deepseek.com/v1"
       assert h.model == "deepseek-v4-flash"
-      assert h.system_prompt =~ "claims substrate"
+      # T17 (P5 r9 H1): an unconfigured persona is nil in the struct — nil
+      # means UNCONFIGURED, so the assembly path can fall back to its own
+      # default; the gather path resolves the pinned default here
+      assert h.system_prompt == nil
+      assert LlmHandler.system_prompt(h) =~ "claims substrate"
     end
 
     test "the handler's system_prompt reaches the model via gather/2 (AC1)" do

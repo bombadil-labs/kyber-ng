@@ -233,6 +233,53 @@ defmodule Kyber.Agent.T17ConfigFoldTest do
       assert {:ok, %{model: "deepseek-v4-flash"}} = Config.resolve(set_of(pairs), "wisp")
     end
 
+    # ------------------------------------------------------------------------
+    # RECORDED HOLE (P5 round-9 MEDIUM-2) — a backdated agent delta folds into
+    # a REVOKED grant's historical window. The review asked for the window to
+    # be closed by STORE APPEND ORDER; that is unimplementable here and
+    # contradicts a hard limit: `Kyber.DeltaSet` is a content-keyed map merged
+    # by union, and spec/00-overview.md §82 pins "merge is union — commutative,
+    # associative, idempotent. Ingestion order never changes state." The fold
+    # is a pure function of the SET; arrival order is neither carried by it nor
+    # agreed on between peers.
+    #
+    # The impossibility is exact: `admitted` (authored inside the live window)
+    # and `backdated` (authored after the revocation, timestamped into the
+    # window) differ ONLY in a value the agent itself signs. Swap their
+    # timestamps and the two stores are the same set — so no pure fold can
+    # admit one and refuse the other. The reachable rulings are both SYMMETRIC:
+    #   (a) status quo — a revocation closes the window prospectively only
+    #       (this test), the operator's remedy is `kyber agent retract` on the
+    #       grant, which de-activates EVERYTHING it admitted (test below);
+    #   (b) revocation as a hard floor — a revoked grant de-activates its whole
+    #       window, losing the legitimate history too.
+    # Hermes owns the ruling; this test pins today's answer so the choice can
+    # never change silently.
+    test "RECORDED HOLE: a backdated agent delta still folds inside a revoked window" do
+      genesis = agent_set("wisp", @genesis_fields, ts: @ts)
+      grant = agent_set("wisp", %{self_config: "true"}, ts: @ts + 1)
+      admitted = agent_set("wisp", %{soul: "chosen"}, seed: @agent_seed, ts: @ts + 2)
+      revoke = agent_set("wisp", %{self_config: "false"}, ts: @ts + 4)
+      # appended LAST, timestamped into the closed window
+      backdated = agent_set("wisp", %{model: "backdated"}, seed: @agent_seed, ts: @ts + 3)
+
+      set = set_of([genesis, grant, admitted, revoke, backdated])
+
+      assert {:ok, view} =
+               Config.resolve(
+                 set,
+                 "wisp",
+                 [Keys.author_for_seed(@operator_seed)],
+                 Keys.author_for_seed(@agent_seed)
+               )
+
+      assert view.self_config == false
+      # the legitimate in-window delta folds (the grant worked)...
+      assert view.soul == "chosen"
+      # ...and so does the backdated one: THE HOLE
+      assert view.model == "backdated"
+    end
+
     test "retracting the grant delta de-activates the agent deltas it admitted" do
       genesis = agent_set("wisp", @genesis_fields, ts: @ts)
       {grant_id, _} = grant = agent_set("wisp", %{self_config: "true"}, ts: @ts + 1)
