@@ -354,6 +354,52 @@ defmodule Kyber.Agent.T17AgentCliTest do
                )
 
       assert fold!(registry).soul == "renewed"
+      # the rebuild ran under the held lock and released it (P5 r8 LOW-1)
+      refute File.exists?(lock)
+    end
+
+    test "the guard is ATOMIC (P5 r8 LOW-1): the append is gated on CREATING the lock", %{
+      registry: registry
+    } do
+      new!(registry)
+      dir = Path.join(registry, "wisp")
+
+      # No lock exists, so the old advisory READ waved the write through —
+      # the TOCTOU. Post-fix the O_EXCL create IS the liveness check: a dir
+      # where the lock cannot be created (stand-in for losing the create
+      # race) refuses the write outright, even though the store FILE itself
+      # stays appendable.
+      before = store_lines(registry)
+      File.chmod!(dir, 0o555)
+
+      try do
+        assert {:error, message} = agent(["set", "wisp", "--model", "kimi-k3"], registry)
+        assert message =~ "lock"
+      after
+        File.chmod!(dir, 0o755)
+      end
+
+      # refused CLEANLY: no partial append, store byte-unchanged
+      assert store_lines(registry) == before
+    end
+
+    test "a successful write holds then releases the lock — no stale lock left behind (P5 r8 LOW-1)",
+         %{registry: registry} do
+      new!(registry)
+      lock = store_path(registry) <> ".lock"
+      refute File.exists?(lock)
+
+      before = length(store_lines(registry))
+      assert {:ok, _} = agent(["set", "wisp", "--model", "kimi-k3"], registry)
+      assert length(store_lines(registry)) == before + 1
+
+      # created-then-removed: a left-behind lock would refuse every later
+      # writer (CLI and daemon boot both contend for this file)
+      refute File.exists?(lock)
+
+      # an ERROR inside the locked section releases too (the after path)
+      assert {:error, _} = agent(["retract", "wisp", String.duplicate("00", 32)], registry)
+      refute File.exists?(lock)
     end
   end
 

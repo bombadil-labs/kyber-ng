@@ -619,20 +619,37 @@ defmodule Kyber.CLI do
     registry = agent_registry(opts)
     paths = agent_paths(registry, opts.name)
 
-    with :ok <- agent_refuse_existing(registry, paths, opts),
-         {:ok, seed, seed_var} <- agent_signing_seed(opts, nil),
-         {:ok, fields} <- agent_stdin_key(opts, opts.fields, seed),
-         fields = Map.put_new(fields, :operator_seed_env, seed_var),
-         :ok <- Config.validate_fields(fields),
-         :ok <- agent_validate_genesis(opts.name, fields) do
-      agent_create(paths, seed, opts.name, fields)
+    case agent_new_admission(registry, paths, opts) do
+      {:ok, release} ->
+        try do
+          with {:ok, seed, seed_var} <- agent_signing_seed(opts, nil),
+               {:ok, fields} <- agent_stdin_key(opts, opts.fields, seed),
+               fields = Map.put_new(fields, :operator_seed_env, seed_var),
+               :ok <- Config.validate_fields(fields),
+               :ok <- agent_validate_genesis(opts.name, fields) do
+            agent_create(paths, seed, opts.name, fields)
+          end
+        after
+          release.()
+        end
+
+      {:error, _refused} = error ->
+        error
     end
   end
 
-  defp agent_refuse_existing(registry, paths, opts) do
+  # P5 round-6 MEDIUM-1 + round-8 LOW-1: `new --force` is a write — the
+  # most destructive one — so the single-writer rule applies exactly as on
+  # set/retract, and ATOMICALLY: the CLI takes the daemon's lock with
+  # O_EXCL (the create IS the liveness check — no window between decision
+  # and destruction), clears the dir around the HELD lock, and releases
+  # only after the fresh store is appended. A live daemon's store is never
+  # destroyed out from under it, and a daemon can never seize the store
+  # mid-rebuild. A fresh dir needs no lock: no store exists to hold.
+  defp agent_new_admission(registry, paths, opts) do
     cond do
       not File.exists?(paths.dir) ->
-        :ok
+        {:ok, fn -> :ok end}
 
       opts.force ->
         cond do
@@ -642,24 +659,37 @@ defmodule Kyber.CLI do
           Path.dirname(Path.expand(paths.dir)) != Path.expand(registry) ->
             {:error, {:invalid_agent_name, opts.name}}
 
-          # P5 round-6 MEDIUM-1: `new --force` is a write — the most
-          # destructive one — so the single-writer rule applies exactly as
-          # on set/retract: a live daemon's store is never rm_rf'd out from
-          # under it (the daemon would keep appending to an unlinked file,
-          # orphaning every later delta, while a second store is born at the
-          # same path). The refusal fires BEFORE any filesystem mutation;
-          # only a dead/absent lock lets the rm_rf run.
-          agent_store_live?(paths.store) ->
-            {:error, {:agent_live_force, opts.name}}
-
           true ->
-            File.rm_rf!(paths.dir)
-            :ok
+            case agent_take_lock(paths.store, opts.name) do
+              :ok ->
+                agent_clear_dir!(paths)
+                {:ok, fn -> File.rm(agent_lock_path(paths.store)) end}
+
+              {:error, {:agent_live, name}} ->
+                {:error, {:agent_live_force, name}}
+
+              {:error, _reason} = error ->
+                error
+            end
         end
 
       true ->
         {:error, {:agent_exists, opts.name}}
     end
+  end
+
+  # rm_rf every child EXCEPT the held lock file — the lock survives the
+  # clear so no daemon can grab the store path before the fresh append
+  defp agent_clear_dir!(paths) do
+    lock = agent_lock_path(paths.store)
+
+    for entry <- File.ls!(paths.dir),
+        path = Path.join(paths.dir, entry),
+        path != lock do
+      File.rm_rf!(path)
+    end
+
+    :ok
   end
 
   # genesis is validated at new-time (premortem P1): the fallback the
@@ -854,25 +884,26 @@ defmodule Kyber.CLI do
     # the door runs BEFORE seed resolution: a seed VALUE handed to
     # --operator-seed-env must be refused as secret-shaped (AC21), not
     # misread as an unset env NAME
-    with {:ok, paths, set, view} <- agent_open(opts),
-         fields = agent_with_unsets(opts.fields, opts.unset),
-         :ok <- Config.validate_fields(fields),
-         {:ok, seed, _var} <- agent_signing_seed(opts, view, set, agent_pointer_chain(paths)),
-         {:ok, fields} <- agent_stdin_key(opts, fields, seed) do
-      case Config.changed_fields(view, fields) do
-        changed when changed == %{} ->
-          {:ok, "no change (the fold already carries these values)"}
+    agent_open(opts, fn paths, set, view ->
+      with fields = agent_with_unsets(opts.fields, opts.unset),
+           :ok <- Config.validate_fields(fields),
+           {:ok, seed, _var} <- agent_signing_seed(opts, view, set, agent_pointer_chain(paths)),
+           {:ok, fields} <- agent_stdin_key(opts, fields, seed) do
+        case Config.changed_fields(view, fields) do
+          changed when changed == %{} ->
+            {:ok, "no change (the fold already carries these values)"}
 
-        changed ->
-          with {:ok, signed} <- AgentEvents.agent_set(seed, agent_now_ms(), opts.name, changed),
-               :ok <- agent_append(paths.store, [signed]) do
-            names =
-              changed |> Map.keys() |> Enum.map(&to_string/1) |> Enum.sort() |> Enum.join(", ")
+          changed ->
+            with {:ok, signed} <- AgentEvents.agent_set(seed, agent_now_ms(), opts.name, changed),
+                 :ok <- agent_append(paths.store, [signed]) do
+              names =
+                changed |> Map.keys() |> Enum.map(&to_string/1) |> Enum.sort() |> Enum.join(", ")
 
-            {:ok, "updated #{opts.name}: #{names}"}
-          end
+              {:ok, "updated #{opts.name}: #{names}"}
+            end
+        end
       end
-    end
+    end)
   end
 
   defp agent_with_unsets(fields, []), do: fields
@@ -881,13 +912,15 @@ defmodule Kyber.CLI do
   # ---- retract (AC13)
 
   defp agent_retract_cmd(opts) do
-    with {:ok, paths, set, view} <- agent_open(opts),
-         :ok <- agent_known_delta(set, opts.target),
-         {:ok, seed, _var} <- agent_signing_seed(opts, view, set, agent_pointer_chain(paths)),
-         {:ok, signed} <- AgentEvents.agent_retract(seed, agent_now_ms(), opts.name, opts.target),
-         :ok <- agent_append(paths.store, [signed]) do
-      {:ok, "retracted #{opts.target}"}
-    end
+    agent_open(opts, fn paths, set, view ->
+      with :ok <- agent_known_delta(set, opts.target),
+           {:ok, seed, _var} <- agent_signing_seed(opts, view, set, agent_pointer_chain(paths)),
+           {:ok, signed} <-
+             AgentEvents.agent_retract(seed, agent_now_ms(), opts.name, opts.target),
+           :ok <- agent_append(paths.store, [signed]) do
+        {:ok, "retracted #{opts.target}"}
+      end
+    end)
   end
 
   # ---- rekey (AC20 premortem)
@@ -914,25 +947,26 @@ defmodule Kyber.CLI do
   # P5 round-7 HIGH-1 (AC21): the NEW seed is never imported to the keyring
   # — like at create, only its author reaches disk (the pointer chain).
   defp agent_rekey(opts) do
-    with {:ok, paths, _set, view} <- agent_open(opts),
-         :ok <- agent_live_view(view, opts.name),
-         chain = agent_pointer_chain(paths),
-         {:ok, old_seed, _var} <- agent_signing_seed(opts, view, nil, chain),
-         {:ok, new_seed} <- agent_seed_from_env(opts.new_seed_env),
-         {:ok, snapshot} <- agent_rekey_snapshot(view, old_seed, new_seed, opts),
-         ts = agent_now_ms(),
-         {:ok, handoff} <-
-           AgentEvents.agent_set(old_seed, ts, opts.name, %{
-             operator_seed_env: opts.new_seed_env
-           }),
-         {:ok, reassert} <- AgentEvents.agent_set(new_seed, ts + 1, opts.name, snapshot),
-         :ok <- agent_append(paths.store, [handoff, reassert]),
-         :ok <- agent_write_pointer(paths, [Keys.author_for_seed(new_seed)]) do
-      {:ok,
-       "rekeyed #{opts.name}: operator authority REPLACED by #{opts.new_seed_env}'s author — " <>
-         "the old seed is revoked (its deltas fold as non-operator) and any {enc} secret " <>
-         "now decrypts under the new seed"}
-    end
+    agent_open(opts, fn paths, _set, view ->
+      with :ok <- agent_live_view(view, opts.name),
+           chain = agent_pointer_chain(paths),
+           {:ok, old_seed, _var} <- agent_signing_seed(opts, view, nil, chain),
+           {:ok, new_seed} <- agent_seed_from_env(opts.new_seed_env),
+           {:ok, snapshot} <- agent_rekey_snapshot(view, old_seed, new_seed, opts),
+           ts = agent_now_ms(),
+           {:ok, handoff} <-
+             AgentEvents.agent_set(old_seed, ts, opts.name, %{
+               operator_seed_env: opts.new_seed_env
+             }),
+           {:ok, reassert} <- AgentEvents.agent_set(new_seed, ts + 1, opts.name, snapshot),
+           :ok <- agent_append(paths.store, [handoff, reassert]),
+           :ok <- agent_write_pointer(paths, [Keys.author_for_seed(new_seed)]) do
+        {:ok,
+         "rekeyed #{opts.name}: operator authority REPLACED by #{opts.new_seed_env}'s author — " <>
+           "the old seed is revoked (its deltas fold as non-operator) and any {enc} secret " <>
+           "now decrypts under the new seed"}
+      end
+    end)
   end
 
   # the new operator's re-assertion of the live fold — every present field,
@@ -984,24 +1018,25 @@ defmodule Kyber.CLI do
   defp agent_tombstone(opts) do
     ts = agent_now_ms()
 
-    with {:ok, paths, set, view} <- agent_open(opts),
-         :ok <- agent_known_delta(set, opts.target),
-         {:ok, seed, _var} <- agent_signing_seed(opts, view, set, agent_pointer_chain(paths)),
-         {:ok, retraction} <- AgentEvents.agent_retract(seed, ts, opts.name, opts.target),
-         {:ok, tombstone} <-
-           AgentEvents.secret_tombstone(
-             seed,
-             ts + 1,
-             opts.name,
-             opts.target,
-             opts.field,
-             opts.rotated
-           ),
-         :ok <- agent_append(paths.store, [retraction, tombstone]) do
-      {:ok,
-       "tombstoned #{opts.target} (#{opts.field}) — the delta is retracted and the " <>
-         "exposure is recorded; ROTATE the credential now (the leaked value is burned)"}
-    end
+    agent_open(opts, fn paths, set, view ->
+      with :ok <- agent_known_delta(set, opts.target),
+           {:ok, seed, _var} <- agent_signing_seed(opts, view, set, agent_pointer_chain(paths)),
+           {:ok, retraction} <- AgentEvents.agent_retract(seed, ts, opts.name, opts.target),
+           {:ok, tombstone} <-
+             AgentEvents.secret_tombstone(
+               seed,
+               ts + 1,
+               opts.name,
+               opts.target,
+               opts.field,
+               opts.rotated
+             ),
+           :ok <- agent_append(paths.store, [retraction, tombstone]) do
+        {:ok,
+         "tombstoned #{opts.target} (#{opts.field}) — the delta is retracted and the " <>
+           "exposure is recorded; ROTATE the credential now (the leaked value is burned)"}
+      end
+    end)
   end
 
   # ---- shared agent machinery
@@ -1036,48 +1071,94 @@ defmodule Kyber.CLI do
     end)
   end
 
-  defp agent_open(opts) do
+  # P5 round-3 M2 + round-8 LOW-1: single-writer, ATOMICALLY. A live
+  # daemon's DurableStore subscription is in-process only — a direct append
+  # behind its back diverges silently until restart. The old check-then-
+  # append was a TOCTOU on an advisory read: a daemon could take the store
+  # between the liveness decision and the append. Now the CLI acquires the
+  # daemon's OWN lock file with O_EXCL for the duration of read-fold-append
+  # — the create IS the liveness check — and removes it on every exit path.
+  # Route live changes through the served channel (`kyber ctl set-config`);
+  # offline appends run under the held lock.
+  defp agent_open(opts, fun) do
     paths = agent_paths(agent_registry(opts), opts.name)
 
     cond do
       not File.exists?(paths.pointer) ->
         {:error, {:unknown_agent, opts.name}}
 
-      # P5 round-3 M2: single-writer. A live daemon's DurableStore
-      # subscription is in-process only — a direct append behind its back
-      # diverges silently until restart. Route live changes through the
-      # served channel (`kyber ctl set-config`); offline appends directly.
-      agent_store_live?(paths.store) ->
-        {:error, {:agent_live, opts.name}}
-
       true ->
-        set = agent_load_set(paths.store)
+        case agent_take_lock(paths.store, opts.name) do
+          :ok ->
+            try do
+              set = agent_load_set(paths.store)
 
-        view =
-          case Config.resolve(
-                 set,
-                 opts.name,
-                 agent_pointer_chain(paths),
-                 agent_pinned_author(paths.keyring)
-               ) do
-            {:ok, view} -> view
-            :not_found -> nil
-          end
+              view =
+                case Config.resolve(
+                       set,
+                       opts.name,
+                       agent_pointer_chain(paths),
+                       agent_pinned_author(paths.keyring)
+                     ) do
+                  {:ok, view} -> view
+                  :not_found -> nil
+                end
 
-        {:ok, paths, set, view}
+              fun.(paths, set, view)
+            after
+              File.rm(agent_lock_path(paths.store))
+            end
+
+          {:error, _refused} = error ->
+            error
+        end
     end
   end
 
-  # the daemon's lock file (`<store>.lock`, OS pid inside) is the liveness
-  # oracle — same `ps -p` posture as the daemon's own reclaim check (EPERM-
-  # safe); our OWN pid counts as live (an in-VM daemon is still the writer)
-  defp agent_store_live?(store_path) do
-    case File.read(store_path <> ".lock") do
+  @agent_lock_attempts 5
+
+  defp agent_lock_path(store_path), do: store_path <> ".lock"
+
+  # the daemon's own lock protocol (`<store>.lock`, OS pid inside, O_EXCL
+  # create — see Daemon.do_take_lock), with one difference: our OWN OS pid
+  # in an EXISTING lock counts as live (an in-VM daemon is still the
+  # writer). Same `ps -p` posture as the daemon's reclaim (EPERM-safe); a
+  # dead or garbage holder is reclaimed, a live one refuses.
+  defp agent_take_lock(store_path, name) do
+    do_agent_take_lock(agent_lock_path(store_path), name, @agent_lock_attempts)
+  end
+
+  defp do_agent_take_lock(_lock, name, 0), do: {:error, {:agent_live, name}}
+
+  defp do_agent_take_lock(lock, name, attempts) do
+    case File.open(lock, [:write, :exclusive, :binary]) do
+      {:ok, io} ->
+        with :ok <- IO.binwrite(io, System.pid()), :ok <- File.close(io) do
+          :ok
+        else
+          {:error, reason} -> {:error, {:agent_lock_failed, reason}}
+        end
+
+      {:error, :eexist} ->
+        if agent_lock_live?(lock) do
+          {:error, {:agent_live, name}}
+        else
+          File.rm(lock)
+          do_agent_take_lock(lock, name, attempts - 1)
+        end
+
+      {:error, reason} ->
+        {:error, {:agent_lock_failed, reason}}
+    end
+  end
+
+  defp agent_lock_live?(lock) do
+    case File.read(lock) do
       {:ok, content} ->
         pid = String.trim(content)
         pid == System.pid() or agent_os_pid_alive?(pid)
 
-      {:error, _no_lock} ->
+      {:error, _unreadable} ->
         false
     end
   end
@@ -2004,6 +2085,11 @@ defmodule Kyber.CLI do
       "agent #{name} is live (a daemon holds its store lock) — refusing to destroy a " <>
         "running agent's store; stop it first (kyber daemon stop / kill the pid) or " <>
         "route changes through kyber ctl set-config"
+
+  defp format_error({:agent_lock_failed, reason}),
+    do:
+      "could not take the store lock (#{inspect(reason)}) — the single-writer guard " <>
+        "holds the lock across the append; check permissions beside the store"
 
   defp format_error({:unknown_delta, id}), do: "unknown delta: #{id}"
 

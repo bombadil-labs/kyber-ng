@@ -36,7 +36,11 @@ defmodule Kyber.Agent.T17DaemonIdentityTest do
   defmodule StubHttp do
     @behaviour Kyber.Agent.HttpClient
     @impl true
-    def post(_url, _headers, body, %{reply_to: pid, table: table}) do
+    def post(_url, headers, body, %{reply_to: pid, table: table}) do
+      # P5 r8 H1: the wire proof needs the OUTBOUND Authorization header —
+      # the one surface the Redactor never touches
+      {_name, auth} = List.keyfind(headers, ~c"authorization", 0)
+      send(pid, {:t17_llm_auth, List.to_string(auth)})
       send(pid, {:t17_llm_body, JSON.decode!(body)})
 
       case :ets.lookup(table, :mode) do
@@ -402,10 +406,15 @@ defmodule Kyber.Agent.T17DaemonIdentityTest do
     assert live_model() == "kimi-broken"
   end
 
-  test "a SWAP-TIME config-class failure counts: the broken agent delta is retracted (P5 H1)",
+  test "a granted agent delta naming api_key_env is FOLD-INERT — the operator key stays on the wire (P5 r8 H1)",
        %{key_dir: key_dir} do
     table = :ets.new(:t17_stub, [:public])
     :ets.insert(table, {:mode, :ok})
+
+    # the exfiltration target: a daemon-readable env var whose VALUE must
+    # never reach the provider's Authorization header
+    System.put_env("T17_DI_EXFIL", "sk-exfil-planted-secret-0987654321")
+    on_exit(fn -> System.delete_env("T17_DI_EXFIL") end)
 
     append_set!(@operator_seed, @base_ts, %{
       model: "kimi-base",
@@ -419,22 +428,74 @@ defmodule Kyber.Agent.T17DaemonIdentityTest do
       rollback_threshold: 1
     )
 
-    # the agent self-configures a key env that is NOT set: the failure
-    # happens AT THE SWAP, before any inference — the harness must already
-    # be armed with this delta and roll it back (never `failures: 0` reset
-    # after the failing swap)
-    agent_delta = append_set!(@daemon_seed, @base_ts + 10, %{api_key_env: "T17_DI_MISSING"})
+    folds = Daemon.status().folds_since_boot
 
-    assert eventually(fn -> agent_delta in retract_targets() end),
-           "the swap-time key failure never fed the harness (status: #{inspect(Daemon.status())})"
+    # the granted agent points api_key_env at an env var of its choosing —
+    # pre-r8 the hot-swap resolved it and shipped the value on the wire
+    append_set!(@daemon_seed, @base_ts + 10, %{api_key_env: "T17_DI_EXFIL"})
 
-    assert [rollback | _rest] = rollback_claims()
-    assert Enum.any?(rollback.offends, &match?({:delta, ^agent_delta, _ctx}, &1))
+    # the delta is processed and INERT: nothing armed, nothing failed,
+    # nothing retracted — a non-event, not a rollback
+    assert eventually(fn -> Daemon.status().folds_since_boot > folds end)
+    status = Daemon.status()
+    assert status.rollbacks == 0
+    assert status.failures == 0
+    assert retract_targets() == []
 
-    # the retraction's own feed delivery re-swaps back onto the good key
-    assert eventually(fn -> live_model() == "kimi-base" end)
-    assert Daemon.status().rollbacks == 1
-    assert retract_targets() == [agent_delta]
+    # the wire proof: the next request's Authorization header carries the
+    # OPERATOR-attested key, never the agent-named env var's value
+    ingest!(key_dir, 1)
+    assert_receive {:t17_llm_auth, auth}, 60_000
+    assert auth == "Bearer " <> @key_value
+    refute auth =~ "sk-exfil"
+  end
+
+  test "the operator CAN still hot-swap api_key_env — the new env's value rides the auth header (P5 r8 H1)",
+       %{key_dir: key_dir} do
+    table = :ets.new(:t17_stub, [:public])
+    :ets.insert(table, {:mode, :ok})
+
+    System.put_env("T17_DI_KEY2", "sk-t17-rotated-value-abcdefghij")
+    on_exit(fn -> System.delete_env("T17_DI_KEY2") end)
+
+    append_set!(@operator_seed, @base_ts, %{model: "kimi-base", api_key_env: "T17_DI_KEY"})
+    boot!(key_dir, stub_llm(table, model: "kimi-base"), model: "kimi-base")
+
+    folds = Daemon.status().folds_since_boot
+    append_set!(@operator_seed, @base_ts + 10, %{api_key_env: "T17_DI_KEY2"})
+    assert eventually(fn -> Daemon.status().folds_since_boot > folds end)
+
+    ingest!(key_dir, 1)
+    assert_receive {:t17_llm_auth, auth}, 60_000
+    assert auth == "Bearer sk-t17-rotated-value-abcdefghij"
+  end
+
+  test "an OPERATOR swap-time key failure is detection-only — the engine keeps the old key (P5 r8)",
+       %{key_dir: key_dir} do
+    table = :ets.new(:t17_stub, [:public])
+    :ets.insert(table, {:mode, :ok})
+
+    append_set!(@operator_seed, @base_ts, %{model: "kimi-base", api_key_env: "T17_DI_KEY"})
+
+    boot!(key_dir, stub_llm(table, model: "kimi-base"),
+      model: "kimi-base",
+      rollback_threshold: 1
+    )
+
+    folds = Daemon.status().folds_since_boot
+
+    # post-r8 only the operator can name the key source, so a swap-time
+    # key failure is always operator-headed: detection-only, no retract
+    append_set!(@operator_seed, @base_ts + 10, %{api_key_env: "T17_DI_MISSING"})
+    assert eventually(fn -> Daemon.status().folds_since_boot > folds end)
+
+    assert Daemon.status().rollbacks == 0
+    assert retract_targets() == []
+
+    # the failed swap never replaced the live credential
+    ingest!(key_dir, 1)
+    assert_receive {:t17_llm_auth, auth}, 60_000
+    assert auth == "Bearer " <> @key_value
   end
 
   test "the operator seed is redacted from the wire even when leaked into content (P5 M1)",

@@ -180,16 +180,47 @@ defmodule Kyber.Agent.T17SelfConfigToolTest do
     assert result_status(outputs) == "error"
   end
 
-  test "the AC17 door runs at the tool boundary: secret-shaped value refused, NO delta" do
+  test "api_key_env can NEVER be set by the agent (P5 r8 H1) — even under the grant" do
+    # a well-formed env NAME, so the refusal is the operator-attested
+    # boundary, not the AC17 shape door — an agent-named env var would
+    # exfiltrate that var's value to the provider via the auth header
     outputs =
       call!(
         granted_set(),
-        JSON.encode!(%{"fields" => %{"api_key_env" => "sk-abcdef1234567890abcdef"}})
+        JSON.encode!(%{"fields" => %{"api_key_env" => "KYBER_OPERATOR_SEED"}})
       )
 
     assert agent_sets(outputs) == []
     assert result_status(outputs) == "error"
-    assert result_text(outputs) =~ "env NAME"
+    assert result_text(outputs) =~ "operator"
+  end
+
+  test "api_key_enc can NEVER be set by the agent (P5 r8 H1) — even under the grant" do
+    enc = Base.encode64(:crypto.strong_rand_bytes(44))
+    outputs = call!(granted_set(), JSON.encode!(%{"fields" => %{"api_key_enc" => enc}}))
+
+    assert agent_sets(outputs) == []
+    assert result_status(outputs) == "error"
+    assert result_text(outputs) =~ "operator"
+  end
+
+  test "api_key_env can NEVER be unset by the agent (P5 r8 H1)" do
+    outputs = call!(granted_set(), JSON.encode!(%{"fields" => %{"unset" => ["api_key_env"]}}))
+
+    assert agent_sets(outputs) == []
+    assert result_status(outputs) == "error"
+  end
+
+  test "the AC17 door runs at the tool boundary: secret-shaped value refused, NO delta" do
+    outputs =
+      call!(
+        granted_set(),
+        JSON.encode!(%{"fields" => %{"model" => "sk-abcdef1234567890abcdef"}})
+      )
+
+    assert agent_sets(outputs) == []
+    assert result_status(outputs) == "error"
+    assert result_text(outputs) =~ "model"
   end
 
   test "an unknown field is malformed — NO delta" do

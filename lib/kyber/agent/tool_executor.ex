@@ -640,8 +640,10 @@ defmodule Kyber.Agent.ToolExecutor do
 
   # the fold-level twin lives in Config.apply_fields (@operator_only) — a
   # hand-appended agent delta naming these fields is fold-inert even when
-  # this boundary is bypassed
-  @operator_attested [:base_url, :operator_seed_env]
+  # this boundary is bypassed. The key source is here too (P5 round-8
+  # HIGH-1): an agent-named api_key_env would exfiltrate any daemon-readable
+  # env var to the provider via the Authorization header.
+  @operator_attested [:base_url, :operator_seed_env, :api_key_env, :api_key_enc]
 
   defp refuse_operator_attested(fields) do
     unset = Map.get(fields, :unset, [])

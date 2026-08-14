@@ -45,10 +45,14 @@ defmodule Kyber.Agent.Config do
   @fields ~w(soul base_url model api_key_env api_key_enc system_prompt operator_seed_env oracle_seed loop channel_socket profile self_config)a
 
   # operator-attested ALWAYS, set AND unset, regardless of the grant:
-  # base_url (premortem P0 — proxy exfiltration) and operator_seed_env
+  # base_url (premortem P0 — proxy exfiltration), operator_seed_env
   # (P5 HIGH-3 — same trust class: redirecting the seed disarms the
-  # rollback harness and seizes signing)
-  @operator_only [:base_url, :operator_seed_env]
+  # rollback harness and seizes signing), and the key source (P5 round-8
+  # HIGH-1: an agent-named api_key_env would make the daemon resolve ANY
+  # daemon-readable env var and ship its value to the provider in the
+  # Authorization header — env-var exfiltration over the wire, which the
+  # Redactor never sees; api_key_enc rides along as defense in depth)
+  @operator_only [:base_url, :operator_seed_env, :api_key_env, :api_key_enc]
 
   @type view :: %{
           name: String.t(),

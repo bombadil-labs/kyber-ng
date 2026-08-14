@@ -292,6 +292,56 @@ defmodule Kyber.Agent.T17ConfigFoldTest do
       assert view.operator_seed_env == "KYBER_OPERATOR_SEED"
     end
 
+    test "api_key_env is operator-attested ALWAYS: a granted agent delta never folds it (P5 r8 H1)" do
+      pairs = [
+        agent_set("wisp", @genesis_fields, ts: @ts),
+        agent_set("wisp", %{self_config: "true"}, ts: @ts + 1),
+        agent_set("wisp", %{api_key_env: "KYBER_OPERATOR_SEED", model: "agent-choice"},
+          seed: @agent_seed,
+          ts: @ts + 2
+        )
+      ]
+
+      assert {:ok, view} = Config.resolve(set_of(pairs), "wisp")
+      # the model change folds (granted); the key-source redirect NEVER
+      # does — an agent-named env var would ship that var's VALUE to the
+      # provider in the Authorization header (env exfiltration on the wire)
+      assert view.model == "agent-choice"
+      assert view.api_key == {:env, "DEEPSEEK_API_KEY"}
+    end
+
+    test "api_key_enc is operator-attested ALWAYS: a granted agent delta never folds it (P5 r8 H1)" do
+      enc = Base.encode64(:crypto.strong_rand_bytes(44))
+
+      pairs = [
+        agent_set("wisp", @genesis_fields, ts: @ts),
+        agent_set("wisp", %{self_config: "true"}, ts: @ts + 1),
+        agent_set("wisp", %{api_key_enc: enc, model: "agent-choice"},
+          seed: @agent_seed,
+          ts: @ts + 2
+        )
+      ]
+
+      assert {:ok, view} = Config.resolve(set_of(pairs), "wisp")
+      assert view.model == "agent-choice"
+      assert view.api_key == {:env, "DEEPSEEK_API_KEY"}
+    end
+
+    test "a granted agent unset of api_key_env is fold-inert too (P5 r8 H1)" do
+      pairs = [
+        agent_set("wisp", @genesis_fields, ts: @ts),
+        agent_set("wisp", %{self_config: "true"}, ts: @ts + 1),
+        agent_set("wisp", %{unset: ["api_key_env"], model: "agent-choice"},
+          seed: @agent_seed,
+          ts: @ts + 2
+        )
+      ]
+
+      assert {:ok, view} = Config.resolve(set_of(pairs), "wisp")
+      assert view.model == "agent-choice"
+      assert view.api_key == {:env, "DEEPSEEK_API_KEY"}
+    end
+
     test "an agent retraction can negate its own folded delta but not an operator's" do
       genesis = agent_set("wisp", @genesis_fields, ts: @ts)
       {genesis_id, _} = genesis
