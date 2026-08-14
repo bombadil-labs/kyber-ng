@@ -398,6 +398,11 @@ defmodule Kyber.Agent.T17ConfigFoldTest do
     # the gate the operator refused; profile (MEDIUM-1) IS the capability
     # envelope (tool registry, memory/skill visibility), so a self-set is
     # self-escalation.
+    #
+    # P5 round-11 (MEDIUM-1): `loop` joined them. It selects the EXECUTION
+    # ENGINE — `loop: ack` leaves no reactor, so a granted agent could stop
+    # its own inference AND blind the rollback harness (which only ever
+    # fires on engine events): the broken config could never be repaired.
     @operator_baseline %{
       base_url: "https://api.deepseek.com/v1",
       operator_seed_env: "KYBER_OPERATOR_SEED",
@@ -405,6 +410,7 @@ defmodule Kyber.Agent.T17ConfigFoldTest do
       channel_socket: "default",
       oracle_seed: "absent",
       profile: "scoped",
+      loop: "reactor",
       model: "deepseek-v4-flash",
       self_config: "true"
     }
@@ -416,6 +422,7 @@ defmodule Kyber.Agent.T17ConfigFoldTest do
       channel_socket: "/tmp/kyber-victim/store.jsonl",
       oracle_seed: "present",
       profile: "wide-open",
+      loop: "ack",
       model: "agent-choice"
     }
 
@@ -435,13 +442,16 @@ defmodule Kyber.Agent.T17ConfigFoldTest do
       assert view.channel_socket == "default"
       assert view.oracle_seed == "absent"
       assert view.profile == "scoped"
+      assert view.loop == "reactor"
 
       # the boot opts the daemon acts on carry the operator's values, not
-      # the agent's: no rm aimed at the store, no gate flip, no wider profile
+      # the agent's: no rm aimed at the store, no gate flip, no wider
+      # profile, and the engine the operator chose still runs
       opts = Config.boot_opts(view, [])
       assert opts[:channel_socket] == :default
       assert opts[:oracle_seed] == :absent
       assert opts[:profile] == "scoped"
+      assert opts[:loop] == :reactor
     end
 
     test "EVERY operator-only field is fold-inert from a granted agent UNSET (P5 r8 H1, r10 C1/H1/M1)" do
@@ -451,7 +461,8 @@ defmodule Kyber.Agent.T17ConfigFoldTest do
         agent_set(
           "wisp",
           %{
-            unset: ~w(base_url operator_seed_env api_key_env channel_socket oracle_seed profile),
+            unset:
+              ~w(base_url operator_seed_env api_key_env channel_socket oracle_seed profile loop),
             model: "agent-choice"
           },
           seed: @agent_seed,
@@ -467,14 +478,20 @@ defmodule Kyber.Agent.T17ConfigFoldTest do
       assert view.channel_socket == "default"
       assert view.oracle_seed == "absent"
       assert view.profile == "scoped"
+      assert view.loop == "reactor"
     end
 
-    test "the OPERATOR still sets and unsets all three round-10 fields (P5 r10 T3)" do
+    test "the OPERATOR still sets and unsets every operator-only field (P5 r10 T3, r11 M1 T3)" do
       pairs = [
         agent_set("wisp", @operator_baseline, ts: @ts),
         agent_set(
           "wisp",
-          %{channel_socket: "/tmp/kyber-op.sock", oracle_seed: "present", profile: "wide-open"},
+          %{
+            channel_socket: "/tmp/kyber-op.sock",
+            oracle_seed: "present",
+            profile: "wide-open",
+            loop: "ack"
+          },
           ts: @ts + 1
         )
       ]
@@ -483,18 +500,21 @@ defmodule Kyber.Agent.T17ConfigFoldTest do
       assert view.channel_socket == "/tmp/kyber-op.sock"
       assert view.oracle_seed == "present"
       assert view.profile == "wide-open"
+      assert view.loop == "ack"
 
       opts = Config.boot_opts(view, [])
       assert opts[:channel_socket] == "/tmp/kyber-op.sock"
       assert opts[:oracle_seed] == :present
+      assert opts[:loop] == :ack
 
       unset =
-        agent_set("wisp", %{unset: ~w(channel_socket oracle_seed profile)}, ts: @ts + 2)
+        agent_set("wisp", %{unset: ~w(channel_socket oracle_seed profile loop)}, ts: @ts + 2)
 
       assert {:ok, stepped} = Config.resolve(set_of(pairs ++ [unset]), "wisp")
       assert stepped.channel_socket == nil
       assert stepped.oracle_seed == nil
       assert stepped.profile == nil
+      assert stepped.loop == nil
     end
 
     test "an agent retraction can negate its own folded delta but not an operator's" do

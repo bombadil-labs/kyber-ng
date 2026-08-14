@@ -78,7 +78,12 @@ defmodule Kyber.CLI do
                                            FIRST, then the pointer chain is REPLACED (old seed revoked).
                                            Crash-safe: interrupted before the pointer write, the old
                                            chain stays live — re-run with --operator-seed-env <OLD>
-                                           --new-seed-env <NEW> to finish
+                                           --new-seed-env <NEW> to finish.
+                                           The store is APPEND-ONLY: a key stored encrypted under the
+                                           OLD seed stays in the log forever and anyone holding that
+                                           seed can still read it — rekey re-encrypts it under the new
+                                           seed but cannot unpublish the old blob, so ROTATE the key
+                                           at the provider too
     agent tombstone <name> <delta-id> --field <f> [--rotated <note>]
                                            the leaked-secret runbook: retract the offending delta,
                                            append a SecretTombstone claim recording the exposure,
@@ -964,10 +969,25 @@ defmodule Kyber.CLI do
         {:ok,
          "rekeyed #{opts.name}: operator authority REPLACED by #{opts.new_seed_env}'s author — " <>
            "the old seed is revoked (its deltas fold as non-operator) and any {enc} secret " <>
-           "now decrypts under the new seed"}
+           "now decrypts under the new seed" <> agent_rekey_exposure(view)}
       end
     end)
   end
+
+  # P5 round-11 MEDIUM-4: rekey re-encrypts the key under the new seed, but
+  # the store only learns — the OLD ciphertext is in the log forever, and
+  # anyone holding the rotated-away seed can still decrypt it. Re-keying is
+  # not revocation of the key VALUE; the only remedy for an append-only
+  # store is rotating the credential at the provider. Say so, and name the
+  # delta that carries the old blob so the operator can find it.
+  defp agent_rekey_exposure(%{api_key: {:enc, _ciphertext}} = view) do
+    ". WARNING: the OLD ciphertext (delta #{view.heads[:api_key_enc]}) stays in the " <>
+      "append-only log and is still readable by anyone holding the old seed — " <>
+      "ROTATE the old key at the provider now (revoke it in the provider dashboard); " <>
+      "re-encryption cannot unpublish what the log already carries"
+  end
+
+  defp agent_rekey_exposure(_no_stored_secret), do: ""
 
   # the new operator's re-assertion of the live fold — every present field,
   # with the {enc} arm re-encrypted under the new seed and the seed env

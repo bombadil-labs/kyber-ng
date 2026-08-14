@@ -288,11 +288,19 @@ defmodule Kyber.Daemon do
 
     case Kyber.Schema.resolve(claims) do
       %{type: "AgentSet", agent: {:entity, ^agent, _ctx}} = resolved ->
-        {:noreply, agent_config_changed(state, id, claims, resolved)}
+        if admitted_author?(state, claims.author) do
+          {:noreply, agent_config_changed(state, id, claims, resolved)}
+        else
+          {:noreply, state}
+        end
 
       %{type: "AgentRetract", agent: {:entity, ^agent, _ctx}} ->
-        {view, state} = agent_refold(state)
-        {:noreply, agent_hot_swap(state, view)}
+        if admitted_author?(state, claims.author) do
+          {view, state} = agent_refold(state)
+          {:noreply, agent_hot_swap(state, view)}
+        else
+          {:noreply, state}
+        end
 
       _other ->
         {:noreply, state}
@@ -318,6 +326,22 @@ defmodule Kyber.Daemon do
   # the gateway adapter is link-coupled the same way (T14i H9)
   def handle_info({:EXIT, pid, reason}, %{adapter: pid} = state), do: {:stop, reason, state}
   def handle_info({:EXIT, _pid, _reason}, state), do: {:noreply, state}
+
+  # P5 round-11 MEDIUM-2: the fold is O(store), the daemon's loop is
+  # serialized, and the feed is a FEDERATION surface — any peer that can
+  # append reaches it. A delta whose author is admitted by NEITHER pin (the
+  # operator chain, or this daemon's own agent author) is inert BY
+  # AUTHORSHIP: the fold would walk the whole store only to discard it, and
+  # the walk's author filter and the negation filter both agree. So the
+  # walk is skipped entirely — a spam burst costs O(1) per delta instead of
+  # O(store). When the operator chain is UNPINNED (nil — the legacy
+  # earliest-author reading) authorship is not resolvable here, so the
+  # delta falls through to the fold exactly as before.
+  defp admitted_author?(%{operator_authors: nil}, _author), do: true
+
+  defp admitted_author?(state, author) do
+    author in state.operator_authors or author == state.author
+  end
 
   # P5 round-3 M3: crash reports (and :sys.get_status) must never print the
   # seed or key material the state carries — the D8 log-leak class on the

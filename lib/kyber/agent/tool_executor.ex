@@ -51,7 +51,10 @@ defmodule Kyber.Agent.ToolExecutor do
   # env var to the provider via the Authorization header. So are the three
   # P5 round-10 fields: channel_socket (the daemon File.rm's the path
   # before bind — a file-deletion primitive), oracle_seed (the operator's
-  # inference gate) and profile (the capability envelope).
+  # inference gate) and profile (the capability envelope). `loop` joined in
+  # round 11: it selects the EXECUTION ENGINE, so an agent setting it to
+  # `ack` disables its own reactor — and the rollback harness with it,
+  # since the harness only ever sees engine events.
   @operator_attested [
     :base_url,
     :operator_seed_env,
@@ -59,7 +62,8 @@ defmodule Kyber.Agent.ToolExecutor do
     :api_key_enc,
     :channel_socket,
     :oracle_seed,
-    :profile
+    :profile,
+    :loop
   ]
 
   @doc "The stub registry: `tool:echo` answers its args."
@@ -643,7 +647,10 @@ defmodule Kyber.Agent.ToolExecutor do
   defp atomize_self_config_fields(raw) do
     Enum.reduce_while(raw, {:ok, %{}}, fn
       {"unset", names}, {:ok, acc} when is_list(names) ->
-        {:cont, {:ok, Map.put(acc, :unset, names)}}
+        case normalize_unset(names) do
+          {:ok, names} -> {:cont, {:ok, Map.put(acc, :unset, names)}}
+          {:error, reason} -> {:halt, {:error, reason}}
+        end
 
       {"unset", _malformed}, {:ok, _acc} ->
         {:halt, {:error, "unset must be a list of field names"}}
@@ -656,12 +663,37 @@ defmodule Kyber.Agent.ToolExecutor do
     end)
   end
 
+  # P5 round-11 HIGH-1: the tool path is TOTAL — a model-controlled call is
+  # never a raise. `unset` members arrive from the model's JSON, so a map or
+  # a list member would blow `to_string/1` up (Protocol.UndefinedError) in
+  # the operator-attested check below and take the reactor — and with it the
+  # daemon — down on a two-token call. Names are field names: binaries (or
+  # atoms, for the in-process callers); anything else is refused legibly
+  # here, before any check that assumes a name.
+  defp normalize_unset(names) do
+    names
+    |> Enum.reduce_while({:ok, []}, fn
+      name, {:ok, acc} when is_binary(name) ->
+        {:cont, {:ok, [name | acc]}}
+
+      name, {:ok, acc} when is_atom(name) ->
+        {:cont, {:ok, [Atom.to_string(name) | acc]}}
+
+      malformed, {:ok, _acc} ->
+        {:halt, {:error, "unset members must be field names — got #{inspect(malformed)}"}}
+    end)
+    |> case do
+      # the emission order is part of the delta's content address — restore it
+      {:ok, reversed} -> {:ok, Enum.reverse(reversed)}
+      {:error, _reason} = error -> error
+    end
+  end
+
   defp refuse_operator_attested(fields) do
     unset = Map.get(fields, :unset, [])
 
     case Enum.find(@operator_attested, fn field ->
-           Map.has_key?(fields, field) or
-             Enum.any?(unset, &(to_string(&1) == Atom.to_string(field)))
+           Map.has_key?(fields, field) or Atom.to_string(field) in unset
          end) do
       nil ->
         :ok

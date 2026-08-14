@@ -531,6 +531,55 @@ defmodule Kyber.Agent.T17AgentCliTest do
       assert_no_seed_on_disk!(registry, [@operator_seed, @new_seed])
     end
 
+    # P5 round-11 MEDIUM-4: rekey rotates the SEED, not the KEY. The store
+    # only learns — the blob encrypted under the old seed is in the
+    # append-only log forever, and anyone holding that seed can still read
+    # it. Re-encryption is not revocation of the value; the only remedy is
+    # rotating the credential at the provider. Rekey must SAY so, and name
+    # the delta carrying the old blob.
+    test "rekey narrates the permanent exposure and names the old blob's delta (P5 r11 M4 T1)",
+         %{registry: registry} do
+      new!(registry)
+      secret = "sk-live-supersecret-value-123456"
+
+      capture_io([input: secret <> "\n"], fn ->
+        send(self(), CLI.run(["agent", "set", "wisp", "--api-key", "--registry", registry]))
+      end)
+
+      assert_received {:ok, _}
+
+      old_blob_id = fold!(registry).heads[:api_key_enc]
+      assert is_binary(old_blob_id)
+
+      System.put_env("T17_NEW_SEED", @new_seed)
+      assert {:ok, message} = agent(["rekey", "wisp", "--new-seed-env", "T17_NEW_SEED"], registry)
+
+      assert message =~ "ROTATE the old key at the provider"
+      assert message =~ "append-only"
+      assert message =~ old_blob_id
+
+      # and the old ciphertext IS still there, still readable under the old
+      # seed — the narration is honest about the store, not decorative
+      assert File.read!(store_path(registry)) =~ old_blob_id
+    end
+
+    test "rekey with no stored secret says nothing about rotation (P5 r11 M4)", %{
+      registry: registry
+    } do
+      new!(registry)
+      System.put_env("T17_NEW_SEED", @new_seed)
+      assert {:ok, message} = agent(["rekey", "wisp", "--new-seed-env", "T17_NEW_SEED"], registry)
+
+      assert message =~ "authority"
+      refute message =~ "ROTATE"
+    end
+
+    test "the rekey help text states the append-only permanence (P5 r11 M4 T2)" do
+      assert {:error, :usage, usage} = CLI.run(["agent", "bogus"])
+      assert usage =~ "APPEND-ONLY"
+      assert usage =~ "ROTATE the key"
+    end
+
     test "rekey moves SIGNING authority in the same operation: B signs, A fails loudly (P5 M2)",
          %{registry: registry} do
       new!(registry)

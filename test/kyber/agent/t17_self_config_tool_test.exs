@@ -216,10 +216,15 @@ defmodule Kyber.Agent.T17SelfConfigToolTest do
   # the next boot), oracle_seed (HIGH-1 — the operator's inference gate,
   # which the daemon's hot path OPENS when the fold says "present") and
   # profile (MEDIUM-1 — the capability envelope) joined the boundary.
+  # P5 round-11 MEDIUM-1: `loop` joined them — it selects the EXECUTION
+  # ENGINE, so `loop: ack` under a grant switches the agent's own reactor
+  # off, taking inference AND the rollback harness (which only ever fires
+  # on engine events) with it: an unrecoverable self-lobotomy.
   for {field, value} <- [
         {"channel_socket", "/tmp/kyber-victim-store.jsonl"},
         {"oracle_seed", "present"},
-        {"profile", "wide-open"}
+        {"profile", "wide-open"},
+        {"loop", "ack"}
       ] do
     test "#{field} can NEVER be set by the agent (P5 r10) — even under the grant" do
       outputs =
@@ -243,9 +248,59 @@ defmodule Kyber.Agent.T17SelfConfigToolTest do
     %{"self_config.set" => %{description: description}} = ToolExecutor.self_config_tools("wisp")
 
     for field <-
-          ~w(base_url operator_seed_env api_key_env api_key_enc channel_socket oracle_seed profile) do
+          ~w(base_url operator_seed_env api_key_env api_key_enc channel_socket oracle_seed profile loop) do
       assert description =~ field
     end
+  end
+
+  # P5 round-11 HIGH-1: the tool path is TOTAL. `unset` members arrive
+  # straight from the model's JSON, and the operator-attested check used to
+  # `to_string/1` them — a map or a list member raised
+  # Protocol.UndefinedError, killing the reactor and the daemon with it, on
+  # a two-token model-controlled call and with no grant needed.
+  test "a MAP inside unset is refused legibly — no raise, no delta (P5 r11 H1)" do
+    outputs = call!(granted_set(), JSON.encode!(%{"fields" => %{"unset" => [%{}]}}))
+
+    assert agent_sets(outputs) == []
+    assert result_status(outputs) == "error"
+    assert result_text(outputs) =~ "unset"
+  end
+
+  test "a LIST and a NUMBER inside unset are refused legibly (P5 r11 H1)" do
+    outputs =
+      call!(granted_set(), JSON.encode!(%{"fields" => %{"unset" => [["model"], 42]}}))
+
+    assert agent_sets(outputs) == []
+    assert result_status(outputs) == "error"
+    assert result_text(outputs) =~ "unset"
+  end
+
+  test "the happy path is unchanged: a string unset member still folds (P5 r11 H1 T3)" do
+    outputs = call!(granted_set(), JSON.encode!(%{"fields" => %{"unset" => ["model"]}}))
+
+    assert result_status(outputs) == "ok"
+    assert [%{type: "AgentSet"}] = agent_sets(outputs)
+
+    set =
+      Enum.reduce(outputs, granted_set(), fn wire, acc ->
+        {:ok, acc} = Store.admit(wire, acc)
+        acc
+      end)
+
+    assert {:ok, view} = Config.resolve(set, "wisp")
+    assert view.model == nil
+  end
+
+  test "malformed input from an UNGRANTED agent is an error, never a crash (P5 r11 H1 T4)" do
+    # the refusal order puts the malformed-input check ahead of the grant —
+    # either answer is legible; NEITHER may raise. The caller (in the live
+    # daemon: the reactor process) survives, and its liveness is the
+    # assertion: a raise here would take this test process with it.
+    outputs = call!(ungranted_set(), JSON.encode!(%{"fields" => %{"unset" => [%{}]}}))
+
+    assert Process.alive?(self())
+    assert agent_sets(outputs) == []
+    assert result_status(outputs) == "error"
   end
 
   test "the AC17 door runs at the tool boundary: secret-shaped value refused, NO delta" do

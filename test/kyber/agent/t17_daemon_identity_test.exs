@@ -27,6 +27,9 @@ defmodule Kyber.Agent.T17DaemonIdentityTest do
   @daemon_seed String.duplicate("ab", 32)
   @operator_seed String.duplicate("7f", 32)
   @agent_seed String.duplicate("9c", 32)
+  # a peer that can append to the shared store but is neither the operator
+  # chain nor this daemon's agent author (P5 round-11 MEDIUM-2)
+  @intruder_seed String.duplicate("3e", 32)
   @key_value "sk-t17-super-secret-value-1234567890"
   @base_ts 1_754_700_000_000.0
 
@@ -104,6 +107,39 @@ defmodule Kyber.Agent.T17DaemonIdentityTest do
                 "function" => %{
                   "name" => "self_config_set",
                   "arguments" => JSON.encode!(%{"fields" => %{"model" => "kimi-self"}})
+                }
+              }
+            ]
+          }
+        end
+
+      {:ok, %{status: 200, body: JSON.encode!(%{"choices" => [%{"message" => message}]})}}
+    end
+  end
+
+  # the P5 round-11 HIGH-1 stub: the model calls self_config.set with a MAP
+  # inside `unset` — a shape the operator-attested check used to
+  # `to_string/1`, raising and taking the reactor (and the daemon) down
+  defmodule MalformedToolHttp do
+    @behaviour Kyber.Agent.HttpClient
+    @impl true
+    def post(_url, _headers, body, %{reply_to: pid}) do
+      decoded = JSON.decode!(body)
+      send(pid, {:t17_llm_body, decoded})
+
+      message =
+        if Enum.any?(decoded["messages"], &(&1["role"] == "tool")) do
+          %{"content" => "done"}
+        else
+          %{
+            "content" => nil,
+            "tool_calls" => [
+              %{
+                "id" => "call-t17-r11",
+                "type" => "function",
+                "function" => %{
+                  "name" => "self_config_set",
+                  "arguments" => JSON.encode!(%{"fields" => %{"unset" => [%{}]}})
                 }
               }
             ]
@@ -1449,6 +1485,139 @@ defmodule Kyber.Agent.T17DaemonIdentityTest do
 
     assert get_in(status, [:config, :fold, :model]) == view.model
     assert get_in(status, [:config, :fold, :soul]) == view.soul
+  end
+
+  # P5 round-11 MEDIUM-2: the fold is O(store) and the daemon's loop is
+  # serialized, so an unadmitted peer spamming AgentSet deltas at the
+  # federation surface used to buy a full-store walk per delta — a stall on
+  # legitimate work, for a delta that could never fold. Authorship decides
+  # inertness BEFORE the walk. The tracer pattern: the feed is FIFO, so an
+  # operator delta appended LAST and observed swapping proves every delta
+  # before it was already processed — the counter is then exact, no sleep.
+
+  test "an UNADMITTED author's AgentSet never costs a fold; the operator's still folds and swaps (P5 r11 M2 T1/T2)",
+       %{key_dir: key_dir} do
+    table = :ets.new(:t17_stub, [:public])
+    :ets.insert(table, {:mode, :ok})
+
+    append_set!(@operator_seed, @base_ts, %{model: "kimi-base", api_key_env: "T17_DI_KEY"})
+    boot!(key_dir, stub_llm(table, model: "kimi-base"), model: "kimi-base")
+
+    base = Daemon.status().folds_since_boot
+
+    append_set!(@intruder_seed, @base_ts + 10, %{model: "intruder-model", soul: "seized"})
+    append_set!(@operator_seed, @base_ts + 20, %{model: "kimi-tracer"})
+
+    assert eventually(fn -> live_model() == "kimi-tracer" end),
+           "the operator's tracer delta never swapped (status: #{inspect(Daemon.status())})"
+
+    status = Daemon.status()
+
+    # exactly ONE fold — the operator's. The intruder's delta was processed
+    # (FIFO ahead of the tracer) and cost no store walk at all
+    assert status.folds_since_boot == base + 1
+    assert get_in(status, [:config, :fold, :model]) == "kimi-tracer"
+    assert get_in(status, [:config, :fold, :soul]) == nil
+  end
+
+  test "a BURST of unadmitted deltas costs zero folds (P5 r11 M2 T4)", %{key_dir: key_dir} do
+    table = :ets.new(:t17_stub, [:public])
+    :ets.insert(table, {:mode, :ok})
+
+    append_set!(@operator_seed, @base_ts, %{model: "kimi-base", api_key_env: "T17_DI_KEY"})
+    boot!(key_dir, stub_llm(table, model: "kimi-base"), model: "kimi-base")
+
+    base = Daemon.status().folds_since_boot
+
+    for n <- 1..25, do: append_set!(@intruder_seed, @base_ts + n, %{model: "spam-#{n}"})
+    append_set!(@operator_seed, @base_ts + 100, %{model: "kimi-tracer"})
+
+    assert eventually(fn -> live_model() == "kimi-tracer" end)
+
+    assert Daemon.status().folds_since_boot == base + 1
+  end
+
+  test "a GRANTED agent's own delta still folds and swaps (P5 r11 M2 T3)", %{key_dir: key_dir} do
+    table = :ets.new(:t17_stub, [:public])
+    :ets.insert(table, {:mode, :ok})
+
+    append_set!(@operator_seed, @base_ts, %{
+      model: "kimi-base",
+      api_key_env: "T17_DI_KEY",
+      self_config: "true"
+    })
+
+    boot!(key_dir, stub_llm(table, model: "kimi-base"), model: "kimi-base")
+
+    base = Daemon.status().folds_since_boot
+    append_set!(@daemon_seed, @base_ts + 10, %{model: "kimi-self"})
+
+    assert eventually(fn -> live_model() == "kimi-self" end),
+           "the granted agent's own delta never folded (status: #{inspect(Daemon.status())})"
+
+    assert Daemon.status().folds_since_boot == base + 1
+  end
+
+  # P5 round-11 HIGH-1: the whole point of the finding — a two-token
+  # model-controlled tool call must not be able to kill the daemon.
+  test "a malformed self_config.set call is refused without killing the reactor (P5 r11 H1)", %{
+    key_dir: key_dir
+  } do
+    append_set!(@operator_seed, @base_ts, %{
+      model: "kimi-base",
+      api_key_env: "T17_DI_KEY",
+      self_config: "true"
+    })
+
+    {:ok, llm} =
+      LlmHandler.new(
+        seed: @daemon_seed,
+        api_key: @key_value,
+        model: "kimi-base",
+        http: {MalformedToolHttp, %{reply_to: self()}}
+      )
+
+    {:ok, daemon} =
+      Daemon.boot(
+        keyring_dir: key_dir,
+        tick_ms: :manual,
+        loop: :reactor,
+        oracle_seed: :present,
+        engine: [llm: llm],
+        agent: "wisp",
+        operator_seed: @operator_seed,
+        api_key: @key_value
+      )
+
+    reactor = Process.whereis(Kyber.Agent.Reactor)
+    ingest!(key_dir, 1)
+
+    # the model's malformed call is answered, not raised on: the turn
+    # RESUMES over a ToolResult
+    assert_receive {:t17_llm_body, _first}, 60_000
+    assert_receive {:t17_llm_body, second}, 60_000
+    assert Enum.any?(second["messages"], &(&1["role"] == "tool"))
+
+    # the reactor and the daemon it links are the same processes they were
+    assert Process.alive?(reactor)
+    assert Process.alive?(daemon)
+    assert Process.whereis(Kyber.Agent.Reactor) == reactor
+
+    # the refusal is legible and NOTHING was minted onto the config stream
+    tool_results =
+      for {_id, {claims, _sig}} <- DurableStore.set(),
+          %{type: "ToolResult"} = resolved <- [Schema.resolve(claims)],
+          do: resolved
+
+    assert Enum.any?(tool_results, &(&1.status == "error" and &1.result =~ "unset"))
+
+    agent_sets =
+      for {_id, {claims, _sig}} <- DurableStore.set(),
+          %{type: "AgentSet"} = resolved <- [Schema.resolve(claims)],
+          claims.author == Keys.author_for_seed(@daemon_seed),
+          do: resolved
+
+    assert agent_sets == []
   end
 
   test "GenServer state dumps redact the seeds and key material (P5 r3 MEDIUM-3)", %{

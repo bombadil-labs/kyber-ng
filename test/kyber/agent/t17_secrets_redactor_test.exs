@@ -217,6 +217,44 @@ defmodule Kyber.Agent.T17SecretsRedactorTest do
       assert :ok = Config.validate_fields(%{soul: "the id abcd1234 is fine"})
     end
 
+    # P5 round-11 MEDIUM-3: the substrate is content-addressed, so its OWN
+    # ids are hex — and the shape scan refused any soul or system_prompt
+    # that cited one. A content id has an exact house format
+    # (Rhizomatic.Hash.id_hex: the BLAKE3-256 multihash's lowercase hex
+    # spelling, `1e20` + 64 hex) and is public by construction; ONLY that
+    # shape is exempt.
+    @content_id Rhizomatic.Hash.id_hex("t17 round-11 content id")
+
+    test "a soul citing a real content id passes the door (P5 r11 M3 T1)" do
+      assert :ok =
+               Config.validate_fields(%{soul: "I remember the promise in delta #{@content_id}."})
+
+      assert :ok =
+               Config.validate_fields(%{
+                 system_prompt: "your soul was set by #{@content_id}; honour it"
+               })
+    end
+
+    test "the exemption is the HOUSE format only — a bare 64-hex seed is still refused (P5 r11 M3 T2)" do
+      # 64 hex with no multihash prefix is the SEED spelling — refused
+      assert {:error, {:secret_shaped, :soul, _}} =
+               Config.validate_fields(%{soul: "remember " <> String.duplicate("ab", 32)})
+
+      # uppercase is not the house spelling
+      assert {:error, {:secret_shaped, :soul, _}} =
+               Config.validate_fields(%{soul: "remember " <> String.upcase(@content_id)})
+
+      # a longer hex run that merely STARTS like an id is not an id
+      assert {:error, {:secret_shaped, :soul, _}} =
+               Config.validate_fields(%{soul: "remember " <> @content_id <> "deadbeef"})
+
+      # and a genuine provider key is refused beside a legitimate id
+      assert {:error, {:secret_shaped, :soul, _}} =
+               Config.validate_fields(%{
+                 soul: "delta #{@content_id} holds sk-live-abcdef1234567890"
+               })
+    end
+
     test "the fail-closed entropy scan refuses a long high-entropy token, passes prose (AC24)" do
       random = Base.encode64(:crypto.strong_rand_bytes(36))
 

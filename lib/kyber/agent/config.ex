@@ -27,12 +27,14 @@ defmodule Kyber.Agent.Config do
   pre-grant agent delta stays inert forever, and retracting the grant
   de-activates everything it admitted. The `@operator_only` fields
   (`base_url`, `operator_seed_env`, the key source, `channel_socket`,
-  `oracle_seed`, `profile`) fold ONLY when operator-attested, regardless
-  of the grant — a prompt-injected agent must not point the key at an
-  attacker proxy, redirect the operator seed to one it controls, name the
-  env var whose value ships in the auth header, aim the daemon's
+  `oracle_seed`, `profile`, `loop`) fold ONLY when operator-attested,
+  regardless of the grant — a prompt-injected agent must not point the key
+  at an attacker proxy, redirect the operator seed to one it controls, name
+  the env var whose value ships in the auth header, aim the daemon's
   pre-bind `File.rm` at its own store, open the oracle gate the operator
-  refused, or re-choose its own capability envelope. Negations are
+  refused, re-choose its own capability envelope, or switch off the engine
+  that runs it (the grantable set is `model`, `system_prompt`, `soul`,
+  `self_config`). Negations are
   author-filtered per target: an
   operator delta is negatable only by an operator-chain author; an agent
   delta by an operator-chain author or the agent's own author.
@@ -65,6 +67,11 @@ defmodule Kyber.Agent.Config do
   # inference gate) and profile (P5 round-10 MEDIUM-1: the profile IS the
   # capability envelope — tool registry, memory/skill visibility — so a
   # self-set is self-escalation)
+  # and `loop` (P5 round-11 MEDIUM-1: `loop` selects the EXECUTION ENGINE —
+  # an agent that folds `loop: ack` onto itself has no reactor left, so
+  # inference stops AND the rollback harness (which only ever fires on
+  # engine events) can never repair the config that killed it: a
+  # permanent, unrecoverable self-lobotomy under a live grant)
   @operator_only [
     :base_url,
     :operator_seed_env,
@@ -72,7 +79,8 @@ defmodule Kyber.Agent.Config do
     :api_key_enc,
     :channel_socket,
     :oracle_seed,
-    :profile
+    :profile,
+    :loop
   ]
 
   @type view :: %{
@@ -307,21 +315,33 @@ defmodule Kyber.Agent.Config do
   defp validate_field(:unset, _non_list),
     do: {:error, {:invalid_field, :unset, @unset_repair}}
 
-  defp validate_field(field, value) when field in @free_text_fields do
-    cond do
-      not is_binary(value) ->
-        {:error, {:invalid_field, field, "must be text"}}
+  # P5 round-11 MEDIUM-3: the substrate's OWN content ids are hex, so the
+  # shape scan refused legitimate prose that cites one ("see delta
+  # 1e20…"). A content id has a house format — the BLAKE3-256 multihash's
+  # lowercase hex spelling, `1e20` + 64 hex, exactly 68 chars
+  # (Rhizomatic.Hash.id_hex) — which is public, derivable, and never a
+  # secret. Masked out before the scan, so ONLY that exact shape is exempt:
+  # a bare 64-hex run is still refused (that is the SEED spelling), as is a
+  # longer or uppercase hex run.
+  @content_id ~r/\b1e20[0-9a-f]{64}\b/
 
-      Enum.any?(@free_text_shapes, &Regex.match?(&1, value)) ->
+  defp validate_field(field, value) when field in @free_text_fields and is_binary(value) do
+    scanned = Regex.replace(@content_id, value, "<content-id>")
+
+    cond do
+      Enum.any?(@free_text_shapes, &Regex.match?(&1, scanned)) ->
         {:error, {:secret_shaped, field, @repair}}
 
-      high_entropy_token?(value) ->
+      high_entropy_token?(scanned) ->
         {:error, {:secret_shaped, field, @repair}}
 
       true ->
         :ok
     end
   end
+
+  defp validate_field(field, _value) when field in @free_text_fields,
+    do: {:error, {:invalid_field, field, "must be text"}}
 
   defp validate_field(field, _value),
     do: {:error, {:invalid_field, field, "unknown or malformed"}}
