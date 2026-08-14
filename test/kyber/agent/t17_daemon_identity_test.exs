@@ -14,6 +14,8 @@ defmodule Kyber.Agent.T17DaemonIdentityTest do
   """
   use ExUnit.Case, async: false
 
+  import ExUnit.CaptureLog
+
   # engine round-trips under full-suite load exceed ExUnit's 60s default
   # (same pattern as t15b_engine_cast_test)
   @moduletag timeout: 300_000
@@ -720,6 +722,180 @@ defmodule Kyber.Agent.T17DaemonIdentityTest do
     assert get_in(Daemon.status(), [:config, :fold, :soul]) == "agent-souled"
     assert eventually(fn -> live_model() == "kimi-base" end)
     assert Daemon.status().rollbacks == 1
+  end
+
+  test "a fold-inert AgentSet never erases blame — the broken delta still rolls back (P5 r4 HIGH-1)",
+       %{key_dir: key_dir} do
+    table = :ets.new(:t17_stub, [:public])
+    :ets.insert(table, {:mode, :ok})
+
+    append_set!(@operator_seed, @base_ts, %{
+      model: "kimi-base",
+      api_key_env: "T17_DI_KEY",
+      self_config: "true"
+    })
+
+    boot!(key_dir, stub_llm(table, model: "kimi-base"),
+      model: "kimi-base",
+      test_pid: self(),
+      rollback_threshold: 2
+    )
+
+    # the agent breaks the model...
+    broken = append_set!(@daemon_seed, @base_ts + 10, %{model: "kimi-broken"})
+    assert eventually(fn -> live_model() == "kimi-broken" end)
+
+    # ...then a FOLD-INERT AgentSet lands (an unadmitted author's delta —
+    # not the operator, not the pinned agent author). Pre-fix it clobbered
+    # the armed model slot with its own non-live id AND reset the counter:
+    # every later failure blamed :none, silently, forever.
+    inert = append_set!(@agent_seed, @base_ts + 20, %{model: "kimi-hijack"})
+
+    :ets.insert(table, {:mode, {:fail, 401}})
+    ingest!(key_dir, 1)
+    assert_receive {:engine, {:llm_error, {:llm_http, 401, _body}}}, 60_000
+    ingest!(key_dir, 2)
+    assert_receive {:engine, {:llm_error, {:llm_http, 401, _body}}}, 60_000
+
+    # blame survived the inert delta: the LIVE broken setter is retracted
+    assert eventually(fn -> broken in retract_targets() end),
+           "the inert delta erased blame — the broken model was never retracted " <>
+             "(status: #{inspect(Daemon.status())})"
+
+    refute inert in retract_targets()
+    assert eventually(fn -> live_model() == "kimi-base" end)
+    assert Daemon.status().rollbacks == 1
+  end
+
+  test "a config-class failure with NO armed slot is loud and counted, never swallowed (P5 r4 HIGH-1)",
+       %{key_dir: key_dir} do
+    table = :ets.new(:t17_stub, [:public])
+    :ets.insert(table, {:mode, :ok})
+
+    # the broken config predates the boot: nothing ever arms the harness
+    append_set!(@operator_seed, @base_ts, %{model: "kimi-base", api_key_env: "T17_DI_KEY"})
+
+    boot!(key_dir, stub_llm(table, model: "kimi-base"),
+      model: "kimi-base",
+      test_pid: self(),
+      rollback_threshold: 2
+    )
+
+    log =
+      capture_log(fn ->
+        :ets.insert(table, {:mode, {:fail, 401}})
+        ingest!(key_dir, 1)
+        assert_receive {:engine, {:llm_error, {:llm_http, 401, _body}}}, 60_000
+
+        assert eventually(fn -> Daemon.status().failures == 1 end),
+               "the unarmed config-class failure was silently swallowed " <>
+                 "(status: #{inspect(Daemon.status())})"
+      end)
+
+    assert log =~ "no armed config delta"
+    # no-retraction semantics kept: nothing to retract, but LOUD
+    assert retract_targets() == []
+    assert Daemon.status().rollbacks == 0
+  end
+
+  test "re-applying the SAME broken value hits the counter immediately (P5 r4 HIGH-1)",
+       %{key_dir: key_dir} do
+    table = :ets.new(:t17_stub, [:public])
+    :ets.insert(table, {:mode, :ok})
+
+    append_set!(@operator_seed, @base_ts, %{
+      model: "kimi-base",
+      api_key_env: "T17_DI_KEY",
+      self_config: "true"
+    })
+
+    boot!(key_dir, stub_llm(table, model: "kimi-base"),
+      model: "kimi-base",
+      test_pid: self(),
+      rollback_threshold: 2
+    )
+
+    first = append_set!(@daemon_seed, @base_ts + 10, %{model: "kimi-broken"})
+    assert eventually(fn -> live_model() == "kimi-broken" end)
+
+    :ets.insert(table, {:mode, {:fail, 401}})
+    ingest!(key_dir, 1)
+    assert_receive {:engine, {:llm_error, {:llm_http, 401, _body}}}, 60_000
+    ingest!(key_dir, 2)
+    assert_receive {:engine, {:llm_error, {:llm_http, 401, _body}}}, 60_000
+
+    assert eventually(fn -> first in retract_targets() end)
+    assert eventually(fn -> live_model() == "kimi-base" end)
+    assert Daemon.status().rollbacks == 1
+
+    # the agent retries the SAME broken value — the re-arm must preserve
+    # the counter (pre-fix it reset to zero and the retry bought itself N
+    # fresh failures before the harness could act again)
+    retry = append_set!(@daemon_seed, @base_ts + 20, %{model: "kimi-broken"})
+    assert eventually(fn -> live_model() == "kimi-broken" end)
+
+    ingest!(key_dir, 3)
+    assert_receive {:engine, {:llm_error, {:llm_http, 401, _body}}}, 60_000
+
+    # ONE fresh failure suffices: the second rollback fires immediately
+    assert eventually(fn -> retry in retract_targets() end),
+           "the retry restarted the counter — no second rollback " <>
+             "(status: #{inspect(Daemon.status())})"
+
+    assert eventually(fn -> live_model() == "kimi-base" end)
+    assert Daemon.status().rollbacks == 2
+  end
+
+  test "boot without the operator seed is LOUD: harness :dead, failures narrated, no crash (P5 r4 M2)",
+       %{key_dir: key_dir} do
+    table = :ets.new(:t17_stub, [:public])
+    :ets.insert(table, {:mode, :ok})
+
+    append_set!(@operator_seed, @base_ts, %{
+      model: "kimi-base",
+      api_key_env: "T17_DI_KEY",
+      operator_seed_env: "T17_DI_OP"
+    })
+
+    boot_log =
+      capture_log(fn ->
+        {:ok, _pid} =
+          Daemon.boot(
+            keyring_dir: key_dir,
+            tick_ms: :manual,
+            loop: :reactor,
+            oracle_seed: :present,
+            engine: [llm: stub_llm(table, model: "kimi-base")],
+            agent: "wisp",
+            api_key: @key_value,
+            model: "kimi-base",
+            test_pid: self(),
+            rollback_threshold: 1
+          )
+      end)
+
+    # the dead harness is announced at BOOT, naming the env var to set
+    assert boot_log =~ "harness is DEAD"
+    assert boot_log =~ "T17_DI_OP"
+    assert Daemon.status().harness == :dead
+
+    daemon = Process.whereis(Kyber.Daemon)
+
+    failure_log =
+      capture_log(fn ->
+        :ets.insert(table, {:mode, {:fail, 401}})
+        ingest!(key_dir, 1)
+        assert_receive {:engine, {:llm_error, {:llm_http, 401, _body}}}, 60_000
+
+        assert eventually(fn -> Daemon.status().failures == 1 end),
+               "the seedless config-class failure was silently swallowed"
+      end)
+
+    # the failure narrates the cannot-roll-back state and never raises
+    assert failure_log =~ "cannot roll back"
+    assert Process.alive?(daemon)
+    assert retract_targets() == []
+    assert Daemon.status().rollbacks == 0
   end
 
   test "GenServer state dumps redact the seeds and key material (P5 r3 MEDIUM-3)", %{

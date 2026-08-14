@@ -157,6 +157,44 @@ defmodule Kyber.Agent.T17SecretsRedactorTest do
                Config.validate_fields(%{api_key_enc: smuggled})
     end
 
+    test "api_key_enc refuses a decode too short to be AEAD output (P5 r4 M1)" do
+      # nonce(12) + tag(16) + at least 1 ciphertext byte = 29 bytes minimum;
+      # a 1-byte decode ("a") can never be our ciphertext
+      refute Secrets.well_formed?(Base.encode64("a"))
+      refute Secrets.well_formed?(Base.encode64(:binary.copy(<<0>>, 28)))
+      assert Secrets.well_formed?(:binary.copy(<<0>>, 29) |> Base.encode64())
+
+      assert {:error, {:invalid_field, :api_key_enc, _}} =
+               Config.validate_fields(%{api_key_enc: Base.encode64("a")})
+    end
+
+    test "EVERY free-text field is shape-scanned — profile and friends (P5 r4 M1)" do
+      key = "sk-live-abcdef1234567890"
+
+      assert {:error, {:secret_shaped, :profile, _}} =
+               Config.validate_fields(%{profile: "summarizer #{key}"})
+
+      assert {:error, {:secret_shaped, :model, _}} =
+               Config.validate_fields(%{model: key})
+
+      assert {:error, {:secret_shaped, :base_url, _}} =
+               Config.validate_fields(%{
+                 base_url: "https://proxy.evil/v1?key=abcdef1234567890abcdef"
+               })
+
+      assert {:error, {:secret_shaped, :channel_socket, _}} =
+               Config.validate_fields(%{channel_socket: "/tmp/#{key}.sock"})
+
+      # ...and the legitimate values still ride
+      assert :ok =
+               Config.validate_fields(%{
+                 model: "deepseek-v4-flash",
+                 base_url: "https://api.deepseek.com/v1",
+                 channel_socket: "default",
+                 profile: "channel-summarizer"
+               })
+    end
+
     test "operator_seed_env is env-name-only — a 64-hex seed VALUE is refused (AC21)" do
       assert {:error, {:invalid_field, :operator_seed_env, _}} =
                Config.validate_fields(%{operator_seed_env: String.duplicate("ab", 32)})

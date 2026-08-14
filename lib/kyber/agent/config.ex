@@ -185,8 +185,15 @@ defmodule Kyber.Agent.Config do
   @spec repair() :: String.t()
   def repair, do: @repair
 
-  # the free-text shape scan (AC17): obvious secret shapes in soul /
-  # system_prompt — sk-/api_ prefixes, >=32-char base64/hex runs, KEY= pairs
+  # P5 round-4 MEDIUM-1: the shape scan covers EVERY schema-admitted string
+  # field that lacks a stricter validator — derived from @fields, so a
+  # future field cannot silently escape the door into the append-only,
+  # federating store. `unset` is a field-name list, not a value carrier.
+  @strictly_validated ~w(api_key_env api_key_enc operator_seed_env oracle_seed loop self_config)a
+  @free_text_fields @fields -- @strictly_validated
+
+  # the free-text shape scan (AC17): obvious secret shapes in any free-text
+  # field — sk-/api_ prefixes, >=32-char base64/hex runs, KEY= pairs
   @free_text_shapes [
     ~r/\bsk-[A-Za-z0-9_-]{8,}/,
     ~r/\bapi_[A-Za-z0-9]{8,}/,
@@ -203,9 +210,11 @@ defmodule Kyber.Agent.Config do
   delta is built — the same validation on `agent new`/`set`, channel
   `set-config`, the self-config tool, and `--from` imports. Secret fields
   are env NAMES (`#{inspect(@env_name.source)}`) or well-formed ciphertext;
-  a plaintext key is refused with the repair message. Free-text fields
-  (soul, system_prompt) get the shape-scan plus the fail-closed
-  high-entropy scan — the store never contains a plaintext key value.
+  a plaintext key is refused with the repair message. EVERY free-text
+  field (any string field without a stricter validator — soul,
+  system_prompt, model, base_url, channel_socket, profile) gets the
+  shape-scan plus the fail-closed high-entropy scan — the store never
+  contains a plaintext key value.
   """
   @spec validate_fields(map()) :: :ok | {:error, term()}
   def validate_fields(fields) when is_map(fields) do
@@ -234,22 +243,6 @@ defmodule Kyber.Agent.Config do
     end
   end
 
-  defp validate_field(field, value) when field in [:soul, :system_prompt] do
-    cond do
-      not is_binary(value) ->
-        {:error, {:invalid_field, field, "must be text"}}
-
-      Enum.any?(@free_text_shapes, &Regex.match?(&1, value)) ->
-        {:error, {:secret_shaped, field, @repair}}
-
-      high_entropy_token?(value) ->
-        {:error, {:secret_shaped, field, @repair}}
-
-      true ->
-        :ok
-    end
-  end
-
   defp validate_field(:loop, value) when value in ["reactor", "ack"], do: :ok
   defp validate_field(:loop, _), do: {:error, {:invalid_field, :loop, "one of: reactor, ack"}}
 
@@ -270,9 +263,21 @@ defmodule Kyber.Agent.Config do
     end
   end
 
-  defp validate_field(field, value)
-       when field in [:model, :base_url, :channel_socket, :profile] and is_binary(value),
-       do: :ok
+  defp validate_field(field, value) when field in @free_text_fields do
+    cond do
+      not is_binary(value) ->
+        {:error, {:invalid_field, field, "must be text"}}
+
+      Enum.any?(@free_text_shapes, &Regex.match?(&1, value)) ->
+        {:error, {:secret_shaped, field, @repair}}
+
+      high_entropy_token?(value) ->
+        {:error, {:secret_shaped, field, @repair}}
+
+      true ->
+        :ok
+    end
+  end
 
   defp validate_field(field, _value),
     do: {:error, {:invalid_field, field, "unknown or malformed"}}

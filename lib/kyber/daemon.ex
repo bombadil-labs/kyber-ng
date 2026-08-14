@@ -1027,6 +1027,7 @@ defmodule Kyber.Daemon do
           boot_api_key: Keyword.get(opts, :api_key),
           armed: %{},
           failures: 0,
+          broken: %{},
           rollbacks: 0,
           # AC22: known secret VALUES the wire must never carry — the boot
           # api key and the operator seed itself (M1: the seed leaked through
@@ -1038,6 +1039,34 @@ defmodule Kyber.Daemon do
             )
         })
         |> mint_soul()
+        |> warn_if_harness_dead()
+    end
+  end
+
+  # P5 round-4 MEDIUM-2: an agent boot WITHOUT the operator seed still runs
+  # (refuse-only agents legitimately do) — but the safety harness is dead
+  # on arrival, and that must be LOUD at boot, not discovered after the
+  # first config failure. `Daemon.status()` carries it as `harness: :dead`.
+  defp warn_if_harness_dead(%{operator_seed: nil} = state) do
+    message =
+      "agent #{state.agent} booted WITHOUT an operator seed — the safety " <>
+        "harness is DEAD: config-class failures will NOT be rolled back " <>
+        "(#{seed_env_hint(state)})"
+
+    Logger.warning("kyber: " <> message)
+    narrate(state, message)
+    state
+  end
+
+  defp warn_if_harness_dead(state), do: state
+
+  defp seed_env_hint(state) do
+    case state.fold_view do
+      %{operator_seed_env: env} when is_binary(env) ->
+        "set the #{env} env var and re-open to arm it"
+
+      _no_fold_env ->
+        "set the agent's operator_seed_env field and its env var, then re-open to arm it"
     end
   end
 
@@ -1092,16 +1121,41 @@ defmodule Kyber.Daemon do
   # the model slot, a later `soul` delta updates the soul slot — a benign
   # delta never absorbs the blame for a broken one. The per-slot source
   # (operator vs agent author) decides rollback-vs-detection per field.
+  #
+  # P5 round-4 HIGH-1: only fields the delta ACTUALLY HOLDS LIVE (its id is
+  # the re-fold's head for the field) arm — a fold-inert delta (unadmitted
+  # author, lost merge, agent-set operator-only field) leaves the harness
+  # EXACTLY as it was: it must never clobber the armed slot pointing at the
+  # live broken setter nor reset the counter. And a re-arm that re-asserts
+  # a value a rollback already blamed (`broken`) PRESERVES the counter —
+  # the retry of the same broken delta hits the threshold immediately
+  # instead of restarting from zero.
   defp agent_config_changed(state, id, claims, resolved) do
-    source = if operator_authored?(state, claims.author), do: :operator, else: :agent
+    view = agent_fold(state.agent, state.operator_authors, state.author)
 
-    armed =
+    live_fields =
       resolved
       |> agent_delta_fields()
-      |> Enum.reduce(state.armed, &Map.put(&2, &1, %{id: id, source: source}))
+      |> Enum.filter(fn field -> view != nil and view.heads[field] == id end)
 
-    state = %{state | armed: armed, failures: 0}
-    agent_hot_swap(state)
+    if live_fields == [] do
+      %{state | fold_view: view}
+    else
+      source = if operator_authored?(state, claims.author), do: :operator, else: :agent
+
+      armed =
+        Enum.reduce(live_fields, state.armed, &Map.put(&2, &1, %{id: id, source: source}))
+
+      failures = if retry_of_broken?(state, resolved, live_fields), do: state.failures, else: 0
+      agent_hot_swap(%{state | armed: armed, failures: failures})
+    end
+  end
+
+  defp retry_of_broken?(state, resolved, live_fields) do
+    Enum.any?(live_fields, fn field ->
+      value = Map.get(resolved, field)
+      value != nil and Map.get(state.broken, field) == value
+    end)
   end
 
   # membership in the PINNED chain — never a store-derived comparison
@@ -1198,9 +1252,10 @@ defmodule Kyber.Daemon do
   end
 
   # a clean inference DISARMS: every armed slot has proven itself — a later
-  # failure must blame the deltas that landed after it, not these
+  # failure must blame the deltas that landed after it, not these (and the
+  # rolled-back-value memory clears: the config proved itself working)
   defp agent_engine_event({:answered, _request_id}, state),
-    do: %{state | failures: 0, armed: %{}}
+    do: %{state | failures: 0, armed: %{}, broken: %{}}
 
   defp agent_engine_event(_event, state), do: state
 
@@ -1214,8 +1269,18 @@ defmodule Kyber.Daemon do
   defp config_class?({:decrypt_failed, _agent}), do: true
   defp config_class?(_reason), do: false
 
-  # no operator seed => the harness cannot sign a retraction: detection only
-  defp agent_failure(%{operator_seed: nil} = state, _reason), do: state
+  # no operator seed => the harness cannot sign a retraction — but NEVER
+  # silently (P5 round-4 MEDIUM-2): the failure counts and the operator is
+  # told the harness is dead, loudly, on every config-class failure
+  defp agent_failure(%{operator_seed: nil} = state, reason) do
+    message =
+      "config-class failure (#{inspect(reason)}) — cannot roll back: " <>
+        "operator seed unset, the safety harness is DEAD (#{seed_env_hint(state)})"
+
+    Logger.warning("kyber: " <> message)
+    narrate(state, message)
+    %{state | failures: state.failures + 1}
+  end
 
   # blame is PER FIELD (P5 round-3 M1): the failing reason maps to the
   # config fields it can implicate; only armed AGENT-sourced slots for
@@ -1243,7 +1308,16 @@ defmodule Kyber.Daemon do
         state
 
       :none ->
-        state
+        # P5 round-4 HIGH-1: a config-class failure with NO armed slot is
+        # never silent — nothing to retract, but the counter moves and the
+        # operator hears it (a broken config without an armed delta is LOUD)
+        message =
+          "config-class failure (#{inspect(reason)}) with no armed config delta — " <>
+            "nothing to auto-retract; inspect the live config (kyber ctl status)"
+
+        Logger.warning("kyber: " <> message)
+        narrate(state, message)
+        %{state | failures: state.failures + 1}
     end
   end
 
@@ -1313,13 +1387,44 @@ defmodule Kyber.Daemon do
         "restored #{Enum.join(restored, ", ")}"
     )
 
+    # P5 round-4 HIGH-1: remember the VALUE each blamed field failed with —
+    # a later re-arm re-asserting it preserves the counter (retry floor) —
+    # and the counter itself survives the rollback: only a clean inference
+    # or a genuinely NEW value resets it, never the rollback that proved
+    # the config broken.
+    broken =
+      Enum.reduce(blamed_fields, state.broken, fn field, acc ->
+        Map.put(acc, field, fold_value(state.fold_view, field))
+      end)
+
     %{
       state
       | armed: Map.drop(state.armed, blamed_fields),
-        failures: 0,
+        broken: broken,
         rollbacks: state.rollbacks + 1
     }
   end
+
+  # the fold's per-field value under the delta-field naming (the api_key
+  # union rides the view as a tagged tuple)
+  defp fold_value(nil, _field), do: nil
+
+  defp fold_value(view, :api_key_env) do
+    case view.api_key do
+      {:env, name} -> name
+      _other -> nil
+    end
+  end
+
+  defp fold_value(view, :api_key_enc) do
+    case view.api_key do
+      {:enc, ciphertext} -> ciphertext
+      _other -> nil
+    end
+  end
+
+  defp fold_value(view, :self_config), do: if(view.self_config, do: "true", else: "false")
+  defp fold_value(view, field), do: Map.get(view, field)
 
   defp fold_summary(nil), do: nil
   defp fold_summary(view), do: Map.take(view, [:model, :base_url, :soul, :self_config])
@@ -1423,6 +1528,10 @@ defmodule Kyber.Daemon do
     |> Map.merge(%{
       agent: agent,
       rollbacks: state.rollbacks,
+      failures: state.failures,
+      # P5 round-4 MEDIUM-2: the harness is operator-seed-gated (D5) — a
+      # seedless boot cannot roll back and says so, in status, from boot
+      harness: if(is_binary(state.operator_seed), do: :armed, else: :dead),
       config: %{fold: fold_summary(state.fold_view), live: state.live}
     })
   end
