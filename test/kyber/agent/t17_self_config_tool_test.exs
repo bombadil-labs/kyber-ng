@@ -211,6 +211,43 @@ defmodule Kyber.Agent.T17SelfConfigToolTest do
     assert result_status(outputs) == "error"
   end
 
+  # P5 round-10: channel_socket (CRITICAL-1 — the daemon File.rm's the
+  # path before bind, so an agent-chosen path deletes an arbitrary file at
+  # the next boot), oracle_seed (HIGH-1 — the operator's inference gate,
+  # which the daemon's hot path OPENS when the fold says "present") and
+  # profile (MEDIUM-1 — the capability envelope) joined the boundary.
+  for {field, value} <- [
+        {"channel_socket", "/tmp/kyber-victim-store.jsonl"},
+        {"oracle_seed", "present"},
+        {"profile", "wide-open"}
+      ] do
+    test "#{field} can NEVER be set by the agent (P5 r10) — even under the grant" do
+      outputs =
+        call!(granted_set(), JSON.encode!(%{"fields" => %{unquote(field) => unquote(value)}}))
+
+      assert agent_sets(outputs) == []
+      assert result_status(outputs) == "error"
+      assert result_text(outputs) =~ "operator"
+    end
+
+    test "#{field} can NEVER be unset by the agent (P5 r10)" do
+      outputs = call!(granted_set(), JSON.encode!(%{"fields" => %{"unset" => [unquote(field)]}}))
+
+      assert agent_sets(outputs) == []
+      assert result_status(outputs) == "error"
+      assert result_text(outputs) =~ "operator"
+    end
+  end
+
+  test "the tool listing NAMES every operator-only field (the model is told, not surprised)" do
+    %{"self_config.set" => %{description: description}} = ToolExecutor.self_config_tools("wisp")
+
+    for field <-
+          ~w(base_url operator_seed_env api_key_env api_key_enc channel_socket oracle_seed profile) do
+      assert description =~ field
+    end
+  end
+
   test "the AC17 door runs at the tool boundary: secret-shaped value refused, NO delta" do
     outputs =
       call!(

@@ -146,24 +146,48 @@ defmodule Kyber.TUITest do
     assert Kyber.CLI.TUI.render_line(sent_line("hello back", 1_754_600_000_001)) == "< hello back"
 
     {:ok, refusal} =
-      Kyber.Agent.Events.gate_decision(@operator_seed, 1_754_600_000_002, "call-1", "refuse", "budget")
+      Kyber.Agent.Events.gate_decision(
+        @operator_seed,
+        1_754_600_000_002,
+        "call-1",
+        "refuse",
+        "budget"
+      )
 
     assert Kyber.CLI.TUI.render_line(JSON.encode!(Wire.envelope(refusal))) == "! refused:budget"
 
     {:ok, allow} =
-      Kyber.Agent.Events.gate_decision(@operator_seed, 1_754_600_000_003, "call-2", "allow", "budget")
+      Kyber.Agent.Events.gate_decision(
+        @operator_seed,
+        1_754_600_000_003,
+        "call-2",
+        "allow",
+        "budget"
+      )
 
     # an ALLOW decision is not a refusal — not in the grammar → nil (SKIP)
     assert Kyber.CLI.TUI.render_line(JSON.encode!(Wire.envelope(allow))) == nil
 
     {:ok, tool} =
-      Kyber.Agent.Events.tool_call(@operator_seed, 1_754_600_000_004, "fs:read", ~s({"path":"/x"}), "req-1")
+      Kyber.Agent.Events.tool_call(
+        @operator_seed,
+        1_754_600_000_004,
+        "fs:read",
+        ~s({"path":"/x"}),
+        "req-1"
+      )
 
     assert Kyber.CLI.TUI.render_line(JSON.encode!(Wire.envelope(tool))) ==
              "~ fs:read {\"path\":\"/x\"}"
 
     {:ok, call} =
-      Kyber.Agent.Events.tool_result(@operator_seed, 1_754_600_000_005, "call-1", "the result", "ok")
+      Kyber.Agent.Events.tool_result(
+        @operator_seed,
+        1_754_600_000_005,
+        "call-1",
+        "the result",
+        "ok"
+      )
 
     assert Kyber.CLI.TUI.render_line(JSON.encode!(Wire.envelope(call))) == "= the result"
 
@@ -305,7 +329,9 @@ defmodule Kyber.TUITest do
     sock = ctx.log_path <> ".sock"
 
     # a raw persistent tail connection
-    {:ok, socket} = :gen_tcp.connect({:local, sock}, 0, [:binary, packet: :raw, active: false], 5_000)
+    {:ok, socket} =
+      :gen_tcp.connect({:local, sock}, 0, [:binary, packet: :raw, active: false], 5_000)
+
     assert {:ok, "{\"ok\":true}"} = raw_request(socket, ~s({"verb":"tail"}))
 
     # a new line lands on the log (via the daemon's own admission point)
@@ -327,11 +353,13 @@ defmodule Kyber.TUITest do
     # SERVER arm: a >64KB send request written in ~70-byte fragments — the
     # server's recv-accumulate reconstructs the line and answers
     big = String.duplicate("z", 70_000)
-    {:ok, socket} = :gen_tcp.connect({:local, sock}, 0, [:binary, packet: :raw, active: false], 5_000)
+
+    {:ok, socket} =
+      :gen_tcp.connect({:local, sock}, 0, [:binary, packet: :raw, active: false], 5_000)
 
     payload = JSON.encode!(%{"verb" => "send", "content" => big}) <> "\n"
 
-    for i <- 0..(div(byte_size(payload), 70)) do
+    for i <- 0..div(byte_size(payload), 70) do
       start = i * 70
       chunk = binary_part(payload, start, min(70, byte_size(payload) - start))
       :ok = :gen_tcp.send(socket, chunk)
@@ -360,15 +388,19 @@ defmodule Kyber.TUITest do
     fake_sock = Path.join(fake_dir, "fake.sock")
     on_exit(fn -> File.rm_rf(fake_dir) end)
 
-    {:ok, listen} = :gen_tcp.listen(0, [:binary, {:ifaddr, {:local, fake_sock}}, packet: :raw, active: false])
+    {:ok, listen} =
+      :gen_tcp.listen(0, [:binary, {:ifaddr, {:local, fake_sock}}, packet: :raw, active: false])
+
     on_exit(fn -> :gen_tcp.close(listen) end)
 
     spawn(fn ->
       {:ok, client} = :gen_tcp.accept(listen)
       {:ok, _request} = :gen_tcp.recv(client, 0, 5_000)
-      big_response = JSON.encode!(%{"ok" => true, "blob" => String.duplicate("w", 70_000)}) <> "\n"
 
-      for i <- 0..(div(byte_size(big_response), 100)) do
+      big_response =
+        JSON.encode!(%{"ok" => true, "blob" => String.duplicate("w", 70_000)}) <> "\n"
+
+      for i <- 0..div(byte_size(big_response), 100) do
         start = i * 100
         chunk = binary_part(big_response, start, min(100, byte_size(big_response) - start))
         :ok = :gen_tcp.send(client, chunk)
@@ -377,7 +409,9 @@ defmodule Kyber.TUITest do
       :gen_tcp.close(client)
     end)
 
-    assert {:ok, %{"ok" => true, "blob" => blob}} = Kyber.CLI.TUI.request(fake_sock, %{"verb" => "status"})
+    assert {:ok, %{"ok" => true, "blob" => blob}} =
+             Kyber.CLI.TUI.request(fake_sock, %{"verb" => "status"})
+
     assert byte_size(blob) == 70_000
   end
 
@@ -391,9 +425,18 @@ defmodule Kyber.TUITest do
     refute File.exists?(sock)
     refute File.exists?(ctx.log_path <> ".lock")
 
-    # a kill -9 leaves the file behind: simulate the stale sock, then boot —
+    # a kill -9 leaves the SOCKET INODE behind: bind one and drop it without
+    # unlinking — the faithful residue (P5 r10 C1 made the reclaim
+    # socket-only, so a hand-written regular file is no longer a valid
+    # stand-in: the daemon refuses to rm one, by design)
+    {:ok, stale} =
+      :gen_tcp.listen(0, [:binary, {:ifaddr, {:local, sock}}, packet: :raw, active: false])
+
+    :gen_tcp.close(stale)
+    assert File.exists?(sock)
+    refute File.stat!(sock).type == :regular
+
     # the daemon rm's it under the held lock before bind (H2)
-    File.write!(sock, "stale")
     boot_daemon!(ctx, operator_seed: @operator_seed)
     assert {:ok, %{"ok" => true}} = Kyber.CLI.TUI.request(sock, %{"verb" => "status"})
   end

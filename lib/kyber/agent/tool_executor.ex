@@ -44,6 +44,24 @@ defmodule Kyber.Agent.ToolExecutor do
   alias Kyber.Agent.{Action, Config, Events, Memory, Policy, Profile, Skill, Tools}
   alias Kyber.Agent.Action.Gate
 
+  # the fold-level twin lives in Config.apply_fields (@operator_only) — a
+  # hand-appended agent delta naming these fields is fold-inert even when
+  # this boundary is bypassed. The key source is here too (P5 round-8
+  # HIGH-1): an agent-named api_key_env would exfiltrate any daemon-readable
+  # env var to the provider via the Authorization header. So are the three
+  # P5 round-10 fields: channel_socket (the daemon File.rm's the path
+  # before bind — a file-deletion primitive), oracle_seed (the operator's
+  # inference gate) and profile (the capability envelope).
+  @operator_attested [
+    :base_url,
+    :operator_seed_env,
+    :api_key_env,
+    :api_key_enc,
+    :channel_socket,
+    :oracle_seed,
+    :profile
+  ]
+
   @doc "The stub registry: `tool:echo` answers its args."
   @spec stub_tools() :: %{String.t() => (String.t() -> String.t())}
   def stub_tools, do: %{"tool:echo" => fn args -> args end}
@@ -186,8 +204,8 @@ defmodule Kyber.Agent.ToolExecutor do
   The self-config tool listing (T17 AC5/AC9): `self_config.set` for
   `tool_specs`/`tool_key_map` ONLY — the write itself lives in the
   dedicated `write_and_run` clause, where the grant (`self_config: true`
-  on the live fold), the base_url refusal (P0 — set AND unset), and the
-  AC17 door all run BEFORE any mint. The agent name rides in the handler
+  on the live fold), the `@operator_attested` refusal (set AND unset), and
+  the AC17 door all run BEFORE any mint. The agent name rides in the handler
   `:context` (`%{agent: name}`), not in the listing.
   """
   @spec self_config_tools(String.t()) :: %{String.t() => map()}
@@ -197,7 +215,8 @@ defmodule Kyber.Agent.ToolExecutor do
         description:
           "Update your own agent configuration (#{agent}). fields is an object over " <>
             "#{Enum.join(Enum.map(Config.fields(), &Atom.to_string/1), ", ")} plus an " <>
-            "optional \"unset\" list of field names. base_url is operator-only. " <>
+            "optional \"unset\" list of field names. These are operator-only: " <>
+            "#{Enum.map_join(@operator_attested, ", ", &Atom.to_string/1)}. " <>
             "Secret fields take env NAMES, never key values.",
         parameters: %{
           "type" => "object",
@@ -581,10 +600,9 @@ defmodule Kyber.Agent.ToolExecutor do
   end
 
   # T17 AC5/AC9 — the agent's own (opt-in) write path onto its AgentSet
-  # stream. The boundary contract, in order: base_url AND operator_seed_env
-  # are refused ALWAYS (set AND unset — the proxy-exfiltration P0 and the
-  # P5 HIGH-3 harness-disarm twin, checked before the grant so the refusal
-  # names the operator regardless); the grant (`self_config: true` on the
+  # stream. The boundary contract, in order: the @operator_attested fields
+  # are refused ALWAYS (set AND unset, checked before the grant so the
+  # refusal names the operator regardless); the grant (`self_config: true` on the
   # LIVE fold) is checked at call time, not boot time; the AC17 door
   # (Config.validate_fields — secret shapes, unknown fields) runs before
   # any mint. A refusal mints NO delta. The mint claims the CALL's
@@ -637,13 +655,6 @@ defmodule Kyber.Agent.ToolExecutor do
         end
     end)
   end
-
-  # the fold-level twin lives in Config.apply_fields (@operator_only) — a
-  # hand-appended agent delta naming these fields is fold-inert even when
-  # this boundary is bypassed. The key source is here too (P5 round-8
-  # HIGH-1): an agent-named api_key_env would exfiltrate any daemon-readable
-  # env var to the provider via the Authorization header.
-  @operator_attested [:base_url, :operator_seed_env, :api_key_env, :api_key_enc]
 
   defp refuse_operator_attested(fields) do
     unset = Map.get(fields, :unset, [])

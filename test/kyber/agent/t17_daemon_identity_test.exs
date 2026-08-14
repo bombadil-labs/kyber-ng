@@ -36,11 +36,13 @@ defmodule Kyber.Agent.T17DaemonIdentityTest do
   defmodule StubHttp do
     @behaviour Kyber.Agent.HttpClient
     @impl true
-    def post(_url, headers, body, %{reply_to: pid, table: table}) do
+    def post(url, headers, body, %{reply_to: pid, table: table}) do
       # P5 r8 H1: the wire proof needs the OUTBOUND Authorization header —
-      # the one surface the Redactor never touches
+      # the one surface the Redactor never touches. P5 r10 M2: and the
+      # request ORIGIN, the other half of "where did the key go".
       {_name, auth} = List.keyfind(headers, ~c"authorization", 0)
       send(pid, {:t17_llm_auth, List.to_string(auth)})
+      send(pid, {:t17_llm_url, to_string(url)})
       send(pid, {:t17_llm_body, JSON.decode!(body)})
 
       case :ets.lookup(table, :mode) do
@@ -638,6 +640,114 @@ defmodule Kyber.Agent.T17DaemonIdentityTest do
     ingest!(key_dir, 1)
     assert_receive {:t17_llm_auth, auth}, 60_000
     assert auth == "Bearer " <> @key_value
+  end
+
+  # P5 round-10 MEDIUM-2: `model` is the one grantable field that touches
+  # provider identity. The invariant: changing the model can never change
+  # the request ORIGIN — the origin is `base_url`, and `base_url` is
+  # operator-attested. An operator deployment holding a key for origin X
+  # must never have that key sent to origin Y because the agent asked for a
+  # model that "belongs" to another provider. (Audit: no model→base_url
+  # derivation exists anywhere — LlmHandler.chat/3 posts to
+  # `handler.base_url <> "/chat/completions"`, and `base_url` comes only
+  # from the fold or the `@base_url` default. These tests pin that.)
+  test "an agent model change never moves the request ORIGIN off the operator's base_url (P5 r10 M2)",
+       %{key_dir: key_dir} do
+    table = :ets.new(:t17_stub, [:public])
+    :ets.insert(table, {:mode, :ok})
+
+    origin = "https://moonshot.operator.example/v1"
+
+    append_set!(@operator_seed, @base_ts, %{
+      model: "kimi-base",
+      base_url: origin,
+      api_key_env: "T17_DI_KEY",
+      self_config: "true"
+    })
+
+    boot!(key_dir, stub_llm(table, model: "kimi-base", base_url: origin),
+      model: "kimi-base",
+      rollback_threshold: 1
+    )
+
+    # the granted agent switches to a model that LOOKS like another
+    # provider's — the only provider-adjacent lever it holds
+    append_set!(@daemon_seed, @base_ts + 10, %{model: "deepseek-v4-flash"})
+    assert eventually(fn -> live_model() == "deepseek-v4-flash" end)
+
+    ingest!(key_dir, 1)
+
+    # the model moved; the ORIGIN and the key did not
+    assert_receive {:t17_llm_url, url}, 60_000
+    assert url == origin <> "/chat/completions"
+    assert_receive {:t17_llm_auth, auth}, 60_000
+    assert auth == "Bearer " <> @key_value
+    assert get_in(Daemon.status(), [:config, :live, :base_url]) == origin
+  end
+
+  test "with no base_url in the fold, a model change still lands on the pinned default (P5 r10 M2)",
+       %{key_dir: key_dir} do
+    table = :ets.new(:t17_stub, [:public])
+    :ets.insert(table, {:mode, :ok})
+
+    # NO base_url anywhere: the terminal step-back state is the engine's
+    # own default, never a model-derived one
+    append_set!(@operator_seed, @base_ts, %{
+      model: "kimi-base",
+      api_key_env: "T17_DI_KEY",
+      self_config: "true"
+    })
+
+    boot!(key_dir, stub_llm(table, model: "kimi-base"), model: "kimi-base")
+
+    append_set!(@daemon_seed, @base_ts + 10, %{model: "some-other-providers-model"})
+    assert eventually(fn -> live_model() == "some-other-providers-model" end)
+
+    ingest!(key_dir, 1)
+
+    assert_receive {:t17_llm_url, url}, 60_000
+    assert url == "https://api.deepseek.com/v1/chat/completions"
+    assert_receive {:t17_llm_auth, auth}, 60_000
+    assert auth == "Bearer " <> @key_value
+  end
+
+  # P5 round-10 CRITICAL-1, defense in depth: the pre-bind `File.rm` may
+  # only ever clear a stale SOCKET. The operator-only fold admission keeps
+  # an agent from naming the path at all; this keeps an operator typo (or
+  # any path that is a regular file) from deleting a store.
+  test "a channel_socket aimed at a REGULAR FILE refuses the boot — the file survives (P5 r10 C1)",
+       %{key_dir: key_dir, log_dir: log_dir} do
+    victim = Path.join(log_dir, "victim-store.jsonl")
+    File.write!(victim, "the append-only store\n")
+
+    assert {:error, {:channel_socket, {:not_a_socket, ^victim}}} =
+             Daemon.boot(
+               keyring_dir: key_dir,
+               tick_ms: :manual,
+               loop: :ack,
+               channel_socket: victim
+             )
+
+    assert File.read!(victim) == "the append-only store\n"
+  end
+
+  test "the :default channel socket still boots and clears only <log>.sock (P5 r10 C1 regression)",
+       %{key_dir: key_dir, log_path: log_path, log_dir: log_dir} do
+    bystander = Path.join(log_dir, "bystander.jsonl")
+    File.write!(bystander, "untouched\n")
+
+    assert {:ok, _pid} =
+             Daemon.boot(
+               keyring_dir: key_dir,
+               tick_ms: :manual,
+               loop: :ack,
+               channel_socket: :default
+             )
+
+    socket_path = log_path <> ".sock"
+    assert File.exists?(socket_path)
+    refute File.stat!(socket_path).type == :regular
+    assert File.read!(bystander) == "untouched\n"
   end
 
   test "the operator seed is redacted from the wire even when leaked into content (P5 M1)",

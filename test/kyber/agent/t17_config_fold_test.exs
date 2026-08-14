@@ -389,6 +389,114 @@ defmodule Kyber.Agent.T17ConfigFoldTest do
       assert view.api_key == {:env, "DEEPSEEK_API_KEY"}
     end
 
+    # P5 round-10: the operator-only set grew by three. channel_socket
+    # (CRITICAL-1) is a file-DELETION primitive — the daemon File.rm's the
+    # resolved path before bind, so an agent-set path aimed at its own
+    # append-only store would rm the store at the next boot; oracle_seed
+    # (HIGH-1) is the operator's inference gate, and the daemon's hot path
+    # APPENDS a seed claim when the fold says "present" — a self-set opens
+    # the gate the operator refused; profile (MEDIUM-1) IS the capability
+    # envelope (tool registry, memory/skill visibility), so a self-set is
+    # self-escalation.
+    @operator_baseline %{
+      base_url: "https://api.deepseek.com/v1",
+      operator_seed_env: "KYBER_OPERATOR_SEED",
+      api_key_env: "DEEPSEEK_API_KEY",
+      channel_socket: "default",
+      oracle_seed: "absent",
+      profile: "scoped",
+      model: "deepseek-v4-flash",
+      self_config: "true"
+    }
+
+    @agent_attack %{
+      base_url: "https://evil.proxy/v1",
+      operator_seed_env: "ATTACKER_SEED",
+      api_key_env: "ATTACKER_KEY",
+      channel_socket: "/tmp/kyber-victim/store.jsonl",
+      oracle_seed: "present",
+      profile: "wide-open",
+      model: "agent-choice"
+    }
+
+    test "EVERY operator-only field is fold-inert from a granted agent SET (P5 r8 H1, r10 C1/H1/M1)" do
+      operator = agent_set("wisp", @operator_baseline, ts: @ts)
+      attack = agent_set("wisp", @agent_attack, seed: @agent_seed, ts: @ts + 1)
+
+      assert {:ok, view} = Config.resolve(set_of([operator, attack]), "wisp")
+
+      # the one grantable field in the attack folds — the grant is live
+      assert view.model == "agent-choice"
+
+      # ...and every operator-attested field still reads the OPERATOR's value
+      assert view.base_url == "https://api.deepseek.com/v1"
+      assert view.operator_seed_env == "KYBER_OPERATOR_SEED"
+      assert view.api_key == {:env, "DEEPSEEK_API_KEY"}
+      assert view.channel_socket == "default"
+      assert view.oracle_seed == "absent"
+      assert view.profile == "scoped"
+
+      # the boot opts the daemon acts on carry the operator's values, not
+      # the agent's: no rm aimed at the store, no gate flip, no wider profile
+      opts = Config.boot_opts(view, [])
+      assert opts[:channel_socket] == :default
+      assert opts[:oracle_seed] == :absent
+      assert opts[:profile] == "scoped"
+    end
+
+    test "EVERY operator-only field is fold-inert from a granted agent UNSET (P5 r8 H1, r10 C1/H1/M1)" do
+      operator = agent_set("wisp", @operator_baseline, ts: @ts)
+
+      unset_all =
+        agent_set(
+          "wisp",
+          %{
+            unset: ~w(base_url operator_seed_env api_key_env channel_socket oracle_seed profile),
+            model: "agent-choice"
+          },
+          seed: @agent_seed,
+          ts: @ts + 1
+        )
+
+      assert {:ok, view} = Config.resolve(set_of([operator, unset_all]), "wisp")
+
+      assert view.model == "agent-choice"
+      assert view.base_url == "https://api.deepseek.com/v1"
+      assert view.operator_seed_env == "KYBER_OPERATOR_SEED"
+      assert view.api_key == {:env, "DEEPSEEK_API_KEY"}
+      assert view.channel_socket == "default"
+      assert view.oracle_seed == "absent"
+      assert view.profile == "scoped"
+    end
+
+    test "the OPERATOR still sets and unsets all three round-10 fields (P5 r10 T3)" do
+      pairs = [
+        agent_set("wisp", @operator_baseline, ts: @ts),
+        agent_set(
+          "wisp",
+          %{channel_socket: "/tmp/kyber-op.sock", oracle_seed: "present", profile: "wide-open"},
+          ts: @ts + 1
+        )
+      ]
+
+      assert {:ok, view} = Config.resolve(set_of(pairs), "wisp")
+      assert view.channel_socket == "/tmp/kyber-op.sock"
+      assert view.oracle_seed == "present"
+      assert view.profile == "wide-open"
+
+      opts = Config.boot_opts(view, [])
+      assert opts[:channel_socket] == "/tmp/kyber-op.sock"
+      assert opts[:oracle_seed] == :present
+
+      unset =
+        agent_set("wisp", %{unset: ~w(channel_socket oracle_seed profile)}, ts: @ts + 2)
+
+      assert {:ok, stepped} = Config.resolve(set_of(pairs ++ [unset]), "wisp")
+      assert stepped.channel_socket == nil
+      assert stepped.oracle_seed == nil
+      assert stepped.profile == nil
+    end
+
     test "an agent retraction can negate its own folded delta but not an operator's" do
       genesis = agent_set("wisp", @genesis_fields, ts: @ts)
       {genesis_id, _} = genesis

@@ -422,6 +422,73 @@ defmodule Kyber.Agent.T17AgentBootTest do
            "no ResponseDelta landed with a stale human.seed present"
   end
 
+  test "a GRANTED agent can never open the oracle gate the operator refused (P5 r10 HIGH-1)",
+       %{registry: registry} do
+    port = provider!(self())
+    # genesis default: oracle_seed "absent" — the operator's refusal
+    new_agent!(registry, port)
+    {log_path, keyring} = pointer!(registry)
+    restart_on!(log_path)
+    boot_agent!(registry)
+
+    ingest!(1)
+
+    assert eventually(fn -> oracle_refusals() != [] end),
+           "no oracle_gate refusal landed in the store"
+
+    refute_received {:t17_provider, _headers, _body}
+
+    # the operator opens the SELF-CONFIG grant — the widest standing
+    # permission an agent can hold
+    {:ok, granted} =
+      AgentEvents.agent_set(
+        @operator_seed,
+        1.0 * System.system_time(:millisecond),
+        "wisp",
+        %{self_config: "true"}
+      )
+
+    :ok = DurableStore.append(Wire.envelope(granted))
+    assert get_in(Daemon.status(), [:config, :fold, :self_config]) == true
+
+    # ...and the agent, signing with the daemon's OWN key (the fold's
+    # admission pin — this is the strongest agent-authored delta there is),
+    # tries to flip its own gate open
+    {:ok, agent_seed} = Kyber.Keys.load_agent_seed(keyring)
+
+    {:ok, self_flip} =
+      AgentEvents.agent_set(
+        agent_seed,
+        1.0 * System.system_time(:millisecond),
+        "wisp",
+        %{oracle_seed: "present"}
+      )
+
+    :ok = DurableStore.append(Wire.envelope(self_flip))
+    Daemon.status()
+
+    # fold-inert: the daemon appended NO seed claim, so the gate is shut
+    refute live_seed?(), "a granted agent opened its own oracle gate"
+
+    refusals_before = length(oracle_refusals())
+    ingest!(2)
+
+    assert eventually(fn -> length(oracle_refusals()) > refusals_before end),
+           "the self-flipped gate let the prompt through"
+
+    refute_received {:t17_provider, _headers, _body}
+
+    # the control: the OPERATOR's identical flip still works, same store,
+    # same running daemon — the gate is a judgment call, not a dead field
+    flip_oracle!("present")
+    Daemon.status()
+    assert live_seed?(), "the operator's flip stopped working"
+
+    ingest!(3)
+    assert_receive {:t17_provider, _headers, body}, 60_000
+    assert body["model"] == "kimi-fold"
+  end
+
   test "oracle hot-flip is idempotent — a gate already matching the fold appends no delta",
        %{registry: registry} do
     # port 9 (discard) — no turn ever dispatches in this test

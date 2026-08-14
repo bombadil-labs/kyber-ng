@@ -25,11 +25,15 @@ defmodule Kyber.Agent.Config do
   `self_config` grant: an admitted agent delta folds only when a live
   operator-attested grant precedes it in `{timestamp, id}` order — a
   pre-grant agent delta stays inert forever, and retracting the grant
-  de-activates everything it admitted. `base_url` AND `operator_seed_env`
-  fold ONLY when operator-attested, regardless of the grant (premortem P0
-  and P5 HIGH-3 — a prompt-injected agent must not point the key at an
-  attacker proxy, nor redirect the operator seed to one it controls and
-  disarm the harness). Negations are author-filtered per target: an
+  de-activates everything it admitted. The `@operator_only` fields
+  (`base_url`, `operator_seed_env`, the key source, `channel_socket`,
+  `oracle_seed`, `profile`) fold ONLY when operator-attested, regardless
+  of the grant — a prompt-injected agent must not point the key at an
+  attacker proxy, redirect the operator seed to one it controls, name the
+  env var whose value ships in the auth header, aim the daemon's
+  pre-bind `File.rm` at its own store, open the oracle gate the operator
+  refused, or re-choose its own capability envelope. Negations are
+  author-filtered per target: an
   operator delta is negatable only by an operator-chain author; an agent
   delta by an operator-chain author or the agent's own author.
 
@@ -47,12 +51,29 @@ defmodule Kyber.Agent.Config do
   # operator-attested ALWAYS, set AND unset, regardless of the grant:
   # base_url (premortem P0 — proxy exfiltration), operator_seed_env
   # (P5 HIGH-3 — same trust class: redirecting the seed disarms the
-  # rollback harness and seizes signing), and the key source (P5 round-8
+  # rollback harness and seizes signing), the key source (P5 round-8
   # HIGH-1: an agent-named api_key_env would make the daemon resolve ANY
   # daemon-readable env var and ship its value to the provider in the
   # Authorization header — env-var exfiltration over the wire, which the
-  # Redactor never sees; api_key_enc rides along as defense in depth)
-  @operator_only [:base_url, :operator_seed_env, :api_key_env, :api_key_enc]
+  # Redactor never sees; api_key_enc rides along as defense in depth),
+  # channel_socket (P5 round-10 CRITICAL-1: the daemon File.rm's the
+  # resolved path before bind, so an agent-set path is a file-DELETION
+  # primitive — pointed at its own append-only store, the security model's
+  # substrate goes with it), oracle_seed (P5 round-10 HIGH-1: the gate is
+  # the operator's refusal, and the hot path APPENDS a seed claim when the
+  # fold says `present` — a self-set would let a refused agent open its own
+  # inference gate) and profile (P5 round-10 MEDIUM-1: the profile IS the
+  # capability envelope — tool registry, memory/skill visibility — so a
+  # self-set is self-escalation)
+  @operator_only [
+    :base_url,
+    :operator_seed_env,
+    :api_key_env,
+    :api_key_enc,
+    :channel_socket,
+    :oracle_seed,
+    :profile
+  ]
 
   @type view :: %{
           name: String.t(),
@@ -386,8 +407,7 @@ defmodule Kyber.Agent.Config do
       for field <- @fields,
           value = Map.get(resolved, field),
           value != nil,
-          # base_url + operator_seed_env are operator-attested ALWAYS
-          # (premortem P0 / P5 HIGH-3)
+          # @operator_only fields are operator-attested ALWAYS
           source == :operator or field not in @operator_only,
           do: {field, value}
 
@@ -403,8 +423,8 @@ defmodule Kyber.Agent.Config do
           {acc, heads}
 
         field ->
-          # base_url + operator_seed_env are operator-attested ALWAYS —
-          # the unset arm too (P0 / HIGH-3): an agent unset is fold-inert
+          # the unset arm is operator-attested too: an agent unset of an
+          # @operator_only field is fold-inert
           if source != :operator and field in @operator_only do
             {acc, heads}
           else

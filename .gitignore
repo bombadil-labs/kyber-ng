@@ -24,3 +24,6 @@ priv/data/
 
 # crash artifacts (a BEAM SIGTERM writes erl_crash.dump into its CWD)
 erl_crash.dump
+
+# Hermes-owned: local agent permissions (never ship grants)
+.claude/settings.json

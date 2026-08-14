@@ -969,9 +969,25 @@ defmodule Kyber.Daemon do
     end
   end
 
+  # P5 round-10 CRITICAL-1, defense in depth: the pre-bind File.rm is a
+  # deletion primitive aimed by a config value. It may only ever clear a
+  # STALE SOCKET — a path that already exists as a regular file (the
+  # append-only store, a keyring, anything) refuses the boot instead,
+  # legibly. The fold-side twin (Config's @operator_only) keeps an agent
+  # from ever naming the path; this keeps an operator typo from deleting a
+  # store.
   defp do_start_channel_socket(path, opts) do
-    File.rm(path)
+    case File.stat(path) do
+      {:ok, %File.Stat{type: :regular}} ->
+        {:error, {:channel_socket, {:not_a_socket, path}}}
 
+      _stale_socket_or_absent ->
+        File.rm(path)
+        bind_channel_socket(path, opts)
+    end
+  end
+
+  defp bind_channel_socket(path, opts) do
     case Kyber.Channel.Socket.start_link(
            socket_path: path,
            log_path: Application.get_env(:kyber, :log_path),
