@@ -251,6 +251,19 @@ defmodule Kyber.Agent.Reactor do
   # serialized behind the harness's processing. Never fatal.
   @impl true
   def handle_info({:engine, _event} = message, state) do
+    # T19 (H1 — the second pinned turn-END site): on {:engine,
+    # {:answered, request_id}} the reactor resolves request_id → the
+    # initiating received via walk_to_received/2 and closes the turn span
+    # with outcome :answered (a closed-id END no-op keeps re-fires
+    # coherent). Total: a failed walk emits nothing, never a raise.
+    case message do
+      {:engine, {:answered, request_id}} ->
+        end_turn_on_answer(request_id)
+
+      _other ->
+        :ok
+    end
+
     with pid when is_pid(pid) <- Process.whereis(Kyber.Daemon), do: send(pid, message)
     if state.test_pid, do: send(state.test_pid, message)
     {:noreply, state}
@@ -315,6 +328,25 @@ defmodule Kyber.Agent.Reactor do
 
       nil ->
         turn = %Turn{turn_id: delta.id, budget: Budget.new(state.budget_cap)}
+
+        # T19 (span table, pin 11): the :turn span starts when the Turn is
+        # created — trace_id = the BARE initiating received delta id (M5),
+        # parent nil (the trace root), gate = the gate at turn start (L9),
+        # budget_cap pinned. Built from pre-validated fields only (L5).
+        Kyber.Trace.span_start(%{
+          span_id: "turn:" <> delta.id,
+          kind: :turn,
+          trace_id: delta.id,
+          parent_id: nil,
+          refs: [delta.id],
+          ts: delta.claims.timestamp,
+          data: %{gate: gate_open?(), budget_cap: state.budget_cap}
+        })
+
+        # M3: the attribution cast at Turn creation — the received delta id
+        # maps to itself as the trace id (the SEPARATE delta→trace index).
+        Kyber.Trace.attribution(delta.id, delta.id)
+
         {%{state | turns: Map.put(state.turns, delta.id, turn)}, turn}
     end
   end
@@ -340,6 +372,28 @@ defmodule Kyber.Agent.Reactor do
       turn_id ->
         Map.get(state.turns, turn_id) || :no_turn
     end
+  end
+
+  # T19: the answered turn-END — resolve request_id → received, close the
+  # turn span. Total (L5): the walk or the store read failing emits nothing.
+  defp end_turn_on_answer(request_id) do
+    received_id =
+      try do
+        walk_to_received(DurableStore.set(), request_id)
+      rescue
+        _ -> nil
+      catch
+        _, _ -> nil
+      end
+
+    if is_binary(received_id) do
+      Kyber.Trace.span_end("turn:" <> received_id, %{
+        status: :closed,
+        data: %{outcome: :answered}
+      })
+    end
+
+    :ok
   end
 
   # the pointer-walk: ToolCall.requestRef → promptRef → the initiating
@@ -386,7 +440,37 @@ defmodule Kyber.Agent.Reactor do
   defp invoke(state, handler, delta_kind, delta, turn) do
     ctx = %Ctx{store: state.store, turn: turn, test_pid: state.test_pid}
 
-    case handler.(delta, ctx) do
+    # T19 (span table, pin invoke/5): one :dispatch span per CHARGED
+    # dispatched delta of the subscribed kinds — starts at invoke entry
+    # (budget-refused deltas never reach invoke and get no dispatch span;
+    # the refusal appears as the GateDecision's own dispatch span, L8).
+    # trace_id/parent_id are reactor-owned (rules 1/2 — explicit).
+    span_id = "dispatch:" <> delta.id
+
+    Kyber.Trace.span_start(%{
+      span_id: span_id,
+      kind: :dispatch,
+      trace_id: turn.turn_id,
+      parent_id: "turn:" <> turn.turn_id,
+      refs: [delta.id],
+      ts: delta.claims.timestamp,
+      data: %{delta_kind: delta_kind}
+    })
+
+    result =
+      case handler.(delta, ctx) do
+        {:emit, wires} -> {:emit, wires}
+        {:refuse, reason} -> {:refuse, reason}
+        :ignore -> :ignore
+      end
+
+    # span_end fires on EVERY return shape (L5 — total; never a raise)
+    Kyber.Trace.span_end(span_id, %{
+      status: :closed,
+      data: %{handler_result: handler_result(result)}
+    })
+
+    case result do
       {:emit, wires} ->
         state |> emit(turn.turn_id, wires) |> observe(delta_kind, delta)
 
@@ -397,6 +481,12 @@ defmodule Kyber.Agent.Reactor do
         observe(state, delta_kind, delta)
     end
   end
+
+  # the handler_result attr: a SAFE atom/term — never the wires themselves
+  # (D8 — no payload carries raw args/results)
+  defp handler_result({:emit, _wires}), do: :emit
+  defp handler_result({:refuse, reason}), do: {:refused, reason}
+  defp handler_result(:ignore), do: :ignore
 
   # pin 19/20: the production handlers are OBSERVED — Ctx.test_pid probe
   # message as the fast signal + the per-invocation-DISTINCT probe claim in
@@ -436,6 +526,12 @@ defmodule Kyber.Agent.Reactor do
       # the Ctx.turn carry through the re-entry seam (SYNTH-NEW-1): this
       # emission re-enters attributed to the emitting handler's turn
       s = %{s | emitted: Map.put(s.emitted, wire["id"], turn_id)}
+
+      # T19 (M3): the attribution cast at emit — wire_id → turn_id into the
+      # SEPARATE delta→trace index (survives span eviction; click-through-
+      # after-eviction and resume/1 depend on it)
+      Kyber.Trace.attribution(wire["id"], turn_id)
+
       DurableStore.append(wire)
       s
     end)
@@ -462,10 +558,27 @@ defmodule Kyber.Agent.Reactor do
   # GateDecision ONLY IF the refused delta's kind is NOT "decides"; a
   # refused "decides" emits nothing and the turn is structurally terminal —
   # exactly one refusal delta, finite store, no live-lock, no hang.
-  defp refuse_budget(state, _turn, _delta, "decides"), do: state
+  #
+  # T19 (H1 — the first pinned turn-END site): both clauses close the turn
+  # span with outcome :refused (the turn is STRUCTURALLY terminal here; a
+  # closed-id END no-op keeps any later answered cast coherent).
+  defp refuse_budget(state, turn, _delta, "decides") do
+    Kyber.Trace.span_end("turn:" <> turn.turn_id, %{
+      status: :closed,
+      data: %{outcome: :refused}
+    })
 
-  defp refuse_budget(state, turn, delta, _kind),
-    do: refuse(state, turn.turn_id, delta, :budget_exhausted)
+    state
+  end
+
+  defp refuse_budget(state, turn, delta, _kind) do
+    Kyber.Trace.span_end("turn:" <> turn.turn_id, %{
+      status: :closed,
+      data: %{outcome: :refused}
+    })
+
+    refuse(state, turn.turn_id, delta, :budget_exhausted)
+  end
 
   # pin 16: the gate — open iff an UNRETRACTED seed claim exists (the seed
   # is asserted by the daemon's oracle_seed boot opt, pin 17); M2:

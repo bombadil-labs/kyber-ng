@@ -271,8 +271,24 @@ defmodule Kyber.Agent.ToolExecutor do
 
         case verdict do
           :allow ->
-            decision_wires ++
+            # T19 (span table, tool_executor.ex:274 on :allow): the
+            # :tool_exec span wraps result_wires/8 — tool_id + result_status
+            # ONLY (NO args/results — redaction by construction, D8). Attach
+            # via the parent (the ToolCall's dispatch span, rule 2) / refs
+            # (rule 3); explicit trace_id when the walk resolves. Total
+            # (L5): a raise here would change the executor's return value.
+            tool_span_id = Kyber.Trace.Span.span_id(:tool_exec, call_id)
+            start_tool_span(tool_span_id, set, claims.timestamp, call_id, tool_id)
+
+            tool_wires =
               result_wires(set, seed, claims.timestamp, call_id, tool_id, args, tools, context)
+
+            Kyber.Trace.span_end(tool_span_id, %{
+              status: :closed,
+              data: %{result_status: tool_result_status(set, call_id, tool_wires)}
+            })
+
+            decision_wires ++ tool_wires
 
           _denied_or_refused ->
             # reject, never repair: a refused call emits NO ToolResult
@@ -531,6 +547,76 @@ defmodule Kyber.Agent.ToolExecutor do
     case JSON.decode(args) do
       {:ok, %{"url" => url}} when is_binary(url) -> {:ok, url}
       _other -> :abstain
+    end
+  end
+
+  # T19: the :tool_exec span emitters — total, pre-validated fields only.
+  defp start_tool_span(span_id, set, ts, call_id, tool_id) do
+    trace_id =
+      try do
+        Kyber.Trace.Span.resolve_received(set, call_id)
+      rescue
+        _ -> nil
+      catch
+        _, _ -> nil
+      end
+
+    span = %{
+      span_id: span_id,
+      kind: :tool_exec,
+      trace_id: trace_id,
+      parent_id: "dispatch:" <> call_id,
+      refs: [call_id],
+      ts: ts,
+      data: %{tool_id: tool_id}
+    }
+
+    Kyber.Trace.span_start(span)
+  end
+
+  # the result_status attr: the ToolResult's status string ("ok"/"error"/
+  # "unknown_tool"/"unknown_entity") — from the fresh wires when one rides
+  # them, else the STORED ToolResult for the call (the answer-from-the-store
+  # duplicate path). Never the result content itself (D8). Total.
+  defp tool_result_status(set, call_id, tool_wires) do
+    case Enum.find_value(tool_wires, fn wire ->
+           wire_status(wire)
+         end) do
+      nil -> stored_tool_status(set, call_id)
+      status -> status
+    end
+  end
+
+  # wire-JSON claims (a fresh Wire.envelope): the status pointer's target is
+  # a plain string; in-memory claims (the store set): a tagged {:string, s}.
+  # Both are total reads of a pre-validated field (D8 — the status STRING,
+  # never the result content).
+  defp wire_status(%{"claims" => %{"pointers" => pointers}}) do
+    Enum.find_value(pointers, fn
+      %{"role" => "status", "target" => status} when is_binary(status) -> status
+      _other -> nil
+    end)
+  end
+
+  defp wire_status(%{pointers: pointers}) do
+    Enum.find_value(pointers, fn
+      %{role: "status", target: {:string, status}} when is_binary(status) -> status
+      _other -> nil
+    end)
+  end
+
+  defp wire_status(_), do: nil
+
+  defp stored_tool_status(set, call_id) do
+    case stored_tool_result(set, call_id) do
+      {_wire, result_id} ->
+        case Map.get(set, result_id) do
+          {claims, _sig} -> wire_status(%{"claims" => claims})
+          nil -> nil
+        end
+
+      nil ->
+        nil
     end
   end
 
