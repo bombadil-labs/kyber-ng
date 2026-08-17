@@ -8,7 +8,8 @@ defmodule Kyber.Agent.T19OracleSeedBootTest do
   seed claim is retracted gets a NEW claim at a fresh timestamp, so the
   retraction cannot absorb it and the reactor's gate is open again), it
   steps the timestamp when the id it would mint is already negated, and it
-  refuses the boot rather than reporting :ok with the gate still closed.
+  survives a peer that pre-negates every id the fixed-ts ladder can derive
+  (the now_ts ladder mints one the peer could not have predicted).
 
   Same discipline as reactor_test: tmp store + tmp keyring per test,
   `tick_ms: :manual`, no `Process.sleep`.
@@ -17,10 +18,12 @@ defmodule Kyber.Agent.T19OracleSeedBootTest do
   use ExUnit.Case, async: false
 
   alias Kyber.{Daemon, DurableStore, Events, Keys, Wire}
+  alias Kyber.Agent.Events, as: AgentEvents
   alias Rhizomatic.Delta
 
   @human_seed String.duplicate("cd", 32)
   @foreign_seed String.duplicate("ef", 32)
+  @operator_seed String.duplicate("7f", 32)
   @oracle_seed_ts 1_700_000_000_000.0
   @oracle_pointer %{role: "seed", target: {:entity, "oracle", "seed"}}
 
@@ -73,6 +76,29 @@ defmodule Kyber.Agent.T19OracleSeedBootTest do
 
   defp boot!(ctx) do
     assert {:ok, _pid} = boot(ctx)
+  end
+
+  # the D6 shape: an agent identity, so the daemon subscribes to the store
+  # and an operator AgentSet re-folds the config mid-session
+  defp boot_agent!(ctx) do
+    assert {:ok, _pid} =
+             Daemon.boot(
+               keyring_dir: ctx.keyring_dir,
+               tick_ms: :manual,
+               loop: :reactor,
+               oracle_seed: :present,
+               agent: "mokosh",
+               operator_seed: @operator_seed,
+               budget_cap: 32,
+               test_pid: self()
+             )
+  end
+
+  defp append_set!(ts, fields) do
+    {:ok, signed} = AgentEvents.agent_set(@operator_seed, ts, "mokosh", fields)
+    wire = Wire.envelope(signed)
+    assert :ok = DurableStore.append(wire)
+    wire["id"]
   end
 
   defp seed_claims do
@@ -163,15 +189,33 @@ defmodule Kyber.Agent.T19OracleSeedBootTest do
     refute negated?(id)
   end
 
-  test "a boot that cannot mint a live seed refuses rather than reporting :ok", ctx do
+  test "a pre-negated fixed-ts ladder cannot pin the gate shut", ctx do
+    # the attack: @oracle_seed_ts is a constant, so every id the fixed-ts
+    # ladder can derive is pre-computable. A federation peer appends all
+    # eleven negations BEFORE this daemon has ever booted.
     for bump <- 0..10,
         do: negate!(ctx.agent_seed, seed_wire_id(ctx.agent_seed, @oracle_seed_ts + bump))
 
-    assert {:error, {:oracle_seed, :negated_seed_id}} = boot(ctx)
+    boot!(ctx)
 
-    # nothing was appended: a claim born retracted would leave the boot
-    # reporting success with the gate closed
-    assert seed_claims() == []
+    # the now_ts ladder mints an id the attacker could not predict, and it
+    # is LIVE — the gate the boot reported open really is open
+    assert [{id, claims}] = seed_claims()
+    assert claims.timestamp > @oracle_seed_ts + 10
+    refute negated?(id)
+  end
+
+  test "a ladder whose every id is negated refuses rather than minting a dead claim", ctx do
+    # not reachable through a boot — the now_ts ladder always has an
+    # unpredictable id left — so the refusal is exercised directly, with a
+    # negated set covering the whole ladder for one base
+    base = 1_754_900_000_000.0
+    state = %{author: Keys.author_for_seed(ctx.agent_seed), seed: ctx.agent_seed}
+    negated = MapSet.new(for bump <- 0..10, do: seed_wire_id(ctx.agent_seed, base + bump))
+
+    assert {:error, :negated_seed_id} = Daemon.seed_ladder(state, base, negated)
+    assert {:ok, wire} = Daemon.seed_ladder(state, base + 11, negated)
+    assert wire["claims"]["timestamp"] == base + 11
   end
 
   test "a retracted seed re-opens the gate with a NEW claim at a fresh ts", ctx do
@@ -226,6 +270,58 @@ defmodule Kyber.Agent.T19OracleSeedBootTest do
                claims.pointers
              )
            end)
+  end
+
+  test "a config hot-swap re-opens a retracted gate through the same mint (D6)", ctx do
+    boot_agent!(ctx)
+    assert [{retracted_id, _claims}] = seed_claims()
+
+    negate!(@operator_seed, retracted_id)
+
+    # the flip reads the daemon's CACHE, so the negation has to have reached
+    # it before the AgentSet does — otherwise the hot path still sees a live
+    # seed and correctly appends nothing
+    assert eventually(fn -> MapSet.member?(:sys.get_state(Daemon).negated_ids, retracted_id) end)
+
+    append_set!(1_754_600_200_000.0, %{oracle_seed: "present"})
+
+    assert eventually(fn ->
+             Enum.any?(seed_claims(), fn {id, _claims} ->
+               id != retracted_id and not negated?(id)
+             end)
+           end)
+
+    # the fold's flip minted a NEW claim rather than resurrecting the
+    # retracted content id, and the daemon's cache agrees the gate is open
+    claims_by_id = Map.new(seed_claims())
+    assert map_size(claims_by_id) == 2
+    assert [live_id] = Map.keys(claims_by_id) -- [retracted_id]
+    assert claims_by_id[live_id].author == Keys.author_for_seed(ctx.agent_seed)
+
+    # the stepped fixed ts, not a now_ts: the flip runs the boot assert's
+    # ladder, so the same determinism holds on both paths
+    assert claims_by_id[live_id].timestamp == @oracle_seed_ts + 1
+
+    daemon = :sys.get_state(Daemon)
+    assert MapSet.member?(daemon.seed_ids, live_id)
+    refute MapSet.member?(daemon.negated_ids, live_id)
+  end
+
+  # bounded sleep-free polling on a condition, no Process.sleep: a
+  # timeout-only receive matches nothing, so it consumes no mailbox message
+  defp eventually(fun, attempts \\ 200) do
+    Enum.reduce_while(1..attempts, false, fn _, _ ->
+      if fun.() do
+        {:halt, true}
+      else
+        receive do
+        after
+          25 -> :timeout
+        end
+
+        {:cont, false}
+      end
+    end)
   end
 
   # bounded sleep-free store polling: a timeout-only receive never matches

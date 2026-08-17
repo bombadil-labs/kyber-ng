@@ -102,6 +102,11 @@ defmodule Mix.Tasks.Kyber.DashboardTest do
     assert error.message =~ "would open the oracle gate on a real store"
     assert error.message =~ "kyber agent set <name> --oracle-seed present"
 
+    # the guard covers the SEED CLAIM, not the dashboard's writes at large:
+    # a :reactor dashboard appends operational deltas whatever the flags say
+    assert error.message =~ "the boot mints a seed claim"
+    assert error.message =~ "still appends operational deltas"
+
     # no --log at all resolves to the configured store — also a real one
     assert_raise Mix.Error, fn -> Dashboard.guard_oracle_seed(oracle_seed: "present") end
 

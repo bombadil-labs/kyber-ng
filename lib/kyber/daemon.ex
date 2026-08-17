@@ -821,11 +821,9 @@ defmodule Kyber.Daemon do
   # dependent on a claim this daemon cannot keep alive. The reactor's gate
   # read stays author-agnostic (pin 16) — only the boot append is scoped.
   #
-  # The timestamp follows the D6 rule (sync_oracle_gate/2): the fixed ts —
-  # so the id is deterministic across boots for the two-boot AC5 companion
-  # — unless a seed claim already exists, in which case it is retracted and
-  # holds that content id, and a fresh ts mints a claim the retraction
-  # cannot absorb.
+  # The timestamp is mint_seed_wire/2's: the fixed ts on a store carrying no
+  # negation against it (deterministic across boots, the two-boot AC5
+  # companion), a stepped one otherwise.
   defp assert_oracle_seed(state, opts) do
     case Keyword.get(opts, :oracle_seed, :absent) do
       :present ->
@@ -836,7 +834,7 @@ defmodule Kyber.Daemon do
         if own_live_seed?(seeds, negated, state.author) do
           :ok
         else
-          with {:ok, wire} <- mint_seed_wire(state, seeds, negated),
+          with {:ok, wire} <- mint_seed_wire(state, negated),
                :ok <- DurableStore.append(wire),
                :ok <- confirm_oracle_gate() do
             :ok
@@ -861,15 +859,33 @@ defmodule Kyber.Daemon do
   end
 
   # A mint whose derived id is already negated is dead on arrival: the store
-  # dedups by content id and the retraction still holds. Two mints inside the
-  # same millisecond derive the same id, so the ms-precision fresh ts is not
-  # enough on its own — derive the id first and step the timestamp up until
-  # no retraction targets it.
+  # dedups by content id and the retraction still holds. So the mint derives
+  # the id first and steps the timestamp until no retraction targets it —
+  # two ladders, in order:
+  #
+  # 1. from the FIXED @oracle_seed_ts. On a store carrying no negation
+  #    against those ids the first candidate wins, which is what keeps the
+  #    boot id deterministic across boots (the two-boot AC5 companion).
+  # 2. from now_ts(). The fixed ts is a constant, so its ladder ids are
+  #    pre-computable: a federation peer (T15) can append negations against
+  #    all of them BEFORE the daemon ever boots and pin the gate shut. A
+  #    now_ts id cannot be predicted, so a boot told to open the gate can
+  #    always mint a live seed. Only a negation landing between this scan
+  #    and the append reaches the refusal.
   @seed_ts_bump_limit 10
 
-  defp mint_seed_wire(state, seeds, negated) do
-    base = if map_size(seeds) > 0, do: now_ts(), else: @oracle_seed_ts
+  defp mint_seed_wire(state, negated) do
+    with {:error, _reason} <- seed_ladder(state, @oracle_seed_ts, negated) do
+      seed_ladder(state, now_ts(), negated)
+    end
+  end
 
+  # public (undocumented) so the exhaustion refusal stays under test: with
+  # the now_ts ladder in play it is not reachable through a real boot.
+  # Reads only :author and :seed off the state.
+  @doc false
+  @spec seed_ladder(map(), float(), MapSet.t()) :: {:ok, map()} | {:error, :negated_seed_id}
+  def seed_ladder(state, base, negated) do
     Enum.reduce_while(0..@seed_ts_bump_limit, {:error, :negated_seed_id}, fn bump, acc ->
       wire = build_signed(state, [@oracle_seed_pointer], base + bump)
 
@@ -892,13 +908,12 @@ defmodule Kyber.Daemon do
   # D6: the hot path keeps the oracle gate consistent with the fold. The
   # gate is a pure store read (reactor pin 16: open iff an unretracted seed
   # claim exists), so the flip is a delta operation — never reactor state:
-  # fold wants :present with no live seed => append one (the boot shape;
-  # the fixed ts unless a retracted seed already holds that content id, in
-  # which case a fresh ts mints a new claim the dedup can't absorb); fold
-  # wants :absent with a live seed => append its negation (retraction-is-
-  # negation, the store only learns). A gate already matching the fold
-  # appends nothing. Takes effect on the next dispatch — the next
-  # inference cycle, no reboot.
+  # fold wants :present with no live seed => append one through the SAME
+  # mint/confirm pair the boot assert uses (mint_seed_wire/2's two ladders,
+  # confirm_oracle_gate/0's postcondition); fold wants :absent with a live
+  # seed => append its negation (retraction-is-negation, the store only
+  # learns). A gate already matching the fold appends nothing. Takes effect
+  # on the next dispatch — the next inference cycle, no reboot.
   defp sync_oracle_gate(state, fold_opts) do
     # the fold DECLARES the gate only when it sets `oracle_seed` explicitly:
     # boot_opts/2 rejects nil values, so an ABSENT key means "the fold never
@@ -909,21 +924,27 @@ defmodule Kyber.Daemon do
         state
 
       {:ok, want} ->
-        {live_id, any_seed?} = cached_seed_state(state)
+        live_id = cached_live_seed(state)
 
         cond do
           want == :present and live_id == nil ->
-            ts = if any_seed?, do: now_ts(), else: @oracle_seed_ts
-            wire = build_signed(state, [@oracle_seed_pointer], ts)
+            # the negated set is re-scanned rather than read off the cache:
+            # the mint needs the retraction targets themselves, and the flip
+            # is rare enough to pay for one walk
+            {_seeds, negated} = scan_seed_claims()
 
-            case DurableStore.append(wire) do
-              :ok ->
-                narrate(state, "oracle gate open via config hot-swap")
-                # the flip append is rare — a rebuild HERE (not per delta)
-                # keeps the cache exact without deriving the new claim's
-                # content id; the feed's re-delivery is then idempotent
-                init_seed_cache(state)
+            with {:ok, wire} <- mint_seed_wire(state, negated),
+                 :ok <- DurableStore.append(wire) do
+              case confirm_oracle_gate() do
+                :ok -> narrate(state, "oracle gate open via config hot-swap")
+                {:error, :gate_closed} -> narrate(state, "oracle gate open FAILED — gate closed")
+              end
 
+              # the flip append is rare — a rebuild HERE (not per delta)
+              # keeps the cache exact without deriving the new claim's
+              # content id; the feed's re-delivery is then idempotent
+              init_seed_cache(state)
+            else
               {:error, reason} ->
                 narrate(state, "oracle gate open refused #{inspect(reason)}")
                 state
@@ -951,10 +972,7 @@ defmodule Kyber.Daemon do
 
   # P5 round-6 LOW-2: the gate's seed-claim state is CACHED — one boot-time
   # scan seeds it, the feed keeps it current — so the daemon's serialized
-  # loop never walks the full store per AgentSet. Same reading as the old
-  # full scan: {live unretracted seed claim id | nil, any seed claim at
-  # all?} — the second element tells the re-open path the fixed-content
-  # boot id is already taken by a retracted claim.
+  # loop never walks the full store per AgentSet.
   defp init_seed_cache(state) do
     {seeds, negated} = scan_seed_claims()
     Map.merge(state, %{seed_ids: MapSet.new(Map.keys(seeds)), negated_ids: negated})
@@ -999,9 +1017,8 @@ defmodule Kyber.Daemon do
     %{state | seed_ids: seed_ids, negated_ids: negated_ids}
   end
 
-  defp cached_seed_state(state) do
-    live = Enum.find(state.seed_ids, &(not MapSet.member?(state.negated_ids, &1)))
-    {live, MapSet.size(state.seed_ids) > 0}
+  defp cached_live_seed(state) do
+    Enum.find(state.seed_ids, &(not MapSet.member?(state.negated_ids, &1)))
   end
 
   # ------------------------------------------------------------------ T14i

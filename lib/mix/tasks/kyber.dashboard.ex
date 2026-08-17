@@ -18,9 +18,13 @@ defmodule Mix.Tasks.Kyber.Dashboard do
   `--model`, `--base-url`, `--oracle-seed present|absent`). The reactor
   boots `engine: :none` unless an api key is supplied.
 
-  `--oracle-seed present` writes a seed claim to the target store, so it is
-  admitted only against a store under the system tmp dir or one the operator
-  marks with `--dev-store` (see `guard_oracle_seed/1`).
+  A `:reactor` dashboard is a WRITER, not a viewer — it hosts the live
+  daemon (M4: one tree per agent, so `ctl send` letters flow through it) and
+  appends operational deltas whatever the flags say. What is guarded is the
+  one standing write: `--oracle-seed present` mints the seed claim that
+  authorizes model initiation, so it is admitted only against a store under
+  the system tmp dir or one the operator marks with `--dev-store` (see
+  `guard_oracle_seed/1`).
   """
 
   use Mix.Task
@@ -121,14 +125,18 @@ defmodule Mix.Tasks.Kyber.Dashboard do
     ]
   end
 
-  # The oracle gate is the operator's inference gate, and the dashboard is a
-  # viewer: `--oracle-seed present` boots a daemon that appends a seed claim
-  # to the target store, so it is admitted only against a dev store. Two
-  # ways to be one, either sufficient: the `--log` path lies under the
-  # system tmp dir (flag-free, so tests and throwaway stores need nothing
-  # extra), or the operator passes `--dev-store` (the deliberate opt-in for
-  # a store anywhere else). Neither => refuse; the operator opens the gate
-  # through the config fold.
+  # The guard covers ONE write: the seed claim. `--oracle-seed present`
+  # boots a daemon that mints it, and that claim is the standing
+  # authorization for model initiation — it outlives the dashboard process,
+  # so it is admitted only against a dev store. The dashboard's reactor
+  # writes either way (refusals, checkpoints, the agent's own deltas — it
+  # IS the live daemon host, M4); the seed claim is the write that wants
+  # the operator's deliberate gate-open, not a side effect of running a
+  # viewer. Two ways to be a dev store, either sufficient: the `--log` path
+  # lies under the system tmp dir (flag-free, so tests and throwaway stores
+  # need nothing extra), or the operator passes `--dev-store` (the
+  # deliberate opt-in for a store anywhere else). Neither => refuse; the
+  # operator opens the gate through the config fold.
   #
   # tmp-ness is a path-COMPONENT prefix, not a string prefix: `/tmpdata` is
   # not under `/tmp`. TMPDIR is user-settable, which is why it cannot be the
@@ -140,9 +148,12 @@ defmodule Mix.Tasks.Kyber.Dashboard do
     if oracle_seed(opts[:oracle_seed]) == :present and
          not (tmp_store?(opts[:log]) or opts[:dev_store] == true) do
       Mix.raise(
-        "--oracle-seed present would open the oracle gate on a real store; the dashboard " <>
-          "is a viewer. Open the gate with: kyber agent set <name> --oracle-seed present " <>
-          "(or pass --dev-store if this store really is a dev store)"
+        "--oracle-seed present would open the oracle gate on a real store: the boot mints " <>
+          "a seed claim, the standing authorization for model initiation. (The dashboard's " <>
+          "reactor still appends operational deltas — refusals, checkpoints — the seed " <>
+          "claim is the one write that wants a deliberate gate-open.) Open the gate with: " <>
+          "kyber agent set <name> --oracle-seed present (or pass --dev-store if this store " <>
+          "really is a dev store)"
       )
     end
 
