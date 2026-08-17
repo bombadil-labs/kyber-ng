@@ -10,10 +10,16 @@ defmodule KyberWeb.Endpoint do
 
   socket "/live", Phoenix.LiveView.Socket
 
-  # the vendored LiveView JS bundle (priv/static/assets — no npm build)
+  # the vendored LiveView JS bundle (priv/static/assets — no npm build).
+  # Plug.Static STRIPS `at: "/assets"` from the request before joining with
+  # `from`, so the bundle at priv/static/assets/... needs
+  # from: {:kyber, "priv/static/assets"} — a bare `from: :kyber` (=
+  # priv/static) or {:kyber, "priv/static"} lands one level too shallow,
+  # 404s the bundle, and the LiveView socket never connects (the page then
+  # only updates on manual refresh)
   plug Plug.Static,
     at: "/assets",
-    from: :kyber,
+    from: {:kyber, "priv/static/assets"},
     gzip: false,
     only: ~w(phoenix_live_view.js)
 
