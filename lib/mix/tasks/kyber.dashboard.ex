@@ -22,9 +22,12 @@ defmodule Mix.Tasks.Kyber.Dashboard do
   daemon (M4: one tree per agent, so `ctl send` letters flow through it) and
   appends operational deltas whatever the flags say. What is guarded is the
   one standing write: `--oracle-seed present` mints the seed claim that
-  authorizes model initiation, so it is admitted only against a store under
-  the system tmp dir or one the operator marks with `--dev-store` (see
-  `guard_oracle_seed/1`).
+  authorizes model initiation, so ON THIS TASK it is admitted only against a
+  store under the system tmp dir or one the operator marks with
+  `--dev-store` (see `guard_oracle_seed/1`). The guard is scoped to this
+  entry point, not to the store: `kyber daemon --oracle-seed present` mints
+  the same claim unguarded, because an explicit flag on an explicit daemon
+  boot is already the deliberate gate-open.
   """
 
   use Mix.Task
@@ -125,18 +128,26 @@ defmodule Mix.Tasks.Kyber.Dashboard do
     ]
   end
 
-  # The guard covers ONE write: the seed claim. `--oracle-seed present`
-  # boots a daemon that mints it, and that claim is the standing
-  # authorization for model initiation — it outlives the dashboard process,
-  # so it is admitted only against a dev store. The dashboard's reactor
-  # writes either way (refusals, checkpoints, the agent's own deltas — it
-  # IS the live daemon host, M4); the seed claim is the write that wants
-  # the operator's deliberate gate-open, not a side effect of running a
-  # viewer. Two ways to be a dev store, either sufficient: the `--log` path
-  # lies under the system tmp dir (flag-free, so tests and throwaway stores
-  # need nothing extra), or the operator passes `--dev-store` (the
-  # deliberate opt-in for a store anywhere else). Neither => refuse; the
-  # operator opens the gate through the config fold.
+  # The guard covers ONE write on ONE entry point: the seed claim minted by
+  # `mix kyber.dashboard --oracle-seed present`. That claim is the standing
+  # authorization for model initiation and it outlives the dashboard
+  # process, so here it is admitted only against a dev store. The
+  # dashboard's reactor writes either way (refusals, checkpoints, the
+  # agent's own deltas — it IS the live daemon host, M4); the seed claim is
+  # the write that wants a deliberate gate-open, not a side effect of
+  # starting a viewer.
+  #
+  # This is NOT store-wide protection, and does not pretend to be: `kyber
+  # daemon --oracle-seed present` and the Discord gateway mint the identical
+  # claim unguarded, by design. Those are the operator's deliberate boot
+  # paths — an explicit flag on an explicit daemon boot IS the deliberate
+  # gate-open. The dashboard is the one entry point where the flag can ride
+  # along casually with a viewer, which is why it alone asks.
+  #
+  # Two ways to be a dev store, either sufficient: the `--log` path lies
+  # under the system tmp dir (flag-free, so tests and throwaway stores need
+  # nothing extra), or the operator passes `--dev-store` (the deliberate
+  # opt-in for a store anywhere else).
   #
   # tmp-ness is a path-COMPONENT prefix, not a string prefix: `/tmpdata` is
   # not under `/tmp`. TMPDIR is user-settable, which is why it cannot be the
@@ -151,9 +162,10 @@ defmodule Mix.Tasks.Kyber.Dashboard do
         "--oracle-seed present would open the oracle gate on a real store: the boot mints " <>
           "a seed claim, the standing authorization for model initiation. (The dashboard's " <>
           "reactor still appends operational deltas — refusals, checkpoints — the seed " <>
-          "claim is the one write that wants a deliberate gate-open.) Open the gate with: " <>
-          "kyber agent set <name> --oracle-seed present (or pass --dev-store if this store " <>
-          "really is a dev store)"
+          "claim is the one write that wants a deliberate gate-open.) The dashboard is a " <>
+          "viewer; the deliberate gate-open is: kyber daemon --oracle-seed present, or " <>
+          "kyber agent set <name> --oracle-seed present. Pass --dev-store if this store " <>
+          "really is a dev store."
       )
     end
 

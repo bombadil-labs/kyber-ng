@@ -9,7 +9,12 @@ defmodule Kyber.Agent.T19OracleSeedBootTest do
   retraction cannot absorb it and the reactor's gate is open again), it
   steps the timestamp when the id it would mint is already negated, and it
   survives a peer that pre-negates every id the fixed-ts ladder can derive
-  (the now_ts ladder mints one the peer could not have predicted).
+  (the fallback mint carries a nonce, so its id is not pre-computable).
+
+  Round 6 adds the D6 hot path's half: closing the gate retracts EVERY live
+  seed claim (a store legitimately holds more than one), opening it is
+  author-scoped the way the boot assert is, and the postcondition confirms
+  the claim this daemon actually minted rather than any live seed-ish one.
 
   Same discipline as reactor_test: tmp store + tmp keyring per test,
   `tick_ms: :manual`, no `Process.sleep`.
@@ -205,9 +210,63 @@ defmodule Kyber.Agent.T19OracleSeedBootTest do
     refute negated?(id)
   end
 
+  test "the now_ts ladder's nonce makes its ids unpredictable", ctx do
+    # every OTHER field of the claim is public, so without the nonce a peer
+    # could enumerate a millisecond window's ids and negate the lot. Two
+    # mints from the same base must not collide.
+    for bump <- 0..10,
+        do: negate!(ctx.agent_seed, seed_wire_id(ctx.agent_seed, @oracle_seed_ts + bump))
+
+    boot!(ctx)
+    assert [{first_id, first_claims}] = seed_claims()
+
+    negate!(ctx.agent_seed, first_id)
+    Daemon.stop()
+    boot!(ctx)
+
+    claims_by_id = Map.new(seed_claims())
+    assert [second_id] = Map.keys(claims_by_id) -- [first_id]
+    second_claims = claims_by_id[second_id]
+
+    # distinct ids even where the base ts collides — the nonce is what
+    # separates them
+    assert second_id != first_id
+    assert nonce_of(first_claims) != nonce_of(second_claims)
+
+    # the seed pointer stays at the HEAD: the reactor derives the claim's
+    # kind from the first pointer's role, so a nonce in front would make the
+    # gate unreadable
+    assert [%{role: "seed"}, %{role: "nonce"}] = second_claims.pointers
+    refute negated?(second_id)
+  end
+
+  test "the postcondition confirms THE MINTED claim, not any live seed-ish one", ctx do
+    boot!(ctx)
+    assert [{minted_id, _claims}] = seed_claims()
+    assert Daemon.confirm_oracle_gate(minted_id) == :ok
+
+    # an unrelated claim that merely LEADS with a "seed" role is not the
+    # oracle gate: it cannot stand in for a mint that never landed
+    decoy =
+      signed_wire(
+        ctx.agent_seed,
+        [%{role: "seed", target: {:entity, "garden", "seed"}}],
+        1_754_700_000_000.0
+      )
+
+    assert :ok = DurableStore.append(decoy)
+    assert Daemon.confirm_oracle_gate(decoy["id"]) == {:error, :gate_closed}
+
+    # a negation racing the append leaves the mint dead on arrival. The
+    # decoy above is still live, so a read that asked only "is SOME
+    # seed-ish claim unretracted" would report this gate open
+    negate!(@operator_seed, minted_id)
+    assert Daemon.confirm_oracle_gate(minted_id) == {:error, :gate_closed}
+  end
+
   test "a ladder whose every id is negated refuses rather than minting a dead claim", ctx do
-    # not reachable through a boot — the now_ts ladder always has an
-    # unpredictable id left — so the refusal is exercised directly, with a
+    # not reachable through a boot — the nonce mint behind this ladder is
+    # always available — so the refusal is exercised directly, with a
     # negated set covering the whole ladder for one base
     base = 1_754_900_000_000.0
     state = %{author: Keys.author_for_seed(ctx.agent_seed), seed: ctx.agent_seed}
@@ -305,6 +364,78 @@ defmodule Kyber.Agent.T19OracleSeedBootTest do
     daemon = :sys.get_state(Daemon)
     assert MapSet.member?(daemon.seed_ids, live_id)
     refute MapSet.member?(daemon.negated_ids, live_id)
+  end
+
+  test "closing the gate negates EVERY live seed claim, not just one (D6)", ctx do
+    # since the boot skip is author-scoped, a store legitimately carries
+    # more than one live seed claim — a foreign one and this daemon's own.
+    # Negating one of them leaves the reactor's gate open while the operator
+    # has been told it is closed.
+    foreign = signed_wire(@foreign_seed, [@oracle_pointer], @oracle_seed_ts)
+    assert :ok = DurableStore.append(foreign)
+
+    boot_agent!(ctx)
+
+    live_before = for {id, _claims} <- seed_claims(), not negated?(id), do: id
+    assert length(live_before) == 2
+    assert foreign["id"] in live_before
+
+    append_set!(1_754_600_300_000.0, %{oracle_seed: "absent"})
+
+    # the gate the REACTOR reads is what has to be shut, not a count of
+    # negations: every live claim must be retracted
+    assert eventually(fn -> Enum.all?(live_before, &negated?/1) end)
+    assert Enum.all?(seed_claims(), fn {id, _claims} -> negated?(id) end)
+    refute gate_open?()
+
+    daemon = :sys.get_state(Daemon)
+    assert Enum.all?(live_before, &MapSet.member?(daemon.negated_ids, &1))
+  end
+
+  test "the D6 open path is author-scoped like the boot assert", ctx do
+    # a foreign live claim must not satisfy a fold that asks for :present —
+    # the daemon would be running on a claim it cannot keep alive
+    foreign = signed_wire(@foreign_seed, [@oracle_pointer], @oracle_seed_ts)
+    assert :ok = DurableStore.append(foreign)
+
+    boot_agent!(ctx)
+    own_author = Keys.author_for_seed(ctx.agent_seed)
+
+    # retract the boot's OWN claim, so the only thing left alive is the
+    # foreign one — an author-blind hot path reads that as "gate open" and
+    # appends nothing
+    claims_by_id = Map.new(seed_claims())
+    assert [boot_id] = Map.keys(claims_by_id) -- [foreign["id"]]
+    assert claims_by_id[boot_id].author == own_author
+
+    negate!(@operator_seed, boot_id)
+    assert eventually(fn -> MapSet.member?(:sys.get_state(Daemon).negated_ids, boot_id) end)
+    refute negated?(foreign["id"])
+
+    append_set!(1_754_600_400_000.0, %{oracle_seed: "present"})
+
+    # the fold mints a claim THIS daemon signs, distinct from both
+    assert eventually(fn ->
+             Enum.any?(seed_claims(), fn {id, claims} ->
+               id not in [boot_id, foreign["id"]] and claims.author == own_author and
+                 not negated?(id)
+             end)
+           end)
+  end
+
+  # the reactor's own gate read (pin 16): any unretracted claim whose first
+  # pointer has role "seed" — the thing an operator is told is "closed"
+  defp gate_open? do
+    Enum.any?(DurableStore.set(), fn {id, {claims, _sig}} ->
+      match?([%{role: "seed"} | _rest], claims.pointers) and not negated?(id)
+    end)
+  end
+
+  defp nonce_of(claims) do
+    Enum.find_value(claims.pointers, fn
+      %{role: "nonce", target: {:entity, _id, nonce}} -> nonce
+      _other -> nil
+    end)
   end
 
   # bounded sleep-free polling on a condition, no Process.sleep: a
