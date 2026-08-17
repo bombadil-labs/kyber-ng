@@ -593,6 +593,9 @@ defmodule Kyber.Daemon do
   # companion (identical seeded commit sequence => identical delta-id sets)
   @oracle_seed_ts 1_700_000_000_000.0
 
+  # the seed claim's only pointer — the gate's fixed shape (pin 16/17)
+  @oracle_seed_pointer %{role: "seed", target: {:entity, "oracle", "seed"}}
+
   defp build_signed(state, pointers, ts) do
     raw = %{
       timestamp: ts,
@@ -809,9 +812,14 @@ defmodule Kyber.Daemon do
   end
 
   # pin 17: the oracle_seed assertion — :present appends ONE seed delta
-  # (fixed pointers, signed by the daemon's boot key) when the store holds
+  # (fixed pointers, signed by the daemon's boot key) when this daemon holds
   # no live one; the reactor's gate reads it from store state. :absent (the
   # default) appends nothing. A failed append refuses the boot.
+  #
+  # The skip is scoped to THIS daemon's author: a live seed claim signed by
+  # another key would otherwise satisfy the boot flag, leaving the gate
+  # dependent on a claim this daemon cannot keep alive. The reactor's gate
+  # read stays author-agnostic (pin 16) — only the boot append is scoped.
   #
   # The timestamp follows the D6 rule (sync_oracle_gate/2): the fixed ts —
   # so the id is deterministic across boots for the two-boot AC5 companion
@@ -825,14 +833,14 @@ defmodule Kyber.Daemon do
         # agent identity, and the assert runs on every reactor boot
         {seeds, negated} = scan_seed_claims()
 
-        if Enum.any?(seeds, &(not MapSet.member?(negated, &1))) do
+        if own_live_seed?(seeds, negated, state.author) do
           :ok
         else
-          ts = if MapSet.size(seeds) > 0, do: now_ts(), else: @oracle_seed_ts
-          wire = build_signed(state, [%{role: "seed", target: {:entity, "oracle", "seed"}}], ts)
-
-          case DurableStore.append(wire) do
-            :ok -> :ok
+          with {:ok, wire} <- mint_seed_wire(state, seeds, negated),
+               :ok <- DurableStore.append(wire),
+               :ok <- confirm_oracle_gate() do
+            :ok
+          else
             {:error, reason} -> {:error, {:oracle_seed, reason}}
           end
         end
@@ -840,6 +848,45 @@ defmodule Kyber.Daemon do
       :absent ->
         :ok
     end
+  end
+
+  # this daemon's own live seed claim: the exact oracle pointer, its author,
+  # and no retraction against it
+  defp own_live_seed?(seeds, negated, author) do
+    Enum.any?(seeds, fn {id, claims} ->
+      claims.author == author and
+        Enum.member?(claims.pointers, @oracle_seed_pointer) and
+        not MapSet.member?(negated, id)
+    end)
+  end
+
+  # A mint whose derived id is already negated is dead on arrival: the store
+  # dedups by content id and the retraction still holds. Two mints inside the
+  # same millisecond derive the same id, so the ms-precision fresh ts is not
+  # enough on its own — derive the id first and step the timestamp up until
+  # no retraction targets it.
+  @seed_ts_bump_limit 10
+
+  defp mint_seed_wire(state, seeds, negated) do
+    base = if map_size(seeds) > 0, do: now_ts(), else: @oracle_seed_ts
+
+    Enum.reduce_while(0..@seed_ts_bump_limit, {:error, :negated_seed_id}, fn bump, acc ->
+      wire = build_signed(state, [@oracle_seed_pointer], base + bump)
+
+      if MapSet.member?(negated, wire["id"]),
+        do: {:cont, acc},
+        else: {:halt, {:ok, wire}}
+    end)
+  end
+
+  # the postcondition, read the way the reactor reads the gate (pin 16): a
+  # boot told to open the gate must not report :ok with it closed
+  defp confirm_oracle_gate do
+    {seeds, negated} = scan_seed_claims()
+
+    if Enum.any?(seeds, fn {id, _claims} -> not MapSet.member?(negated, id) end),
+      do: :ok,
+      else: {:error, :gate_closed}
   end
 
   # D6: the hot path keeps the oracle gate consistent with the fold. The
@@ -867,7 +914,7 @@ defmodule Kyber.Daemon do
         cond do
           want == :present and live_id == nil ->
             ts = if any_seed?, do: now_ts(), else: @oracle_seed_ts
-            wire = build_signed(state, [%{role: "seed", target: {:entity, "oracle", "seed"}}], ts)
+            wire = build_signed(state, [@oracle_seed_pointer], ts)
 
             case DurableStore.append(wire) do
               :ok ->
@@ -910,10 +957,12 @@ defmodule Kyber.Daemon do
   # boot id is already taken by a retracted claim.
   defp init_seed_cache(state) do
     {seeds, negated} = scan_seed_claims()
-    Map.merge(state, %{seed_ids: seeds, negated_ids: negated})
+    Map.merge(state, %{seed_ids: MapSet.new(Map.keys(seeds)), negated_ids: negated})
   end
 
-  # one full-store scan: {seed claim ids, negation targets}
+  # one full-store scan: {%{seed claim id => claims}, negation targets}. The
+  # claims ride along so the boot assert can scope its skip by author; the
+  # D6 hot-path cache keeps ids only.
   defp scan_seed_claims do
     set = DurableStore.set()
 
@@ -926,8 +975,8 @@ defmodule Kyber.Daemon do
     seeds =
       for {id, {claims, _sig}} <- set,
           match?([%{role: "seed"} | _rest], claims.pointers),
-          into: MapSet.new(),
-          do: id
+          into: %{},
+          do: {id, claims}
 
     {seeds, negated}
   end

@@ -108,6 +108,60 @@ defmodule Mix.Tasks.Kyber.DashboardTest do
     assert Dashboard.guard_oracle_seed(oracle_seed: "present", log: tmp) == :ok
   end
 
+  test "tmp-ness is a path-component prefix: a /tmp-prefixed SIBLING is refused" do
+    sibling = Path.expand(System.tmp_dir!()) <> "data/store.jsonl"
+
+    assert_raise Mix.Error, fn ->
+      Dashboard.guard_oracle_seed(oracle_seed: "present", log: sibling)
+    end
+
+    # the same path with the explicit operator opt-in is admitted
+    assert Dashboard.guard_oracle_seed(oracle_seed: "present", log: sibling, dev_store: true) ==
+             :ok
+  end
+
+  test "--dev-store admits a real store; without it a real store stays refused" do
+    real = Path.join(System.user_home!(), ".kyber/store.jsonl")
+
+    assert Dashboard.guard_oracle_seed(oracle_seed: "present", log: real, dev_store: true) == :ok
+    assert Dashboard.guard_oracle_seed(oracle_seed: "present", dev_store: true) == :ok
+
+    assert_raise Mix.Error, fn ->
+      Dashboard.guard_oracle_seed(oracle_seed: "present", log: real, dev_store: false)
+    end
+  end
+
+  test "a relocated TMPDIR moves the flag-free case, it does not widen it" do
+    outside = Path.join(System.tmp_dir!(), "kyber-dash-outside/store.jsonl")
+
+    relocated =
+      Path.join(System.tmp_dir!(), "kyber-dash-tmpdir-#{System.unique_integer([:positive])}")
+
+    File.mkdir_p!(relocated)
+
+    previous = System.get_env("TMPDIR")
+    System.put_env("TMPDIR", relocated)
+
+    on_exit(fn ->
+      if previous, do: System.put_env("TMPDIR", previous), else: System.delete_env("TMPDIR")
+      File.rm_rf(relocated)
+    end)
+
+    # under the RELOCATED tmp dir: flag-free
+    assert Dashboard.guard_oracle_seed(
+             oracle_seed: "present",
+             log: Path.join(relocated, "store.jsonl")
+           ) == :ok
+
+    # under the OLD tmp dir but outside the relocated one: refused
+    assert_raise Mix.Error, fn ->
+      Dashboard.guard_oracle_seed(oracle_seed: "present", log: outside)
+    end
+
+    assert Dashboard.guard_oracle_seed(oracle_seed: "present", log: outside, dev_store: true) ==
+             :ok
+  end
+
   test "the guard is silent for --oracle-seed absent, whatever the store" do
     real = Path.join(System.user_home!(), ".kyber/store.jsonl")
 

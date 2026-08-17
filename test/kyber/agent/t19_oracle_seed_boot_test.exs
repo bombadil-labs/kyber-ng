@@ -2,11 +2,13 @@ defmodule Kyber.Agent.T19OracleSeedBootTest do
   @moduledoc """
   T19 round-3 — the boot-time oracle seed assertion (`oracle_seed: :present`).
 
-  Two properties, both read off store state: the assert is idempotent (a
-  second boot against a store that already holds a live seed claim appends
-  nothing), and it re-opens after a retraction (a store whose only seed
-  claim is retracted gets a NEW claim at a fresh timestamp, so the
-  retraction cannot absorb it and the reactor's gate is open again).
+  Properties, all read off store state: the assert is idempotent for THIS
+  daemon's own live claim (a second boot appends no line to the log) but not
+  for a foreign author's, it re-opens after a retraction (a store whose only
+  seed claim is retracted gets a NEW claim at a fresh timestamp, so the
+  retraction cannot absorb it and the reactor's gate is open again), it
+  steps the timestamp when the id it would mint is already negated, and it
+  refuses the boot rather than reporting :ok with the gate still closed.
 
   Same discipline as reactor_test: tmp store + tmp keyring per test,
   `tick_ms: :manual`, no `Process.sleep`.
@@ -18,7 +20,9 @@ defmodule Kyber.Agent.T19OracleSeedBootTest do
   alias Rhizomatic.Delta
 
   @human_seed String.duplicate("cd", 32)
+  @foreign_seed String.duplicate("ef", 32)
   @oracle_seed_ts 1_700_000_000_000.0
+  @oracle_pointer %{role: "seed", target: {:entity, "oracle", "seed"}}
 
   setup do
     keyring_dir = Application.get_env(:kyber, :keyring_dir)
@@ -27,13 +31,14 @@ defmodule Kyber.Agent.T19OracleSeedBootTest do
     uniq = "#{System.unique_integer([:positive])}-#{System.system_time(:nanosecond)}"
     key_dir = Path.join(keyring_dir, "kyber-t19os-key-#{uniq}")
     log_dir = Path.join(System.tmp_dir!(), "kyber-t19os-log-#{uniq}")
+    log_path = Path.join(log_dir, "store.jsonl")
     File.mkdir_p!(key_dir)
     File.mkdir_p!(log_dir)
     assert :ok = Keys.import_human_seed(@human_seed, key_dir)
     assert {:ok, agent_seed} = Keys.mint_agent_seed(key_dir)
 
     stop_app()
-    Application.put_env(:kyber, :log_path, Path.join(log_dir, "store.jsonl"))
+    Application.put_env(:kyber, :log_path, log_path)
     assert {:ok, _} = Application.ensure_all_started(:kyber)
 
     on_exit(fn ->
@@ -44,7 +49,7 @@ defmodule Kyber.Agent.T19OracleSeedBootTest do
       File.rm_rf(log_dir)
     end)
 
-    {:ok, keyring_dir: key_dir, agent_seed: agent_seed}
+    {:ok, keyring_dir: key_dir, agent_seed: agent_seed, log_path: log_path}
   end
 
   defp stop_app do
@@ -55,16 +60,19 @@ defmodule Kyber.Agent.T19OracleSeedBootTest do
     end
   end
 
+  defp boot(ctx) do
+    Daemon.boot(
+      keyring_dir: ctx.keyring_dir,
+      tick_ms: :manual,
+      loop: :reactor,
+      oracle_seed: :present,
+      budget_cap: 32,
+      test_pid: self()
+    )
+  end
+
   defp boot!(ctx) do
-    assert {:ok, _pid} =
-             Daemon.boot(
-               keyring_dir: ctx.keyring_dir,
-               tick_ms: :manual,
-               loop: :reactor,
-               oracle_seed: :present,
-               budget_cap: 32,
-               test_pid: self()
-             )
+    assert {:ok, _pid} = boot(ctx)
   end
 
   defp seed_claims do
@@ -80,16 +88,90 @@ defmodule Kyber.Agent.T19OracleSeedBootTest do
     Wire.envelope({claims, sig})
   end
 
+  defp seed_wire_id(seed, ts), do: signed_wire(seed, [@oracle_pointer], ts)["id"]
+
+  defp negate!(seed, id) do
+    wire =
+      signed_wire(
+        seed,
+        [%{role: "negates", target: {:delta, id, "retracted"}}],
+        1_754_600_000_000.0
+      )
+
+    assert :ok = DurableStore.append(wire)
+  end
+
+  defp negated?(id) do
+    Enum.any?(DurableStore.set(), fn {_id, {claims, _sig}} ->
+      Enum.any?(claims.pointers, &match?(%{role: "negates", target: {:delta, ^id, _ctx}}, &1))
+    end)
+  end
+
+  # the LOG, not the set: the set dedups by content id, so a re-append of an
+  # identical claim is invisible there — the append-only log records the line
+  defp logged_seed_lines(ctx) do
+    ctx.log_path
+    |> File.read!()
+    |> String.split("\n", trim: true)
+    |> Enum.filter(fn line ->
+      {:ok, wire} = Wire.decode(line)
+      match?([%{"role" => "seed"} | _rest], wire["claims"]["pointers"])
+    end)
+  end
+
   test "two boots against the same store append exactly ONE seed claim", ctx do
     boot!(ctx)
     assert [{first_id, first_claims}] = seed_claims()
     assert first_claims.timestamp == @oracle_seed_ts
+    assert length(logged_seed_lines(ctx)) == 1
 
     Daemon.stop()
     boot!(ctx)
 
-    # the second boot found the live claim and appended nothing
+    # the second boot found its own live claim and appended nothing — the
+    # log line count is what proves the skip, not the deduping set
     assert [{^first_id, _claims}] = seed_claims()
+    assert length(logged_seed_lines(ctx)) == 1
+  end
+
+  test "a live seed claim by ANOTHER author does not satisfy the boot flag", ctx do
+    foreign = signed_wire(@foreign_seed, [@oracle_pointer], @oracle_seed_ts)
+    assert :ok = DurableStore.append(foreign)
+
+    boot!(ctx)
+
+    claims_by_id = Map.new(seed_claims())
+    assert map_size(claims_by_id) == 2
+    assert [own_id] = Map.keys(claims_by_id) -- [foreign["id"]]
+
+    # the daemon appended its OWN claim: a foreign key's claim is one it
+    # cannot keep alive, so the gate would rest on a claim it does not sign
+    assert claims_by_id[own_id].author == Keys.author_for_seed(ctx.agent_seed)
+    refute negated?(own_id)
+  end
+
+  test "a mint whose derived id is already negated steps to a fresh one", ctx do
+    # merge-is-union: a negation can land BEFORE the claim it retracts, so
+    # the fixed-ts boot id can be dead with no seed claim in the store at all
+    negate!(ctx.agent_seed, seed_wire_id(ctx.agent_seed, @oracle_seed_ts))
+
+    boot!(ctx)
+
+    assert [{id, claims}] = seed_claims()
+    assert claims.timestamp == @oracle_seed_ts + 1
+    assert id == seed_wire_id(ctx.agent_seed, @oracle_seed_ts + 1)
+    refute negated?(id)
+  end
+
+  test "a boot that cannot mint a live seed refuses rather than reporting :ok", ctx do
+    for bump <- 0..10,
+        do: negate!(ctx.agent_seed, seed_wire_id(ctx.agent_seed, @oracle_seed_ts + bump))
+
+    assert {:error, {:oracle_seed, :negated_seed_id}} = boot(ctx)
+
+    # nothing was appended: a claim born retracted would leave the boot
+    # reporting success with the gate closed
+    assert seed_claims() == []
   end
 
   test "a retracted seed re-opens the gate with a NEW claim at a fresh ts", ctx do

@@ -17,6 +17,10 @@ defmodule Mix.Tasks.Kyber.Dashboard do
   plus the daemon's model flags (`--api-key-env`, `--operator-seed-env`,
   `--model`, `--base-url`, `--oracle-seed present|absent`). The reactor
   boots `engine: :none` unless an api key is supplied.
+
+  `--oracle-seed present` writes a seed claim to the target store, so it is
+  admitted only against a store under the system tmp dir or one the operator
+  marks with `--dev-store` (see `guard_oracle_seed/1`).
   """
 
   use Mix.Task
@@ -33,7 +37,8 @@ defmodule Mix.Tasks.Kyber.Dashboard do
           operator_seed_env: :string,
           model: :string,
           base_url: :string,
-          oracle_seed: :string
+          oracle_seed: :string,
+          dev_store: :boolean
         ]
       )
 
@@ -118,16 +123,26 @@ defmodule Mix.Tasks.Kyber.Dashboard do
 
   # The oracle gate is the operator's inference gate, and the dashboard is a
   # viewer: `--oracle-seed present` boots a daemon that appends a seed claim
-  # to the target store, so it is admitted only against a dev/test store
-  # (a `--log` path under the system tmp dir). Anywhere else the operator
-  # opens the gate through the config fold.
+  # to the target store, so it is admitted only against a dev store. Two
+  # ways to be one, either sufficient: the `--log` path lies under the
+  # system tmp dir (flag-free, so tests and throwaway stores need nothing
+  # extra), or the operator passes `--dev-store` (the deliberate opt-in for
+  # a store anywhere else). Neither => refuse; the operator opens the gate
+  # through the config fold.
+  #
+  # tmp-ness is a path-COMPONENT prefix, not a string prefix: `/tmpdata` is
+  # not under `/tmp`. TMPDIR is user-settable, which is why it cannot be the
+  # only admission — a relocated TMPDIR moves the flag-free case, it does
+  # not widen it.
   @doc false
   @spec guard_oracle_seed(keyword()) :: :ok
   def guard_oracle_seed(opts) do
-    if oracle_seed(opts[:oracle_seed]) == :present and not tmp_store?(opts[:log]) do
+    if oracle_seed(opts[:oracle_seed]) == :present and
+         not (tmp_store?(opts[:log]) or opts[:dev_store] == true) do
       Mix.raise(
         "--oracle-seed present would open the oracle gate on a real store; the dashboard " <>
-          "is a viewer. Open the gate with: kyber agent set <name> --oracle-seed present"
+          "is a viewer. Open the gate with: kyber agent set <name> --oracle-seed present " <>
+          "(or pass --dev-store if this store really is a dev store)"
       )
     end
 
@@ -136,8 +151,12 @@ defmodule Mix.Tasks.Kyber.Dashboard do
 
   defp tmp_store?(nil), do: false
 
-  defp tmp_store?(log),
-    do: String.starts_with?(Path.expand(log), Path.expand(System.tmp_dir!()))
+  defp tmp_store?(log) do
+    List.starts_with?(
+      Path.split(Path.expand(log)),
+      Path.split(Path.expand(System.tmp_dir!()))
+    )
+  end
 
   # T19 (P5 LOW): strict, mirroring resolve_operator_seed/1 — a typo'd
   # `--oracle-seed presnt` refuses loudly rather than coercing to :absent
