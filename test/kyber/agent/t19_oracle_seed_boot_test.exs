@@ -37,6 +37,14 @@ defmodule Kyber.Agent.T19OracleSeedBootTest do
   startup; and a flip that cannot be honored is latched, so a standing fold
   refuses once rather than on every later AgentSet.
 
+  Round 10 splits the flip latch by FAILURE CLASS. A latch inferred from the
+  failure counter treats a refused store write like a permanent refusal, so
+  one disk blip during an `absent` fold left the gate — the control that
+  authorizes model spend — standing OPEN against an explicit operator close,
+  with the standing fold skipping the flip on every pass and nothing ever
+  retrying. Transient store I/O now never latches; foreign claims holding the
+  gate open still do.
+
   Same discipline as reactor_test: tmp store + tmp keyring per test,
   `tick_ms: :manual`, no `Process.sleep`.
   """
@@ -738,6 +746,11 @@ defmodule Kyber.Agent.T19OracleSeedBootTest do
     assert refusals_in(first) == 1
     failures = Daemon.status().gate_flip_failures
 
+    # foreign claims holding the gate open is the PERMANENT class: this daemon
+    # does not retract what it did not sign, so no later fold has anything new
+    # to try. That — and only that — is what latches.
+    assert :sys.get_state(Daemon).gate_flip_latch == :absent
+
     # `oracle_seed` STANDS in the folded view, so every later AgentSet on this
     # agent — about anything at all — re-enters the flip path. Without the
     # latch each one re-scans the store and re-logs the same refusal.
@@ -770,6 +783,82 @@ defmodule Kyber.Agent.T19OracleSeedBootTest do
     assert Daemon.status().foreign_gate_claims_open == 2
   end
 
+  test "a TRANSIENT store failure on a close does NOT latch — the next fold retries", ctx do
+    # the round-9 latch read "unhonorable" off the failure counter, so ONE
+    # refused write during an `absent` fold latched :absent — and the fold is
+    # STANDING, so every later fold skipped the flip and the gate that
+    # authorizes model spend stayed OPEN against an explicit operator close,
+    # forever, with nothing ever retrying.
+    own = signed_wire(ctx.agent_seed, [@oracle_pointer], @oracle_seed_ts)
+    assert :ok = DurableStore.append(own)
+    {set_wire, set_claims} = set_delta(1_754_601_100_000.0, %{oracle_seed: "absent"})
+    assert :ok = DurableStore.append(set_wire)
+
+    heal = flaky_store!(ctx)
+
+    # :absent at boot, so the boot mints nothing — the live seed claim is the
+    # one replayed above, and it is THIS daemon's own
+    boot_agent!(ctx, oracle_seed: :absent)
+    assert gate_open?()
+    assert MapSet.member?(:sys.get_state(Daemon).own_seed_ids, own["id"])
+
+    log =
+      capture_log(fn ->
+        refold!(set_wire, set_claims)
+      end)
+
+    # the negation could not land, so the gate is still open and every channel
+    # says so
+    assert log =~ "close FAILED — gate still open on this daemon's OWN seed claim(s)"
+    assert Daemon.status().gate_flip_failures >= 1
+    refute negated?(own["id"])
+    assert gate_open?()
+
+    # ...and the flip did NOT latch: the claims are still ours to retract and
+    # the store may take the write next time
+    assert :sys.get_state(Daemon).gate_flip_latch == nil
+
+    heal.()
+
+    # the SAME standing `absent` fold, re-delivered: it retries the close and
+    # lands it
+    refold!(set_wire, set_claims)
+
+    assert eventually(fn -> negated?(own["id"]) end)
+    refute gate_open?()
+    assert :sys.get_state(Daemon).gate_flip_latch == nil
+  end
+
+  test "a TRANSIENT store failure on an OPEN does NOT latch — the next fold retries", ctx do
+    {set_wire, set_claims} = set_delta(1_754_601_200_000.0, %{oracle_seed: "present"})
+    assert :ok = DurableStore.append(set_wire)
+
+    heal = flaky_store!(ctx)
+
+    # :absent at boot, so the store carries no seed claim at all — the fold's
+    # `present` is what asks for the mint
+    boot_agent!(ctx, oracle_seed: :absent)
+    refute gate_open?()
+
+    log = capture_log(fn -> refold!(set_wire, set_claims) end)
+
+    assert log =~ "oracle gate open refused :persist_failed"
+    assert Daemon.status().gate_flip_failures >= 1
+    refute gate_open?()
+    assert :sys.get_state(Daemon).gate_flip_latch == nil
+
+    heal.()
+    refold!(set_wire, set_claims)
+
+    assert eventually(fn -> gate_open?() end)
+    assert :sys.get_state(Daemon).gate_flip_latch == nil
+
+    # the claim it finally minted is its OWN, exactly as the boot assert's
+    # would have been
+    assert [{_id, claims}] = seed_claims()
+    assert claims.author == Keys.author_for_seed(ctx.agent_seed)
+  end
+
   # an UNWRITABLE store, uid-independent (a chmod means nothing to root): the
   # log path is a symlink into a directory that does not exist, so the
   # store's lazy open fails :enoent for everyone. Replay is untouched — a
@@ -787,6 +876,56 @@ defmodule Kyber.Agent.T19OracleSeedBootTest do
     Application.put_env(:kyber, :log_path, broken)
     assert {:ok, _} = Application.ensure_all_started(:kyber)
     broken
+  end
+
+  # a store whose appends fail TRANSIENTLY, uid-independent for the same
+  # reason unwritable_store!/1 is: the log path is a SYMLINK the replay
+  # follows to a real file, and the store opens the log LAZILY (on the first
+  # append, never at boot). So the store replays the bytes, and removing the
+  # link's target DIRECTORY afterwards makes every append fail
+  # :persist_failed without ever touching a live handle; putting the
+  # directory back makes the next append land — a disk blip, not a permanent
+  # condition. The directory, not just the file: `Kyber.Log.open/1` opens
+  # append+CREATE, so a merely-missing file is created through the link.
+  #
+  # Returns a zero-arg fun that heals the store.
+  defp flaky_store!(ctx) do
+    Daemon.stop()
+    stop_app()
+
+    dir = Path.dirname(ctx.log_path)
+    live = Path.join(dir, "flaky-live")
+    target = Path.join(live, "store.jsonl")
+    link = Path.join(dir, "flaky.jsonl")
+    replayed = File.read!(ctx.log_path)
+    File.mkdir_p!(live)
+    File.write!(target, replayed)
+    File.ln_s!(target, link)
+
+    Application.put_env(:kyber, :log_path, link)
+    assert {:ok, _} = Application.ensure_all_started(:kyber)
+
+    File.rm_rf!(live)
+
+    fn ->
+      File.mkdir_p!(live)
+      File.write!(target, replayed)
+    end
+  end
+
+  # the AgentSet as the FEED hands it over ({:delta, id, claims} — the
+  # DurableStore fan-out contract), so a fold can be driven on a store that
+  # cannot take a write. The delta itself is in the store from before the
+  # break, which is what the re-fold's head check reads.
+  defp set_delta(ts, fields) do
+    {:ok, {claims, _sig} = signed} = AgentEvents.agent_set(@operator_seed, ts, "mokosh", fields)
+    {Wire.envelope(signed), claims}
+  end
+
+  defp refold!(wire, claims) do
+    folds = :sys.get_state(Daemon).folds_since_boot
+    send(Daemon, {:delta, wire["id"], claims})
+    assert eventually(fn -> :sys.get_state(Daemon).folds_since_boot > folds end)
   end
 
   # one fold, awaited: the daemon's loop is serialized, so a folds_since_boot

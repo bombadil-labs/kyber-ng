@@ -1032,11 +1032,15 @@ defmodule Kyber.Daemon do
       {:ok, want} ->
         if Map.get(state, :gate_flip_latch) == want,
           do: state,
-          else: latch_gate_flip(state, want, flip_gate(state, want))
+          else: flip_gate(state, want)
     end
   end
 
   defp flip_gate(state, want) do
+    # the latch is decided per flip: cleared going in, set again only by the
+    # paths below that hit a PERMANENT failure
+    state = clear_gate_flip_latch(state)
+
     cond do
       want == :present and cached_own_live_seed(state) == nil ->
         open_gate_hot(state)
@@ -1059,21 +1063,26 @@ defmodule Kyber.Daemon do
   # the same refusal on every fold. So an unhonorable `want` is LATCHED and
   # skipped until something gate-relevant changes.
   #
-  # "Unhonorable" is read off the failure counter rather than a return value:
-  # every path that could not honor a flip goes through
-  # note_gate_flip_failure/2, so the counter moving IS the signal. A flip that
-  # succeeded clears the latch — the cond's own conditions make the next fold
-  # a no-op anyway.
+  # "Unhonorable" is a PERMANENT failure, and only the failing path knows
+  # which class it is in — so each one says so explicitly here rather than
+  # having the latch infer it. The permanent classes are the ones a later
+  # fold has nothing new to try against: foreign claims hold the gate open
+  # (this daemon does not retract what it did not sign), or a peer is
+  # negating the ids this daemon mints.
+  #
+  # TRANSIENT store I/O — `{:error, :persist_failed}`, which collapses the
+  # lazy open and the write itself — NEVER latches. A disk that refused this
+  # write can take the next one, and latching there would leave the gate
+  # standing at the opposite of what the operator asked for, permanently,
+  # after one blip.
   #
   # track_seed_claims/3 clears the latch when a FOREIGN seed or negates delta
   # arrives (see there): the store changed in a way that can change the
   # answer. Our own negations are excluded — they are what produced the
   # latched state, and letting them clear it would restore the spam.
-  defp latch_gate_flip(state, want, next) do
-    if Map.get(next, :gate_flip_failures, 0) > Map.get(state, :gate_flip_failures, 0),
-      do: Map.put(next, :gate_flip_latch, want),
-      else: Map.put(next, :gate_flip_latch, nil)
-  end
+  defp set_gate_flip_latch(state, want), do: Map.put(state, :gate_flip_latch, want)
+
+  defp clear_gate_flip_latch(state), do: Map.put(state, :gate_flip_latch, nil)
 
   defp open_gate_hot(state) do
     # the negated set is re-scanned rather than read off the cache: the mint
@@ -1089,8 +1098,14 @@ defmodule Kyber.Daemon do
             narrate(state, "oracle gate open via config hot-swap")
             state
 
+          # a negation raced the append: the mint is dead on arrival. Something
+          # is actively negating what this daemon mints, so re-minting on every
+          # later fold is spam — PERMANENT. The racing negation is itself a
+          # foreign delta, so the feed re-arms the latch when it arrives.
           {:error, :gate_closed} ->
-            note_gate_flip_failure(state, "oracle gate open FAILED — gate closed")
+            state
+            |> note_gate_flip_failure("oracle gate open FAILED — gate closed")
+            |> set_gate_flip_latch(:present)
         end
 
       # the flip append is rare — a rebuild HERE (not per delta) keeps the
@@ -1098,8 +1113,19 @@ defmodule Kyber.Daemon do
       # re-delivery is then idempotent
       init_seed_cache(state)
     else
+      # the store did not take the mint. TRANSIENT: the next fold retries,
+      # so this must not latch.
+      {:error, :persist_failed} ->
+        note_gate_flip_failure(
+          state,
+          "oracle gate open refused :persist_failed — the store did not take the mint; the " <>
+            "next fold RETRIES"
+        )
+
       {:error, reason} ->
-        note_gate_flip_failure(state, "oracle gate open refused #{inspect(reason)}")
+        state
+        |> note_gate_flip_failure("oracle gate open refused #{inspect(reason)}")
+        |> set_gate_flip_latch(:present)
     end
   end
 
@@ -1151,21 +1177,53 @@ defmodule Kyber.Daemon do
 
     # the postcondition is read off the STORE, not the cache: the narration
     # must not report a closed gate the reactor would still read as open
-    cond do
-      foreign_ids != [] ->
-        note_gate_flip_failure(
-          state,
-          "oracle gate STILL OPEN on #{length(foreign_ids)} foreign seed claim(s) — the close " <>
-            "was refused for claims this daemon did not sign; model initiation may proceed on " <>
-            "their authority until their own agents retract them"
-        )
+    if foreign_ids != [] do
+      state
+      |> note_gate_flip_failure(
+        "oracle gate STILL OPEN on #{length(foreign_ids)} foreign seed claim(s) — the close " <>
+          "was refused for claims this daemon did not sign; model initiation may proceed on " <>
+          "their authority until their own agents retract them"
+      )
+      |> set_gate_flip_latch(:absent)
+    else
+      close_postcondition(state)
+    end
+  end
 
-      any_live_seed?() ->
-        note_gate_flip_failure(state, "oracle gate close FAILED — gate still open")
-
-      true ->
+  # the gate is open when the operator asked for it shut; the only question
+  # left is whether another fold could shut it. The discriminator is the
+  # SIGNING AUTHOR of what is still live:
+  #
+  # - all OURS => the negations above did not land (the store refused the
+  #   write). TRANSIENT — the claims are still ours to retract and the next
+  #   fold must retry, so the latch stays clear.
+  # - one we did NOT sign => a permanent hold, for the same reason the split
+  #   above refuses foreign claims. Latch it.
+  #
+  # Reaching the foreign half HERE takes a foreign claim landing between the
+  # author split above and this scan: every foreign claim the cache already
+  # knew about went to the branch above.
+  defp close_postcondition(state) do
+    case live_seed_authors() do
+      [] ->
         narrate(state, "oracle gate closed via config hot-swap")
         state
+
+      authors ->
+        if Enum.all?(authors, &(&1 == state.author)) do
+          note_gate_flip_failure(
+            state,
+            "oracle gate close FAILED — gate still open on this daemon's OWN seed claim(s): the " <>
+              "negations did not land. The next fold RETRIES the close."
+          )
+        else
+          state
+          |> note_gate_flip_failure(
+            "oracle gate close FAILED — gate still open on a seed claim this daemon did not " <>
+              "sign, which landed mid-close; this daemon does not retract what it did not sign"
+          )
+          |> set_gate_flip_latch(:absent)
+        end
     end
   end
 
@@ -1195,9 +1253,14 @@ defmodule Kyber.Daemon do
         do: {id, claims.author}
   end
 
-  defp any_live_seed? do
+  defp any_live_seed?, do: live_seed_authors() != []
+
+  # the signing author of every live seed claim in the store — the close
+  # postcondition's discriminator (see close_postcondition/1)
+  defp live_seed_authors do
     {seeds, negated} = scan_seed_claims()
-    Enum.any?(seeds, fn {id, _claims} -> not MapSet.member?(negated, id) end)
+
+    for {id, claims} <- seeds, not MapSet.member?(negated, id), do: claims.author
   end
 
   # P5 round-6 LOW-2: the gate's seed-claim state is CACHED — one boot-time
