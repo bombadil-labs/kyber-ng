@@ -37,6 +37,8 @@ defmodule Mix.Tasks.Kyber.Dashboard do
         ]
       )
 
+    :ok = guard_oracle_seed(opts)
+
     if opts[:log], do: Application.put_env(:kyber, :log_path, opts[:log])
 
     if opts[:port] do
@@ -113,6 +115,29 @@ defmodule Mix.Tasks.Kyber.Dashboard do
       narrate: true
     ]
   end
+
+  # The oracle gate is the operator's inference gate, and the dashboard is a
+  # viewer: `--oracle-seed present` boots a daemon that appends a seed claim
+  # to the target store, so it is admitted only against a dev/test store
+  # (a `--log` path under the system tmp dir). Anywhere else the operator
+  # opens the gate through the config fold.
+  @doc false
+  @spec guard_oracle_seed(keyword()) :: :ok
+  def guard_oracle_seed(opts) do
+    if oracle_seed(opts[:oracle_seed]) == :present and not tmp_store?(opts[:log]) do
+      Mix.raise(
+        "--oracle-seed present would open the oracle gate on a real store; the dashboard " <>
+          "is a viewer. Open the gate with: kyber agent set <name> --oracle-seed present"
+      )
+    end
+
+    :ok
+  end
+
+  defp tmp_store?(nil), do: false
+
+  defp tmp_store?(log),
+    do: String.starts_with?(Path.expand(log), Path.expand(System.tmp_dir!()))
 
   # T19 (P5 LOW): strict, mirroring resolve_operator_seed/1 — a typo'd
   # `--oracle-seed presnt` refuses loudly rather than coercing to :absent

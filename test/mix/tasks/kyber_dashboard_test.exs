@@ -8,7 +8,8 @@ defmodule Mix.Tasks.Kyber.DashboardTest do
   What is pinned: the flat engine shape (no `:llm` wrapper — the reactor
   builds the handler), the AC22 redact seeding (api key AND operator seed,
   so neither survives to the wire on this path), the strict `--oracle-seed`
-  parse, and the 64-hex operator-seed gate.
+  parse, the viewer refusal of `--oracle-seed present` on a real store, and
+  the 64-hex operator-seed gate.
   """
 
   use ExUnit.Case, async: false
@@ -86,6 +87,36 @@ defmodule Mix.Tasks.Kyber.DashboardTest do
     # :absent (which would refuse every model initiation with no signal)
     assert_raise Mix.Error, ~r/--oracle-seed must be present or absent/, fn ->
       Dashboard.build_boot_opts([oracle_seed: "presnt"], "/k", nil, nil)
+    end
+  end
+
+  test "--oracle-seed present is refused unless the store is a tmp dev store" do
+    real = Path.join(System.user_home!(), ".kyber/store.jsonl")
+    tmp = Path.join(System.tmp_dir!(), "kyber-dashboard-test/store.jsonl")
+
+    error =
+      assert_raise Mix.Error, fn ->
+        Dashboard.guard_oracle_seed(oracle_seed: "present", log: real)
+      end
+
+    assert error.message =~ "would open the oracle gate on a real store"
+    assert error.message =~ "kyber agent set <name> --oracle-seed present"
+
+    # no --log at all resolves to the configured store — also a real one
+    assert_raise Mix.Error, fn -> Dashboard.guard_oracle_seed(oracle_seed: "present") end
+
+    assert Dashboard.guard_oracle_seed(oracle_seed: "present", log: tmp) == :ok
+  end
+
+  test "the guard is silent for --oracle-seed absent, whatever the store" do
+    real = Path.join(System.user_home!(), ".kyber/store.jsonl")
+
+    assert Dashboard.guard_oracle_seed(oracle_seed: "absent", log: real) == :ok
+    assert Dashboard.guard_oracle_seed(log: real) == :ok
+
+    # the strict parse still runs ahead of the store check
+    assert_raise Mix.Error, ~r/--oracle-seed must be present or absent/, fn ->
+      Dashboard.guard_oracle_seed(oracle_seed: "presnt", log: real)
     end
   end
 

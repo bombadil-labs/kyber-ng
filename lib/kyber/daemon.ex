@@ -224,12 +224,11 @@ defmodule Kyber.Daemon do
 
       case loop do
         :reactor ->
-          # pin 17: the oracle_seed boot-opt assertion — `:present` appends
-          # ONE fixed-content seed delta at boot, signed by the daemon's
-          # existing boot key (fixed content => fixed content-derived id =>
-          # the two-boot AC5 companion holds). M2: retraction-detection (a
-          # negates pointer targeting the seed id) is the gate's closing
-          # mechanism — the reactor reads it from store state.
+          # pin 17: the oracle_seed boot-opt assertion — `:present` asserts
+          # ONE live seed delta at boot, signed by the daemon's existing
+          # boot key. M2: retraction-detection (a negates pointer targeting
+          # the seed id) is the gate's closing mechanism — the reactor reads
+          # it from store state.
           reactor_opts = reactor_opts(opts, seed)
 
           with :ok <- assert_oracle_seed(state, opts),
@@ -809,24 +808,33 @@ defmodule Kyber.Daemon do
     end
   end
 
-  # pin 17: the oracle_seed assertion — :present appends ONE fixed-content
-  # seed delta (fixed timestamp + fixed pointers, signed by the daemon's
-  # boot key) so its content-derived id is deterministic across boots; the
-  # reactor's gate reads it from store state. :absent (the default) appends
-  # nothing. A failed append refuses the boot.
+  # pin 17: the oracle_seed assertion — :present appends ONE seed delta
+  # (fixed pointers, signed by the daemon's boot key) when the store holds
+  # no live one; the reactor's gate reads it from store state. :absent (the
+  # default) appends nothing. A failed append refuses the boot.
+  #
+  # The timestamp follows the D6 rule (sync_oracle_gate/2): the fixed ts —
+  # so the id is deterministic across boots for the two-boot AC5 companion
+  # — unless a seed claim already exists, in which case it is retracted and
+  # holds that content id, and a fresh ts mints a claim the retraction
+  # cannot absorb.
   defp assert_oracle_seed(state, opts) do
     case Keyword.get(opts, :oracle_seed, :absent) do
       :present ->
-        wire =
-          build_signed(
-            state,
-            [%{role: "seed", target: {:entity, "oracle", "seed"}}],
-            @oracle_seed_ts
-          )
+        # read the store directly: the seed cache is built only under an
+        # agent identity, and the assert runs on every reactor boot
+        {seeds, negated} = scan_seed_claims()
 
-        case DurableStore.append(wire) do
-          :ok -> :ok
-          {:error, reason} -> {:error, {:oracle_seed, reason}}
+        if Enum.any?(seeds, &(not MapSet.member?(negated, &1))) do
+          :ok
+        else
+          ts = if MapSet.size(seeds) > 0, do: now_ts(), else: @oracle_seed_ts
+          wire = build_signed(state, [%{role: "seed", target: {:entity, "oracle", "seed"}}], ts)
+
+          case DurableStore.append(wire) do
+            :ok -> :ok
+            {:error, reason} -> {:error, {:oracle_seed, reason}}
+          end
         end
 
       :absent ->
@@ -901,6 +909,12 @@ defmodule Kyber.Daemon do
   # all?} — the second element tells the re-open path the fixed-content
   # boot id is already taken by a retracted claim.
   defp init_seed_cache(state) do
+    {seeds, negated} = scan_seed_claims()
+    Map.merge(state, %{seed_ids: seeds, negated_ids: negated})
+  end
+
+  # one full-store scan: {seed claim ids, negation targets}
+  defp scan_seed_claims do
     set = DurableStore.set()
 
     negated =
@@ -915,7 +929,7 @@ defmodule Kyber.Daemon do
           into: MapSet.new(),
           do: id
 
-    Map.merge(state, %{seed_ids: seeds, negated_ids: negated})
+    {seeds, negated}
   end
 
   # negation targets are tracked unconditionally, never only for known
