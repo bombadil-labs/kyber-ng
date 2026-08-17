@@ -30,6 +30,7 @@ defmodule Mix.Tasks.Kyber.Dashboard do
           keyring: :string,
           port: :integer,
           api_key_env: :string,
+          operator_seed_env: :string,
           model: :string,
           base_url: :string,
           oracle_seed: :string
@@ -66,14 +67,20 @@ defmodule Mix.Tasks.Kyber.Dashboard do
           :none
 
         key ->
-          [llm: Keyword.new(api_key: key, model: opts[:model], base_url: opts[:base_url])]
+          Keyword.new(api_key: key, model: opts[:model], base_url: opts[:base_url])
       end
 
     boot_opts =
       [
         keyring_dir: keyring,
         loop: :reactor,
-        oracle_seed: opts[:oracle_seed] || :absent,
+        channel_socket: :default,
+        operator_seed: resolve_operator_seed(opts[:operator_seed_env]),
+        oracle_seed:
+          case opts[:oracle_seed] do
+            "present" -> :present
+            _ -> :absent
+          end,
         engine: engine,
         narrate: true
       ]
@@ -89,6 +96,24 @@ defmodule Mix.Tasks.Kyber.Dashboard do
 
       {:error, reason} ->
         Mix.raise("daemon boot failed: #{inspect(reason)}")
+    end
+  end
+
+  # Mirrors Kyber.CLI.resolve_operator_seed/1: an absent env NAME or an unset
+  # env is a nil seed (sends refuse — the no_operator_seed gate); a set value
+  # must be 64-hex. The VALUE never rides argv and is never printed.
+  defp resolve_operator_seed(nil), do: nil
+
+  defp resolve_operator_seed(var) do
+    case System.get_env(var) do
+      nil ->
+        nil
+
+      value ->
+        case Base.decode16(String.trim(value), case: :mixed) do
+          {:ok, <<_::binary-32>>} -> String.downcase(String.trim(value))
+          _garbage -> Mix.raise("#{var} must be a 64-hex (32-byte) operator seed")
+        end
     end
   end
 end
