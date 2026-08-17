@@ -150,9 +150,13 @@ defmodule Mix.Tasks.Kyber.Dashboard do
   # opt-in for a store anywhere else).
   #
   # tmp-ness is a path-COMPONENT prefix, not a string prefix: `/tmpdata` is
-  # not under `/tmp`. TMPDIR is user-settable, which is why it cannot be the
-  # only admission — a relocated TMPDIR moves the flag-free case, it does
-  # not widen it.
+  # not under `/tmp`. TMPDIR is user-settable, and a relocated TMPDIR CAN
+  # widen the admission on its own — `TMPDIR=$HOME` would make
+  # `~/.kyber/store.jsonl` "under tmp", admitting a real store flag-free.
+  # So the tmp check is intersected with a literal `/tmp` component anchor:
+  # the store must be under `System.tmp_dir!()` AND under `/tmp`. A TMPDIR
+  # pointed anywhere else refuses, and `--dev-store` is the only way to
+  # admit a store outside `/tmp`.
   @doc false
   @spec guard_oracle_seed(keyword()) :: :ok
   def guard_oracle_seed(opts) do
@@ -175,10 +179,10 @@ defmodule Mix.Tasks.Kyber.Dashboard do
   defp tmp_store?(nil), do: false
 
   defp tmp_store?(log) do
-    List.starts_with?(
-      Path.split(Path.expand(log)),
-      Path.split(Path.expand(System.tmp_dir!()))
-    )
+    components = Path.split(Path.expand(log))
+
+    List.starts_with?(components, Path.split(Path.expand(System.tmp_dir!()))) and
+      match?(["/", "tmp" | _rest], components)
   end
 
   # T19 (P5 LOW): strict, mirroring resolve_operator_seed/1 — a typo'd

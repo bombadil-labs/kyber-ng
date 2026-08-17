@@ -21,6 +21,14 @@ defmodule Kyber.Agent.T19OracleSeedBootTest do
   a claim the close negates, and surfaces flips the daemon could not honor
   as `gate_flip_failures` in status.
 
+  Round 8 makes the two retraction reads agree pointer-for-pointer (a claim
+  whose SECOND `negates` pointer targets the seed closes the gate for the
+  reactor too), proves the fail-soft boot end to end against a REAL refused
+  append rather than the counter helper, and pins the close path's honesty:
+  each foreign retraction is attributed, a repeated `absent` fold re-negates
+  nothing, and a boot that could not mint says which of the two it is —
+  refuse-only, or open on someone else's claim.
+
   Same discipline as reactor_test: tmp store + tmp keyring per test,
   `tick_ms: :manual`, no `Process.sleep`.
   """
@@ -29,7 +37,7 @@ defmodule Kyber.Agent.T19OracleSeedBootTest do
 
   import ExUnit.CaptureLog
 
-  alias Kyber.{Daemon, DurableStore, Events, Keys, Wire}
+  alias Kyber.{Daemon, DurableStore, Events, Keys, Schema, Wire}
   alias Kyber.Agent.Events, as: AgentEvents
   alias Rhizomatic.Delta
 
@@ -485,6 +493,243 @@ defmodule Kyber.Agent.T19OracleSeedBootTest do
                  not negated?(id)
              end)
            end)
+  end
+
+  test "a seed retracted by a claim's SECOND negates pointer is closed for the reactor too",
+       ctx do
+    boot!(ctx)
+    assert [{seed_id, _claims}] = seed_claims()
+
+    # both reads agree the gate is OPEN: the daemon minted a live seed and
+    # the reactor initiates on it
+    open_id = received!("message:t19os:agree-open", "gate agrees open", 1_754_610_000_000)
+    assert_receive {:reactor, {:dispatch, "received", ^open_id}}, 2_000
+    assert poll_store(&prompt_ref?(&1, open_id))
+
+    # the retraction a first-pointer-only read misses: TWO negates pointers,
+    # the seed at the SECOND. The daemon's close path honours every pointer,
+    # so a reactor that read only the first would keep initiating after the
+    # operator was told the gate was shut.
+    unrelated = seed_wire_id(ctx.agent_seed, 1_754_620_000_000.0)
+
+    two_negates =
+      signed_wire(
+        @operator_seed,
+        [
+          %{role: "negates", target: {:delta, unrelated, "retracted"}},
+          %{role: "negates", target: {:delta, seed_id, "retracted"}}
+        ],
+        1_754_630_000_000.0
+      )
+
+    assert :ok = DurableStore.append(two_negates)
+    assert negated?(seed_id)
+    refute gate_open?()
+
+    closed_id = received!("message:t19os:agree-shut", "gate agrees shut", 1_754_640_000_000)
+    assert_receive {:reactor, {:dispatch, "received", ^closed_id}}, 2_000
+
+    assert %{type: "GateDecision", verdict: "refuse", policy: "oracle_gate"} =
+             refusal_for(closed_id)
+
+    refute Enum.any?(DurableStore.set(), &prompt_ref?(&1, closed_id))
+  end
+
+  test "the single-negates retraction agrees the same way", ctx do
+    boot!(ctx)
+    assert [{seed_id, _claims}] = seed_claims()
+
+    negate!(@operator_seed, seed_id)
+    assert negated?(seed_id)
+    refute gate_open?()
+
+    received_id = received!("message:t19os:single", "one negates pointer", 1_754_650_000_000)
+    assert_receive {:reactor, {:dispatch, "received", ^received_id}}, 2_000
+
+    assert %{type: "GateDecision", verdict: "refuse", policy: "oracle_gate"} =
+             refusal_for(received_id)
+  end
+
+  test "a boot whose seed append FAILS still boots, counts, and refuses", ctx do
+    # the real failure, not the counter helper: the log file is read-only, so
+    # the store's lazy open refuses and the mint never lands
+    break_appends!(ctx)
+
+    log = capture_log(fn -> boot!(ctx) end)
+
+    assert log =~ "NO live seed claim exists"
+    assert log =~ "refuse-only"
+    assert Daemon.status().gate_flip_failures == 1
+    assert seed_claims() == []
+
+    restore_appends!(ctx)
+
+    # the posture the message promised: model initiation refuses
+    received_id = received!("message:t19os:failsoft", "no gate", 1_754_660_000_000)
+    assert_receive {:reactor, {:dispatch, "received", ^received_id}}, 2_000
+
+    assert %{type: "GateDecision", verdict: "refuse", policy: "oracle_gate"} =
+             refusal_for(received_id)
+  end
+
+  test "a failed mint over a FOREIGN live seed says the gate is open, not refuse-only", ctx do
+    foreign = signed_wire(@foreign_seed, [@oracle_pointer], @oracle_seed_ts)
+    assert :ok = DurableStore.append(foreign)
+
+    break_appends!(ctx)
+
+    log = capture_log(fn -> boot!(ctx) end)
+
+    # the daemon has no claim of its own, but the reactor's gate is OPEN on
+    # the foreign one — "refuse-only" would be a lie in exactly the case
+    # where model initiation still proceeds
+    assert log =~ "NOT opened by THIS daemon"
+    assert log =~ "foreign claim this daemon cannot retract or keep alive"
+    refute log =~ "boots refuse-only"
+    assert Daemon.status().gate_flip_failures == 1
+
+    restore_appends!(ctx)
+
+    received_id = received!("message:t19os:foreign-open", "foreign gate", 1_754_670_000_000)
+    assert_receive {:reactor, {:dispatch, "received", ^received_id}}, 2_000
+    assert poll_store(&prompt_ref?(&1, received_id))
+  end
+
+  test "a close whose negations cannot land reports the gate STILL OPEN", ctx do
+    foreign = signed_wire(@foreign_seed, [@oracle_pointer], @oracle_seed_ts)
+    assert :ok = DurableStore.append(foreign)
+
+    # the fold delta is appended BEFORE the appends are broken and replayed
+    # into the daemon by hand: the feed's own delivery would race the chmod
+    set_id = append_set!(1_754_600_600_000.0, %{oracle_seed: "absent"})
+    {set_claims, _sig} = Map.fetch!(DurableStore.set(), set_id)
+
+    boot_agent!(ctx)
+    live_before = for {id, _claims} <- seed_claims(), not negated?(id), do: id
+    assert length(live_before) == 2
+
+    break_appends!(ctx)
+
+    log =
+      capture_log(fn ->
+        # the same message the store's fan-out sends, for a delta that IS in
+        # the store; the call behind it is the barrier (the daemon's loop is
+        # serialized, so a reply means the fold ahead of it has run)
+        send(Daemon, {:delta, set_id, set_claims})
+        assert %{} = Daemon.status()
+      end)
+
+    assert log =~ "oracle gate close refused"
+    assert log =~ "gate still open"
+    assert Daemon.status().gate_flip_failures >= 1
+
+    # the daemon survived and the store still tells the truth: nothing was
+    # retracted, so the gate the reactor reads is the gate the log describes
+    assert Process.alive?(Process.whereis(Daemon))
+    assert Enum.all?(live_before, fn id -> not negated?(id) end)
+    assert gate_open?()
+
+    restore_appends!(ctx)
+  end
+
+  test "a repeated absent fold re-negates nothing, and names each foreign author", ctx do
+    foreign = signed_wire(@foreign_seed, [@oracle_pointer], @oracle_seed_ts)
+    assert :ok = DurableStore.append(foreign)
+
+    boot_agent!(ctx)
+    live_before = for {id, _claims} <- seed_claims(), not negated?(id), do: id
+    assert length(live_before) == 2
+
+    log =
+      capture_log(fn ->
+        append_set!(1_754_600_700_000.0, %{oracle_seed: "absent"})
+        assert eventually(fn -> Enum.all?(live_before, &negated?/1) end)
+      end)
+
+    # the foreign retraction is attributed: a close that walks over another
+    # principal's claims is visible without the operator having opted into
+    # narration
+    assert log =~ "retracting foreign seed claim #{String.slice(foreign["id"], 0, 8)}"
+    assert log =~ "author #{Keys.author_for_seed(@foreign_seed)}"
+
+    # exactly ONE negation per live claim, and a SECOND absent fold adds none:
+    # a re-fold against an already-closed gate must not re-negate a federated
+    # peer's claim on every pass
+    assert Enum.all?(live_before, fn id -> logged_negations_for(ctx, id) == 1 end)
+
+    folds = :sys.get_state(Daemon).folds_since_boot
+    append_set!(1_754_600_800_000.0, %{oracle_seed: "absent"})
+    assert eventually(fn -> :sys.get_state(Daemon).folds_since_boot > folds end)
+
+    assert Enum.all?(live_before, fn id -> logged_negations_for(ctx, id) == 1 end)
+  end
+
+  # a REAL append refusal, not a stubbed one: the store opens the log lazily
+  # and caches the io handle, so the handle is dropped (and closed) first and
+  # write permission is taken off the file — the next append re-opens into
+  # :eacces. The DIRECTORY stays writable: the daemon's boot lock lives there,
+  # and a read-only dir would refuse the boot for an unrelated reason.
+  defp break_appends!(ctx) do
+    :sys.replace_state(DurableStore, fn state ->
+      if is_pid(state.io), do: File.close(state.io)
+      %{state | io: nil}
+    end)
+
+    File.touch!(ctx.log_path)
+    File.chmod!(ctx.log_path, 0o444)
+    on_exit(fn -> File.chmod(ctx.log_path, 0o644) end)
+  end
+
+  defp restore_appends!(ctx), do: File.chmod!(ctx.log_path, 0o644)
+
+  defp received!(message_id, body, ts) do
+    {:ok, signed} =
+      Events.message_received(
+        @human_seed,
+        ts,
+        message_id,
+        "channel:reactor",
+        "session:reactor",
+        body
+      )
+
+    wire = Wire.envelope(signed)
+    assert :ok = DurableStore.append(wire)
+    wire["id"]
+  end
+
+  defp prompt_ref?({_id, {claims, _sig}}, received_id) do
+    match?(
+      [%{role: "promptRef", target: {:delta, ^received_id, "requested"}} | _rest],
+      claims.pointers
+    )
+  end
+
+  defp refusal_for(received_id) do
+    case poll_store(&refusal?(&1, received_id)) do
+      {_id, {claims, _sig}} -> Schema.resolve(claims)
+      nil -> nil
+    end
+  end
+
+  defp refusal?({_id, {claims, _sig}}, received_id) do
+    match?([%{role: "decides"} | _rest], claims.pointers) and
+      Schema.resolve(claims).decides == {:delta, received_id, "decided"}
+  end
+
+  # the LOG, not the set: a re-negation at a fresh timestamp is a DISTINCT
+  # content id, so the deduping set cannot tell one close from two
+  defp logged_negations_for(ctx, target) do
+    ctx.log_path
+    |> File.read!()
+    |> String.split("\n", trim: true)
+    |> Enum.count(fn line ->
+      {:ok, wire} = Wire.decode(line)
+
+      Enum.any?(wire["claims"]["pointers"], fn pointer ->
+        pointer["role"] == "negates" and pointer["target"]["delta"] == target
+      end)
+    end)
   end
 
   # the reactor's own gate read (pin 16): any unretracted claim whose first

@@ -610,15 +610,19 @@ defmodule Kyber.Agent.Reactor do
   # retraction-detection scans for a negates pointer targeting the seed id.
   # ANY-unretracted, not find-first: a D6 hot-flip cycle (close, re-open)
   # leaves a retracted seed alongside a fresh live one in the store.
+  #
+  # The retraction read is retracted_ids/1 — EVERY negates pointer on every
+  # claim, not the first one a claim carries. It has to be the same read the
+  # daemon's close path uses (daemon.ex scan_seed_claims/0): a claim whose
+  # second pointer negates the seed retracts it there, so a first-pointer-only
+  # read here would leave the gate open after the operator was told it was
+  # closed — a fail-open on the control that gates model spend.
   defp gate_open? do
-    Enum.any?(DurableStore.set(), fn {id, {claims, _sig}} ->
-      kind(claims) == "seed" and not retracted?(id)
-    end)
-  end
+    set = DurableStore.set()
+    retracted = retracted_ids(set)
 
-  defp retracted?(seed_id) do
-    Enum.any?(DurableStore.set(), fn {_id, {claims, _sig}} ->
-      match?({:delta, ^seed_id, _ctx}, pointer(claims, "negates"))
+    Enum.any?(set, fn {id, {claims, _sig}} ->
+      kind(claims) == "seed" and not MapSet.member?(retracted, id)
     end)
   end
 

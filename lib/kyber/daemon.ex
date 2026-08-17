@@ -858,13 +858,28 @@ defmodule Kyber.Daemon do
     end
   end
 
+  # the message reads the ACTUAL gate before narrating. The boot skip is
+  # author-scoped, so a failed mint does not imply a closed gate: a foreign
+  # live seed claim holds the gate open for the reactor while this daemon has
+  # no claim of its own. Telling the operator "refuse-only" there is wrong in
+  # exactly the dangerous case — model initiation proceeds on a claim this
+  # daemon can neither keep alive nor retract.
   defp warn_gate_not_opened(state, reason) do
-    note_gate_flip_failure(
-      state,
-      "oracle gate NOT opened (#{inspect(reason)}) — this daemon boots refuse-only: " <>
-        "model initiation will REFUSE until the gate is opened " <>
-        "(kyber agent set <name> --oracle-seed present)"
-    )
+    if any_live_seed?() do
+      note_gate_flip_failure(
+        state,
+        "oracle gate NOT opened by THIS daemon (#{inspect(reason)}), but the gate is OPEN on a " <>
+          "foreign claim this daemon cannot retract or keep alive — model initiation may " <>
+          "proceed on that claim's authority"
+      )
+    else
+      note_gate_flip_failure(
+        state,
+        "oracle gate NOT opened (#{inspect(reason)}) and NO live seed claim exists — this " <>
+          "daemon boots refuse-only: model initiation will REFUSE until the gate is opened " <>
+          "(kyber agent set <name> --oracle-seed present)"
+      )
+    end
   end
 
   # `gate_flip_failures`: the count of gate-open/close requests this daemon
@@ -1051,13 +1066,28 @@ defmodule Kyber.Daemon do
   # operator closing a store-global gate is asking for. Should the gate ever
   # become per-agent, this close must scope to the agent's own claims — a
   # follow-up, not built here (it would change pin 16's semantics).
+  #
+  # The AUTHORITY for retracting another principal's claim is established
+  # upstream, not here: `oracle_seed` is an @operator_only field
+  # (Config.apply_fields), so an agent-authored AgentSet naming it is
+  # fold-inert. A fold that reaches this function asking for :absent is
+  # operator-attested by construction — the daemon's own admitted_author?/2 is
+  # the weaker check (it also admits the agent's own author) and is not what
+  # carries this. Each FOREIGN retraction is narrated and logged individually
+  # with its author, so a close that walks over a federated peer's claims is
+  # visible rather than folded into one "gate closed" line.
   defp close_gate_hot(state, live_ids) do
+    authors = seed_authors(live_ids)
+
     state =
       Enum.reduce(live_ids, state, fn id, acc ->
         wire = build_signed(acc, [%{role: "negates", target: {:delta, id, "retracted"}}])
 
         case DurableStore.append(wire) do
           :ok ->
+            unless MapSet.member?(acc.own_seed_ids, id),
+              do: note_foreign_retraction(acc, id, authors[id])
+
             %{acc | negated_ids: MapSet.put(acc.negated_ids, id)}
 
           {:error, reason} ->
@@ -1073,6 +1103,31 @@ defmodule Kyber.Daemon do
       narrate(state, "oracle gate closed via config hot-swap")
       state
     end
+  end
+
+  # a retraction against someone else's claim goes to the LOG as well as the
+  # narration: narration is opt-in (narrate: false by default), and a close
+  # that repeatedly retracts a federated peer's fresh claims is precisely the
+  # thing an operator needs to see without having asked for it in advance.
+  #
+  # The author rides in FULL: `short/1` keeps eight characters, which the
+  # "ed25519:" prefix consumes entirely — a peer identity has to be
+  # unambiguous here or the line says nothing about who was retracted.
+  defp note_foreign_retraction(state, id, author) do
+    message =
+      "oracle gate close: retracting foreign seed claim #{short(id)} (author #{author})"
+
+    Logger.warning("kyber: " <> message)
+    narrate(state, message)
+  end
+
+  defp seed_authors(ids) do
+    wanted = MapSet.new(ids)
+
+    for {id, {claims, _sig}} <- DurableStore.set(),
+        MapSet.member?(wanted, id),
+        into: %{},
+        do: {id, claims.author}
   end
 
   defp any_live_seed? do

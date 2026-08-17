@@ -143,7 +143,30 @@ defmodule Mix.Tasks.Kyber.DashboardTest do
     end
   end
 
-  test "a relocated TMPDIR moves the flag-free case, it does not widen it" do
+  test "a relocated TMPDIR cannot WIDEN the admission: TMPDIR=$HOME still refuses" do
+    # TMPDIR is user-settable, so `under System.tmp_dir!()` alone would admit
+    # a real store flag-free the moment TMPDIR points at home. The literal
+    # /tmp component anchor is what stops it.
+    real = Path.join(System.user_home!(), ".kyber/store.jsonl")
+
+    previous = System.get_env("TMPDIR")
+    System.put_env("TMPDIR", System.user_home!())
+
+    on_exit(fn ->
+      if previous, do: System.put_env("TMPDIR", previous), else: System.delete_env("TMPDIR")
+    end)
+
+    assert Path.expand(System.tmp_dir!()) == Path.expand(System.user_home!())
+
+    assert_raise Mix.Error, fn ->
+      Dashboard.guard_oracle_seed(oracle_seed: "present", log: real)
+    end
+
+    # --dev-store remains the one way to admit a store outside /tmp
+    assert Dashboard.guard_oracle_seed(oracle_seed: "present", log: real, dev_store: true) == :ok
+  end
+
+  test "a TMPDIR relocated WITHIN /tmp moves the flag-free case" do
     outside = Path.join(System.tmp_dir!(), "kyber-dash-outside/store.jsonl")
 
     relocated =
