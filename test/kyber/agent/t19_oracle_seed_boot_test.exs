@@ -16,11 +16,18 @@ defmodule Kyber.Agent.T19OracleSeedBootTest do
   author-scoped the way the boot assert is, and the postcondition confirms
   the claim this daemon actually minted rather than any live seed-ish one.
 
+  Round 7 pins the close path to the REACTOR's definition of a gate claim
+  (first pointer role "seed", any target), so a claim the reactor counts is
+  a claim the close negates, and surfaces flips the daemon could not honor
+  as `gate_flip_failures` in status.
+
   Same discipline as reactor_test: tmp store + tmp keyring per test,
   `tick_ms: :manual`, no `Process.sleep`.
   """
 
   use ExUnit.Case, async: false
+
+  import ExUnit.CaptureLog
 
   alias Kyber.{Daemon, DurableStore, Events, Keys, Wire}
   alias Kyber.Agent.Events, as: AgentEvents
@@ -245,8 +252,6 @@ defmodule Kyber.Agent.T19OracleSeedBootTest do
     assert [{minted_id, _claims}] = seed_claims()
     assert Daemon.confirm_oracle_gate(minted_id) == :ok
 
-    # an unrelated claim that merely LEADS with a "seed" role is not the
-    # oracle gate: it cannot stand in for a mint that never landed
     decoy =
       signed_wire(
         ctx.agent_seed,
@@ -255,13 +260,19 @@ defmodule Kyber.Agent.T19OracleSeedBootTest do
       )
 
     assert :ok = DurableStore.append(decoy)
-    assert Daemon.confirm_oracle_gate(decoy["id"]) == {:error, :gate_closed}
+
+    # the decoy IS a gate claim — the reactor reads any live claim whose
+    # first pointer has role "seed" — but it is not the mint, and the
+    # postcondition asks only about the mint
+    assert Daemon.confirm_oracle_gate(decoy["id"]) == :ok
+    assert Daemon.confirm_oracle_gate(minted_id) == :ok
 
     # a negation racing the append leaves the mint dead on arrival. The
-    # decoy above is still live, so a read that asked only "is SOME
-    # seed-ish claim unretracted" would report this gate open
+    # decoy is still live, so a read that asked only "is SOME gate claim
+    # unretracted" would report this mint landed
     negate!(@operator_seed, minted_id)
     assert Daemon.confirm_oracle_gate(minted_id) == {:error, :gate_closed}
+    assert gate_open?()
   end
 
   test "a ladder whose every id is negated refuses rather than minting a dead claim", ctx do
@@ -390,6 +401,59 @@ defmodule Kyber.Agent.T19OracleSeedBootTest do
 
     daemon = :sys.get_state(Daemon)
     assert Enum.all?(live_before, &MapSet.member?(daemon.negated_ids, &1))
+  end
+
+  test "closing the gate negates a live seed claim at ANY target (D6)", ctx do
+    # the daemon's close path reads the gate the way the REACTOR does: a
+    # claim whose FIRST pointer has role "seed" opens the gate whatever its
+    # target. A close scoped to the exact oracle pointer would leave this one
+    # alive — model initiation still authorized after the operator was told
+    # the gate is closed.
+    decoy =
+      signed_wire(
+        @foreign_seed,
+        [%{role: "seed", target: {:entity, "garden", "seed"}}],
+        1_754_700_000_000.0
+      )
+
+    assert :ok = DurableStore.append(decoy)
+
+    boot_agent!(ctx)
+    assert gate_open?()
+
+    append_set!(1_754_600_500_000.0, %{oracle_seed: "absent"})
+
+    assert eventually(fn -> not gate_open?() end)
+    assert negated?(decoy["id"])
+  end
+
+  test "status carries the gate-flip failure counter, zero on a clean boot", ctx do
+    boot!(ctx)
+    assert Daemon.status().gate_flip_failures == 0
+
+    Daemon.stop()
+    boot_agent!(ctx)
+    assert Daemon.status().gate_flip_failures == 0
+  end
+
+  test "a gate flip this daemon cannot honor logs and counts" do
+    # the failure branches need a refused append or a negation racing the
+    # mint, so the increment is exercised directly — a state that has never
+    # failed a flip counts from zero either way
+    log =
+      capture_log(fn ->
+        assert %{gate_flip_failures: 1} =
+                 Daemon.note_gate_flip_failure(
+                   %{narrate: false, gate_flip_failures: 0},
+                   "oracle gate close FAILED — gate still open"
+                 )
+
+        assert %{gate_flip_failures: 1} =
+                 Daemon.note_gate_flip_failure(%{narrate: false}, "oracle gate open refused")
+      end)
+
+    assert log =~ "oracle gate close FAILED"
+    assert log =~ "oracle gate open refused"
   end
 
   test "the D6 open path is author-scoped like the boot assert", ctx do
