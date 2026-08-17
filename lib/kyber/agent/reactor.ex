@@ -669,12 +669,33 @@ defmodule Kyber.Agent.Reactor do
   end
 
   defp builder_for(seed, opts) when is_list(opts) do
+    # The stamped model must be the model the engine actually calls, so the
+    # SAME engine opts `llm_for/2` resolves the call from also feed the label.
+    # Absent => omit the key so ContextBuilder's default applies (`model: nil`
+    # would override it).
+    model_opt =
+      case builder_model(opts) do
+        nil -> []
+        model -> [model: model]
+      end
+
     {:ok,
      ContextBuilder.handler(
-       seed: seed,
-       store: &DurableStore.set/0,
-       memory: Keyword.get(opts, :memory, {MemoryPort.Stub, %{}})
+       [
+         seed: seed,
+         store: &DurableStore.set/0,
+         memory: Keyword.get(opts, :memory, {MemoryPort.Stub, %{}})
+       ] ++ model_opt
      )}
+  end
+
+  # The two engine-opts shapes: a built `%LlmHandler{}` (the daemon's
+  # `build_daemon_engine`) or a flat keyword list (the dashboard task).
+  defp builder_model(opts) do
+    case Keyword.get(opts, :llm) do
+      %LlmHandler{model: model} -> model
+      nil -> Keyword.get(opts, :model)
+    end
   end
 
   # the tool path (the existing pure executor handler — hosted, never rebuilt)

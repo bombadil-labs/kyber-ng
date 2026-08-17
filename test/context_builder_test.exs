@@ -40,7 +40,7 @@ defmodule Kyber.Agent.ContextBuilderTest do
     typed = Schema.resolve(request.claims)
 
     assert typed.type == "InferenceRequested"
-    assert typed.model == "kimi-k3"
+    assert typed.model == "deepseek-v4-flash"
     assert typed.promptRef == {:delta, delta.id, "requested"}
     assert typed.sessionId == {:entity, "session:s1", "inferences"}
     assert typed.memoryPointers == [{:delta, memory_id, "informed"}]
@@ -48,6 +48,21 @@ defmodule Kyber.Agent.ContextBuilderTest do
     # thin: closed validation already proves no conversation text rides —
     # and the prompt's content string appears nowhere in the wire
     refute inspect(wire) =~ "What is the cap?"
+  end
+
+  test "the stamped model is the configured one, not the default (the label must not lie)" do
+    {delta, _signed} = received(1_700_000_000_000, "msg-1", "What is the cap?")
+
+    handler =
+      ContextBuilder.handler(
+        seed: @agent_seed,
+        store: fn -> %{} end,
+        model: "some-model"
+      )
+
+    assert [wire] = handler.([delta])
+    assert {:ok, request} = Store.verify(wire)
+    assert Schema.resolve(request.claims).model == "some-model"
   end
 
   test "the emission is deterministic: a re-fire is byte-identical (AC3's dedup)" do

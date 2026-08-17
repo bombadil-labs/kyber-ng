@@ -18,12 +18,17 @@ defmodule Kyber.Agent.ContextBuilder do
   alias Kyber.{DurableStore, Gather, Schema, Wire}
   alias Kyber.Agent.{Events, MemoryPort}
 
-  @model "kimi-k3"
+  # Mirrors `LlmHandler`'s T17 engine default (user verdict 2026-08-13). The
+  # label a request STAMPS must name the model the call actually reaches: the
+  # two defaults must never drift again (a stale one here made every
+  # InferenceRequested lie about a deepseek call).
+  @model "deepseek-v4-flash"
 
   @doc """
   The gather handler closure. Options: `:seed` (required), `:memory`
   (`{module, state}`, default the stub), `:store` (a thunk answering the
-  delta set), `:model` (default #{inspect(@model)}).
+  delta set), `:model` (default #{inspect(@model)} — the engine's configured
+  model when the reactor threads one through).
   """
   @spec handler(keyword()) :: Gather.handler()
   def handler(opts) do
