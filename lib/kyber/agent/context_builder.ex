@@ -13,6 +13,11 @@ defmodule Kyber.Agent.ContextBuilder do
   the prompt's timestamp and every pointer is a function of the store below
   the prompt, so a crash-window re-fire is byte-identical and dedupes at the
   sink by content address (AC3).
+
+  The stamped model is part of that content-derived identity: AC3's
+  byte-identical re-fire holds for a FIXED configured model, and a model
+  swap mints a distinct request id by construction (dedup operates on
+  identical wires; a changed model is a different wire).
   """
 
   alias Kyber.{DurableStore, Gather, Schema, Wire}

@@ -193,6 +193,9 @@ defmodule Kyber.Agent.Reactor do
          store: Process.whereis(DurableStore),
          budget_cap: Keyword.get(opts, :budget_cap, @default_cap),
          engine: engine,
+         # the boot engine opts are kept so an AC10 swap can rebuild the
+         # builder from the SAME shape it was first derived from
+         engine_opts: engine_opts,
          test_pid: Keyword.get(opts, :test_pid),
          turns: %{},
          dispatched: MapSet.new(),
@@ -205,17 +208,39 @@ defmodule Kyber.Agent.Reactor do
   end
 
   # P5 round-3 M3: a crash report dumps the state — the signing seed must
-  # never print in plaintext (the D8 log-leak class on the crash path)
+  # never print in plaintext (the D8 log-leak class on the crash path). The
+  # boot engine opts held for the AC10 rebuild carry secrets of their own
+  # (the handler's seed/api_key, the redact list of known secrets, or the
+  # flat shape's `api_key:`), so they are sanitized field-wise the way the
+  # engine sanitizes its handler — the keys stay, only the secrets go.
   @impl true
   def format_status(status) do
     Map.new(status, fn
-      {:state, %{seed: seed} = state} when not is_nil(seed) ->
-        {:state, %{state | seed: "<redacted>"}}
+      {:state, %{} = state} ->
+        {:state, state |> redact_seed() |> redact_engine_opts()}
 
       other ->
         other
     end)
   end
+
+  defp redact_seed(%{seed: seed} = state) when not is_nil(seed),
+    do: %{state | seed: "<redacted>"}
+
+  defp redact_seed(state), do: state
+
+  defp redact_engine_opts(%{engine_opts: opts} = state) when is_list(opts),
+    do: %{state | engine_opts: Enum.map(opts, &redact_engine_opt/1)}
+
+  defp redact_engine_opts(state), do: state
+
+  defp redact_engine_opt({:llm, %LlmHandler{} = llm}),
+    do: {:llm, %{llm | seed: "<redacted>", api_key: "<redacted>", redact: "<redacted>"}}
+
+  defp redact_engine_opt({key, _secret}) when key in [:api_key, :redact],
+    do: {key, "<redacted>"}
+
+  defp redact_engine_opt(other), do: other
 
   @impl true
   def handle_cast({:ingest, delta}, state) do
@@ -237,7 +262,7 @@ defmodule Kyber.Agent.Reactor do
       engine -> Engine.swap_llm_config(engine, changes)
     end
 
-    {:noreply, state}
+    {:noreply, rebuild_builder(state, changes)}
   end
 
   @impl true
@@ -689,12 +714,43 @@ defmodule Kyber.Agent.Reactor do
      )}
   end
 
+  # T19 (P5 HIGH): the stamped model lives in the reactor's OWN builder, so a
+  # swap forwarded to the engine alone leaves every later InferenceRequested
+  # naming the pre-swap model. Rebuild from the boot engine opts with the new
+  # model layered on. Total: a non-model change rebuilds nothing, and a
+  # refused rebuild leaves the standing builder — a swap never crashes.
+  defp rebuild_builder(%{engine_opts: engine_opts} = state, %{model: model})
+       when is_list(engine_opts) and is_binary(model) do
+    engine_opts = Keyword.put(engine_opts, :model, model)
+
+    case builder_for(state.seed, engine_opts) do
+      {:ok, builder} ->
+        Process.put({__MODULE__, :builder}, builder)
+        %{state | engine_opts: engine_opts}
+
+      _refused ->
+        state
+    end
+  end
+
+  defp rebuild_builder(state, _changes), do: state
+
   # The two engine-opts shapes: a built `%LlmHandler{}` (the daemon's
-  # `build_daemon_engine`) or a flat keyword list (the dashboard task).
+  # `build_daemon_engine`) or a flat keyword list (the dashboard task). An
+  # EXPLICIT top-level `:model` wins — that is the seam a swap override
+  # rides; the daemon's shape carries none and falls through to the built
+  # handler's own field. An unrecognized `:llm` shape yields nil (the
+  # ContextBuilder default applies), never a raise.
   defp builder_model(opts) do
-    case Keyword.get(opts, :llm) do
-      %LlmHandler{model: model} -> model
-      nil -> Keyword.get(opts, :model)
+    case Keyword.get(opts, :model) do
+      model when is_binary(model) ->
+        model
+
+      _absent ->
+        case Keyword.get(opts, :llm) do
+          %LlmHandler{model: model} -> model
+          _other -> nil
+        end
     end
   end
 
