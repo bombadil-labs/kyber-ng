@@ -193,6 +193,9 @@ defmodule Kyber.Agent.Reactor do
          store: Process.whereis(DurableStore),
          budget_cap: Keyword.get(opts, :budget_cap, @default_cap),
          engine: engine,
+         # the boot engine opts are kept so an AC10 swap can rebuild the
+         # builder from the SAME shape it was first derived from
+         engine_opts: engine_opts,
          test_pid: Keyword.get(opts, :test_pid),
          turns: %{},
          dispatched: MapSet.new(),
@@ -205,17 +208,39 @@ defmodule Kyber.Agent.Reactor do
   end
 
   # P5 round-3 M3: a crash report dumps the state — the signing seed must
-  # never print in plaintext (the D8 log-leak class on the crash path)
+  # never print in plaintext (the D8 log-leak class on the crash path). The
+  # boot engine opts held for the AC10 rebuild carry secrets of their own
+  # (the handler's seed/api_key, the redact list of known secrets, or the
+  # flat shape's `api_key:`), so they are sanitized field-wise the way the
+  # engine sanitizes its handler — the keys stay, only the secrets go.
   @impl true
   def format_status(status) do
     Map.new(status, fn
-      {:state, %{seed: seed} = state} when not is_nil(seed) ->
-        {:state, %{state | seed: "<redacted>"}}
+      {:state, %{} = state} ->
+        {:state, state |> redact_seed() |> redact_engine_opts()}
 
       other ->
         other
     end)
   end
+
+  defp redact_seed(%{seed: seed} = state) when not is_nil(seed),
+    do: %{state | seed: "<redacted>"}
+
+  defp redact_seed(state), do: state
+
+  defp redact_engine_opts(%{engine_opts: opts} = state) when is_list(opts),
+    do: %{state | engine_opts: Enum.map(opts, &redact_engine_opt/1)}
+
+  defp redact_engine_opts(state), do: state
+
+  defp redact_engine_opt({:llm, %LlmHandler{} = llm}),
+    do: {:llm, %{llm | seed: "<redacted>", api_key: "<redacted>", redact: "<redacted>"}}
+
+  defp redact_engine_opt({key, _secret}) when key in [:api_key, :redact],
+    do: {key, "<redacted>"}
+
+  defp redact_engine_opt(other), do: other
 
   @impl true
   def handle_cast({:ingest, delta}, state) do
@@ -237,7 +262,7 @@ defmodule Kyber.Agent.Reactor do
       engine -> Engine.swap_llm_config(engine, changes)
     end
 
-    {:noreply, state}
+    {:noreply, rebuild_builder(state, changes)}
   end
 
   @impl true
@@ -251,6 +276,19 @@ defmodule Kyber.Agent.Reactor do
   # serialized behind the harness's processing. Never fatal.
   @impl true
   def handle_info({:engine, _event} = message, state) do
+    # T19 (H1 — the second pinned turn-END site): on {:engine,
+    # {:answered, request_id}} the reactor resolves request_id → the
+    # initiating received via walk_to_received/2 and closes the turn span
+    # with outcome :answered (a closed-id END no-op keeps re-fires
+    # coherent). Total: a failed walk emits nothing, never a raise.
+    case message do
+      {:engine, {:answered, request_id}} ->
+        end_turn_on_answer(request_id)
+
+      _other ->
+        :ok
+    end
+
     with pid when is_pid(pid) <- Process.whereis(Kyber.Daemon), do: send(pid, message)
     if state.test_pid, do: send(state.test_pid, message)
     {:noreply, state}
@@ -315,6 +353,25 @@ defmodule Kyber.Agent.Reactor do
 
       nil ->
         turn = %Turn{turn_id: delta.id, budget: Budget.new(state.budget_cap)}
+
+        # T19 (span table, pin 11): the :turn span starts when the Turn is
+        # created — trace_id = the BARE initiating received delta id (M5),
+        # parent nil (the trace root), gate = the gate at turn start (L9),
+        # budget_cap pinned. Built from pre-validated fields only (L5).
+        Kyber.Trace.span_start(%{
+          span_id: "turn:" <> delta.id,
+          kind: :turn,
+          trace_id: delta.id,
+          parent_id: nil,
+          refs: [delta.id],
+          ts: delta.claims.timestamp,
+          data: %{gate: gate_open?(), budget_cap: state.budget_cap}
+        })
+
+        # M3: the attribution cast at Turn creation — the received delta id
+        # maps to itself as the trace id (the SEPARATE delta→trace index).
+        Kyber.Trace.attribution(delta.id, delta.id)
+
         {%{state | turns: Map.put(state.turns, delta.id, turn)}, turn}
     end
   end
@@ -340,6 +397,28 @@ defmodule Kyber.Agent.Reactor do
       turn_id ->
         Map.get(state.turns, turn_id) || :no_turn
     end
+  end
+
+  # T19: the answered turn-END — resolve request_id → received, close the
+  # turn span. Total (L5): the walk or the store read failing emits nothing.
+  defp end_turn_on_answer(request_id) do
+    received_id =
+      try do
+        walk_to_received(DurableStore.set(), request_id)
+      rescue
+        _ -> nil
+      catch
+        _, _ -> nil
+      end
+
+    if is_binary(received_id) do
+      Kyber.Trace.span_end("turn:" <> received_id, %{
+        status: :closed,
+        data: %{outcome: :answered}
+      })
+    end
+
+    :ok
   end
 
   # the pointer-walk: ToolCall.requestRef → promptRef → the initiating
@@ -386,7 +465,37 @@ defmodule Kyber.Agent.Reactor do
   defp invoke(state, handler, delta_kind, delta, turn) do
     ctx = %Ctx{store: state.store, turn: turn, test_pid: state.test_pid}
 
-    case handler.(delta, ctx) do
+    # T19 (span table, pin invoke/5): one :dispatch span per CHARGED
+    # dispatched delta of the subscribed kinds — starts at invoke entry
+    # (budget-refused deltas never reach invoke and get no dispatch span;
+    # the refusal appears as the GateDecision's own dispatch span, L8).
+    # trace_id/parent_id are reactor-owned (rules 1/2 — explicit).
+    span_id = "dispatch:" <> delta.id
+
+    Kyber.Trace.span_start(%{
+      span_id: span_id,
+      kind: :dispatch,
+      trace_id: turn.turn_id,
+      parent_id: "turn:" <> turn.turn_id,
+      refs: [delta.id],
+      ts: delta.claims.timestamp,
+      data: %{delta_kind: delta_kind}
+    })
+
+    result =
+      case handler.(delta, ctx) do
+        {:emit, wires} -> {:emit, wires}
+        {:refuse, reason} -> {:refuse, reason}
+        :ignore -> :ignore
+      end
+
+    # span_end fires on EVERY return shape (L5 — total; never a raise)
+    Kyber.Trace.span_end(span_id, %{
+      status: :closed,
+      data: %{handler_result: handler_result(result)}
+    })
+
+    case result do
       {:emit, wires} ->
         state |> emit(turn.turn_id, wires) |> observe(delta_kind, delta)
 
@@ -397,6 +506,12 @@ defmodule Kyber.Agent.Reactor do
         observe(state, delta_kind, delta)
     end
   end
+
+  # the handler_result attr: a SAFE atom/term — never the wires themselves
+  # (D8 — no payload carries raw args/results)
+  defp handler_result({:emit, _wires}), do: :emit
+  defp handler_result({:refuse, reason}), do: {:refused, reason}
+  defp handler_result(:ignore), do: :ignore
 
   # pin 19/20: the production handlers are OBSERVED — Ctx.test_pid probe
   # message as the fast signal + the per-invocation-DISTINCT probe claim in
@@ -436,6 +551,12 @@ defmodule Kyber.Agent.Reactor do
       # the Ctx.turn carry through the re-entry seam (SYNTH-NEW-1): this
       # emission re-enters attributed to the emitting handler's turn
       s = %{s | emitted: Map.put(s.emitted, wire["id"], turn_id)}
+
+      # T19 (M3): the attribution cast at emit — wire_id → turn_id into the
+      # SEPARATE delta→trace index (survives span eviction; click-through-
+      # after-eviction and resume/1 depend on it)
+      Kyber.Trace.attribution(wire["id"], turn_id)
+
       DurableStore.append(wire)
       s
     end)
@@ -462,10 +583,27 @@ defmodule Kyber.Agent.Reactor do
   # GateDecision ONLY IF the refused delta's kind is NOT "decides"; a
   # refused "decides" emits nothing and the turn is structurally terminal —
   # exactly one refusal delta, finite store, no live-lock, no hang.
-  defp refuse_budget(state, _turn, _delta, "decides"), do: state
+  #
+  # T19 (H1 — the first pinned turn-END site): both clauses close the turn
+  # span with outcome :refused (the turn is STRUCTURALLY terminal here; a
+  # closed-id END no-op keeps any later answered cast coherent).
+  defp refuse_budget(state, turn, _delta, "decides") do
+    Kyber.Trace.span_end("turn:" <> turn.turn_id, %{
+      status: :closed,
+      data: %{outcome: :refused}
+    })
 
-  defp refuse_budget(state, turn, delta, _kind),
-    do: refuse(state, turn.turn_id, delta, :budget_exhausted)
+    state
+  end
+
+  defp refuse_budget(state, turn, delta, _kind) do
+    Kyber.Trace.span_end("turn:" <> turn.turn_id, %{
+      status: :closed,
+      data: %{outcome: :refused}
+    })
+
+    refuse(state, turn.turn_id, delta, :budget_exhausted)
+  end
 
   # pin 16: the gate — open iff an UNRETRACTED seed claim exists (the seed
   # is asserted by the daemon's oracle_seed boot opt, pin 17); M2:
@@ -556,12 +694,64 @@ defmodule Kyber.Agent.Reactor do
   end
 
   defp builder_for(seed, opts) when is_list(opts) do
+    # The stamped model must be the model the engine actually calls, so the
+    # SAME engine opts `llm_for/2` resolves the call from also feed the label.
+    # Absent => omit the key so ContextBuilder's default applies (`model: nil`
+    # would override it).
+    model_opt =
+      case builder_model(opts) do
+        nil -> []
+        model -> [model: model]
+      end
+
     {:ok,
      ContextBuilder.handler(
-       seed: seed,
-       store: &DurableStore.set/0,
-       memory: Keyword.get(opts, :memory, {MemoryPort.Stub, %{}})
+       [
+         seed: seed,
+         store: &DurableStore.set/0,
+         memory: Keyword.get(opts, :memory, {MemoryPort.Stub, %{}})
+       ] ++ model_opt
      )}
+  end
+
+  # T19 (P5 HIGH): the stamped model lives in the reactor's OWN builder, so a
+  # swap forwarded to the engine alone leaves every later InferenceRequested
+  # naming the pre-swap model. Rebuild from the boot engine opts with the new
+  # model layered on. Total: a non-model change rebuilds nothing, and a
+  # refused rebuild leaves the standing builder — a swap never crashes.
+  defp rebuild_builder(%{engine_opts: engine_opts} = state, %{model: model})
+       when is_list(engine_opts) and is_binary(model) do
+    engine_opts = Keyword.put(engine_opts, :model, model)
+
+    case builder_for(state.seed, engine_opts) do
+      {:ok, builder} ->
+        Process.put({__MODULE__, :builder}, builder)
+        %{state | engine_opts: engine_opts}
+
+      _refused ->
+        state
+    end
+  end
+
+  defp rebuild_builder(state, _changes), do: state
+
+  # The two engine-opts shapes: a built `%LlmHandler{}` (the daemon's
+  # `build_daemon_engine`) or a flat keyword list (the dashboard task). An
+  # EXPLICIT top-level `:model` wins — that is the seam a swap override
+  # rides; the daemon's shape carries none and falls through to the built
+  # handler's own field. An unrecognized `:llm` shape yields nil (the
+  # ContextBuilder default applies), never a raise.
+  defp builder_model(opts) do
+    case Keyword.get(opts, :model) do
+      model when is_binary(model) ->
+        model
+
+      _absent ->
+        case Keyword.get(opts, :llm) do
+          %LlmHandler{model: model} -> model
+          _other -> nil
+        end
+    end
   end
 
   # the tool path (the existing pure executor handler — hosted, never rebuilt)

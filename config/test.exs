@@ -18,3 +18,12 @@ config :kyber,
       System.tmp_dir!(),
       "kyber-test-#{System.unique_integer([:positive])}-#{System.system_time(:nanosecond)}/keyring"
     )
+
+# T19: the dashboard tests boot KyberWeb.Application directly; the endpoint
+# never binds a port in the suite (server: false — LiveViewTest drives it
+# through the test conn).
+config :kyber, KyberWeb.Endpoint,
+  server: false,
+  check_origin: false,
+  secret_key_base: "kyber-test-secret-key-base-0123456789abcdef0123456789abcdef",
+  live_view: [signing_salt: "kyber-test-salt"]

@@ -196,6 +196,12 @@ threat-model follow-ons, §2 backlog); live hot-apply beyond next-inference.
   challenge it). Also flagged: replay/convergence for late-spawned blind views (can a
   blind view catch pre-spawn claims without a snapshot — `subscribe_seeded` answers
   this, needs a test).
+- **T17 residual (round-11 MEDIUM-4, accepted 2026-08-14):** `agent rekey` re-encrypts
+  the API key under the new seed, but the store only learns — the OLD ciphertext stays
+  in the append-only log and is readable by anyone holding the rotated-away seed.
+  Structurally unfixable within the append-only atom; remedy is provider-side key
+  rotation (rekey now warns and names the delta carrying the old blob). Not
+  agent-exploitable (rotated seed no longer folds as operator).
 - **Loop 18 — Browser tool for kyber agents (scoped 2026-08-13, WSL/Windows):** a
   dedicated Chrome instance on the WINDOWS side driven over CDP (Chrome DevTools
   Protocol) from the WSL agent — `--user-data-dir=C:\kyber-browser-profile` (NEVER the
@@ -207,6 +213,24 @@ threat-model follow-ons, §2 backlog); live hot-apply beyond next-inference.
   filesystem secret like the keyring — NOT in the delta store; T17 redactor covers
   cookie leakage). Tool grant is opt-in per profile (tool_bounds), mirroring
   self_config. Deliverable: `Kyber.Agent.Browser` CDP client + tool registrations.
+- **Loop 19 — Kyber dashboard (Phoenix LiveView, scoped 2026-08-14):** a dashboard
+  site with two linked views over the live harness. **View 1 — delta intake waterfall:**
+  a LiveView `stream/4` attached as a `DurableStore.subscribe/1` subscriber — every
+  append appears live; delta → subscriber-fire → re-emitted claim re-entering the intake
+  is all visible in the flow. **View 2 — span/trace view:** OTel-style waterfall per
+  agent turn; trace id = the turn's initiating `received` claim content-derived id
+  (reactor pin 11 — already content-addressed and store-correlatable). Spans cover
+  handler dispatch, LLM call, store append, subscriber fan-out. **Span storage = ring
+  buffer (user decision):** in-memory, ETS-indexed by trace id for instant click-through;
+  traces are ephemeral by design (restart clears them — the store keeps only deltas, the
+  atom untouched). **Click-through:** any delta in view 1 opens view 2 — full trace if
+  the id is a root, else the spans whose activity referenced it (promptRef chains).
+  Emitter lives in core via the pin-1 cast seam (dropped when no collector listens — no
+  new substrate deps). **Location: IN-REPO** (user decision 2026-08-14) — Phoenix +
+  LiveView deps in `mix.exs`/`config/` under the AGENTS.md dashboard rail exception.
+  Open forks: (a) RESOLVED — in-repo; (b) exact span boundary set;
+  (c) ring buffer capacity/retention. Deliverable:
+  Phoenix LiveView app + core span emitter + ring buffer + ETS trace index.
 
 ## 3. Long-Term Vision: Rhizomatic Cognition
 

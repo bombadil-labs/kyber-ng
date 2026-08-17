@@ -23,9 +23,27 @@ config :kyber,
   log_path: Path.join(home, ".kyber/store.jsonl"),
   keyring_dir: Path.join(home, ".kyber")
 
-# env-specific config (test.exs overrides log_path to a tmp dir). Imported only
-# for :test so dev/prod runs need no extra config files (T3 touches config/
-# only for config.exs + test.exs).
+# T19 dashboard track (AGENTS.md rail exception 2026-08-14): the in-repo
+# Phoenix LiveView dashboard. The endpoint config lives under :kyber (the
+# dashboard modules live in the :kyber app — there is no separate
+# :kyber_web OTP application; KyberWeb.Application boots it on the
+# dashboard path only, so the substrate escript never loads Phoenix).
+# Phoenix's json_library is the stdlib JSON module (no jason dep).
+config :phoenix, :json_library, JSON
+
+config :kyber, KyberWeb.Endpoint,
+  url: [host: "localhost"],
+  http: [port: 4000],
+  secret_key_base: "kyber-dashboard-dev-secret-key-base-0123456789abcdef0123456789abcdef",
+  live_view: [signing_salt: "kyber-live-salt"],
+  render_errors: [view: KyberWeb.ErrorHTML, accepts: ~w(html)],
+  check_origin: false,
+  server: true
+
+# env-specific config (test.exs overrides log_path AND the endpoint config to
+# tmp/offline values). Imported only for :test so dev/prod runs need no extra
+# config files (T3 touches config/ only for config.exs + test.exs). The T19
+# endpoint block above sits BEFORE this import so the test overrides win.
 if config_env() == :test do
   import_config "test.exs"
 end

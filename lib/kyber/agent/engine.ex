@@ -446,7 +446,26 @@ defmodule Kyber.Agent.Engine do
   end
 
   defp complete(turn, set, state) do
-    case LlmHandler.chat(state.llm, turn.messages, tools: state.tools) do
+    # T19 (span table): the :llm span wraps LlmHandler.chat/3 — one span per
+    # ATTEMPT (M1): "llm:"<>request_id<>"#"<>attempt, attempt = the
+    # request's ToolResult count + 1 (a tool-using turn performs k+1 real
+    # chats under ONE request id). The model attr only — never api_key/seed
+    # (D8). The span closes on EVERY return, including {:error, reason}
+    # (L5). Attach: explicit trace_id when the walk resolves, else parent
+    # (the request's dispatch span, rule 2), else refs (rule 3), else a
+    # micro-trace — ordering is not guaranteed across sender pairs, so the
+    # collector's orphan handling is mandatory.
+    llm_span_id = Kyber.Trace.Span.llm_span_id(turn.request_id, llm_attempt(turn))
+    start_llm_span(llm_span_id, turn, set, state)
+
+    result = LlmHandler.chat(state.llm, turn.messages, tools: state.tools)
+
+    Kyber.Trace.span_end(llm_span_id, %{
+      status: :closed,
+      data: %{outcome: llm_outcome(result)}
+    })
+
+    case result do
       {:ok, {:tool_calls, calls}} ->
         # native function calling (folded from B): one ToolCall delta per
         # model call, emitted as it happens — never batched at turn end; the
@@ -465,6 +484,33 @@ defmodule Kyber.Agent.Engine do
         notify(state, {:llm_error, reason})
         state
     end
+  end
+
+  # T19: the llm span helpers — attempt = ToolResult count + 1 (the number
+  # of tool-role messages already fed back), outcome = a safe atom (the raw
+  # {:error, reason} never rides a span payload — D8).
+  defp llm_attempt(turn) do
+    Enum.count(turn.messages, &(&1["role"] == "tool")) + 1
+  end
+
+  defp llm_outcome({:ok, {:tool_calls, _calls}}), do: :tool_calls
+  defp llm_outcome({:ok, _content}), do: :answered
+  defp llm_outcome({:error, _reason}), do: :error
+
+  defp start_llm_span(span_id, turn, set, state) do
+    trace_id = Kyber.Trace.Span.resolve_received(set, turn.request_id)
+
+    span = %{
+      span_id: span_id,
+      kind: :llm,
+      trace_id: trace_id,
+      parent_id: "dispatch:" <> turn.request_id,
+      refs: [turn.request_id],
+      ts: turn.request_ts,
+      data: %{model: state.llm.model}
+    }
+
+    Kyber.Trace.span_start(span)
   end
 
   defp answer(turn, content, set, state) do

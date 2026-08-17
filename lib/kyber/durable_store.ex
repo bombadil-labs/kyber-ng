@@ -169,7 +169,15 @@ defmodule Kyber.DurableStore do
 
   @impl true
   def handle_call({:append, wire}, _from, state) do
+    # T19 (span table): one `:store_append` span per {:append, wire} — the
+    # span is TOTAL (L5): built from the pre-validated envelope id/timestamp
+    # only, started here and closed in every branch below (outcome known
+    # after do_append), including the refused/persist_failed error returns.
+    append_span_id = span_id_for_wire(wire)
+    if append_span_id, do: emit_append_start(append_span_id, wire)
+
     {reply, new_state} = do_append(wire, state)
+    if append_span_id, do: emit_append_end(append_span_id, reply, state, new_state)
 
     # U1 (T14a pin 1): the post-commit push cast — immediately after the
     # write-ahead commit accepts the delta, cast it into the reactor (the
@@ -199,7 +207,12 @@ defmodule Kyber.DurableStore do
 
             if map_size(new_state.set) > map_size(state.set) do
               committed = %{new_state | index: DurableIndex.add(new_state.index, delta)}
-              {:reply, :ok, fan_out(committed, delta)}
+              fanned = fan_out(committed, delta)
+              # T19 (span table): one `:fan_out` span per COMMITTED delta —
+              # counts only (the store knows pids, not names; L4). Fires
+              # after the fan-out so delivered/pruned are the actual numbers.
+              emit_fan_out_span(delta, state, fanned)
+              {:reply, :ok, fanned}
             else
               # duplicate re-append: the log got the line (append is
               # write-ahead, the door accepted it) but the set did not grow
@@ -279,6 +292,63 @@ defmodule Kyber.DurableStore do
   # delta (one verify per append, shared with the index — P5 low).
   defp notify_reactor(delta) do
     GenServer.cast(Kyber.Agent.Reactor, {:ingest, delta})
+  end
+
+  # ------------------------------------------------------- T19 span emitters
+
+  # T19 (span table): `:store_append` per append — the wire is NOT
+  # pre-validated at this point (the door runs inside do_append), so the
+  # envelope id/timestamp are read with a guard: a garbage wire emits no
+  # span (emitter calls are TOTAL — a raise here would take the write path
+  # down, L5).
+  defp span_id_for_wire(wire) do
+    if is_binary(wire["id"]), do: "append:" <> wire["id"], else: nil
+  end
+
+  defp emit_append_start(span_id, wire) do
+    Kyber.Trace.span_start(%{
+      span_id: span_id,
+      kind: :store_append,
+      trace_id: nil,
+      parent_id: nil,
+      refs: [wire["id"]],
+      ts: get_in(wire, ["claims", "timestamp"]),
+      data: %{delta_id: wire["id"]}
+    })
+  end
+
+  # the outcome is the pinned four-way: :committed | :duplicate | :refused |
+  # :persist_failed. :committed = the door admitted AND the set grew (the
+  # write-ahead landed and the merge is new); :duplicate = the door admitted
+  # the identical wire but the set did not grow (never fanned out again —
+  # AC1 surfaces it via this outcome); :persist_failed = the write did not
+  # land; :refused = the door rejected.
+  defp emit_append_end(span_id, reply, state, new_state) do
+    outcome =
+      case reply do
+        :ok -> if map_size(new_state.set) > map_size(state.set), do: :committed, else: :duplicate
+        {:error, :persist_failed} -> :persist_failed
+        {:error, _reason} -> :refused
+      end
+
+    Kyber.Trace.span_end(span_id, %{status: :closed, data: %{outcome: outcome}})
+  end
+
+  defp emit_fan_out_span(delta, state, fanned) do
+    delivered = length(fanned.subscribers)
+    pruned = length(state.subscribers) - delivered
+
+    Kyber.Trace.span_start(%{
+      span_id: "fan:" <> delta.id,
+      kind: :fan_out,
+      trace_id: nil,
+      parent_id: nil,
+      refs: [delta.id],
+      ts: delta.claims.timestamp,
+      data: %{delta_id: delta.id, delivered: delivered, pruned: pruned}
+    })
+
+    Kyber.Trace.span_end("fan:" <> delta.id, %{status: :closed, data: %{}})
   end
 
   # T16 (F2/PM4): fan the committed delta out to every subscriber in commit

@@ -4,20 +4,6 @@
 hard limits, testing norms — binding). This file is HOW to actually work as an autonomous agent
 here. Both claude-code and prime-agent read both files by default.*
 
-## Write-first doctrine (the analysis-paralysis fix — proven 2026-08-06: 71 min → 211 s)
-
-- Your reading list is capped at ONE file: the ticket/spec that defines this build. The
-  substrate (SPEC.md, spec/) is for LOOKUP when you need a fact — never pre-read "to understand
-  the system" before writing. Unbounded reading burns the budget with zero artifacts.
-- Your FIRST tool action is writing the AC1 test AND its implementation
-  together, then one AC at a time — tests alongside code, not a red/green
-  loop.
-- Never more than 2 consecutive read-only turns. Every 3rd turn MUST modify a file or run the
-  tests.
-- The completion gate encodes DELIVERABLE EXISTENCE (`test -f` per named deliverable + the
-  suite) — an early gate green before deliverables exist is NOT success; keep working until the
-  deliverables exist and the suite passes.
-
 ## Pacing (the one-op-per-turn killer — proven: 105 turns × 40 s → 3.5 min)
 
 - BATCH: write multiple files per turn when they belong together. Never serialize one operation
@@ -50,6 +36,10 @@ here. Both claude-code and prime-agent read both files by default.*
   polling.
 - Rails frozen: `deps/`, `spec/`, `SPEC.md`, `mix.exs`, `config/`. Never touch the real
   `~/.kyber` — tmp store/keyring everywhere.
+- **Dashboard exception (Loop 19, user decision 2026-08-14):** the in-repo Phoenix
+  dashboard track may amend `mix.exs`/`config/` and add Phoenix/LiveView deps under
+  `deps/` — scoped to the dashboard feature; the substrate rails above stay frozen
+  for everything else.
 - Tests are written ALONGSIDE the implementation (every AC has a test), not
   as a strict red/green loop — well-tested codebase over ceremony.
 
