@@ -153,10 +153,15 @@ defmodule Mix.Tasks.Kyber.Dashboard do
   # not under `/tmp`. TMPDIR is user-settable, and a relocated TMPDIR CAN
   # widen the admission on its own — `TMPDIR=$HOME` would make
   # `~/.kyber/store.jsonl` "under tmp", admitting a real store flag-free.
-  # So the tmp check is intersected with a literal `/tmp` component anchor:
-  # the store must be under `System.tmp_dir!()` AND under `/tmp`. A TMPDIR
-  # pointed anywhere else refuses, and `--dev-store` is the only way to
-  # admit a store outside `/tmp`.
+  # That widening is what the second half of the check defends against
+  # directly: a tmp dir that overlaps the operator's home is not a dev-store
+  # signal at all, so the guard falls back to demanding `--dev-store`.
+  #
+  # Anchoring on a literal `/tmp` component would do the same job on Linux
+  # and nowhere else: macOS resolves TMPDIR to `/var/folders/...`, so no
+  # macOS store would ever be flag-free and every operator there would learn
+  # to pass `--dev-store` by reflex — which is exactly the habit this
+  # tripwire exists to prevent.
   @doc false
   @spec guard_oracle_seed(keyword()) :: :ok
   def guard_oracle_seed(opts) do
@@ -179,10 +184,23 @@ defmodule Mix.Tasks.Kyber.Dashboard do
   defp tmp_store?(nil), do: false
 
   defp tmp_store?(log) do
-    components = Path.split(Path.expand(log))
+    tmp = Path.split(Path.expand(System.tmp_dir!()))
 
-    List.starts_with?(components, Path.split(Path.expand(System.tmp_dir!()))) and
-      match?(["/", "tmp" | _rest], components)
+    List.starts_with?(Path.split(Path.expand(log)), tmp) and not overlaps_home?(tmp)
+  end
+
+  # the widening case, both directions: a tmp dir INSIDE home (`TMPDIR=$HOME`,
+  # `TMPDIR=$HOME/tmp`) makes every real store look tmp, and a tmp dir that
+  # CONTAINS home (`TMPDIR=/`, `TMPDIR=/home`) does the same from above.
+  defp overlaps_home?(tmp) do
+    case System.user_home() do
+      nil ->
+        false
+
+      home ->
+        home = Path.split(Path.expand(home))
+        List.starts_with?(tmp, home) or List.starts_with?(home, tmp)
+    end
   end
 
   # T19 (P5 LOW): strict, mirroring resolve_operator_seed/1 — a typo'd

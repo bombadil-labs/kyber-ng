@@ -23,11 +23,19 @@ defmodule Kyber.Agent.T19OracleSeedBootTest do
 
   Round 8 makes the two retraction reads agree pointer-for-pointer (a claim
   whose SECOND `negates` pointer targets the seed closes the gate for the
-  reactor too), proves the fail-soft boot end to end against a REAL refused
-  append rather than the counter helper, and pins the close path's honesty:
-  each foreign retraction is attributed, a repeated `absent` fold re-negates
-  nothing, and a boot that could not mint says which of the two it is —
-  refuse-only, or open on someone else's claim.
+  reactor too) and pins the boot narration's honesty: a boot that could not
+  mint says which of the two it is — refuse-only, or open on someone else's
+  claim.
+
+  Round 9 draws the daemon's blast radius at its own signature. The close
+  retracts every live seed claim this daemon SIGNED and refuses the rest
+  loudly (a config fold on one agent does not write permanent negations
+  against another principal's deltas, so the gate stays open and status says
+  so); the boot attestation anchors to this daemon's own oracle mint rather
+  than to whichever live seed claim a map walk reached first; an unwritable
+  store REFUSES the boot while a hostile peer's negations still cannot deny
+  startup; and a flip that cannot be honored is latched, so a standing fold
+  refuses once rather than on every later AgentSet.
 
   Same discipline as reactor_test: tmp store + tmp keyring per test,
   `tick_ms: :manual`, no `Process.sleep`.
@@ -100,18 +108,29 @@ defmodule Kyber.Agent.T19OracleSeedBootTest do
 
   # the D6 shape: an agent identity, so the daemon subscribes to the store
   # and an operator AgentSet re-folds the config mid-session
-  defp boot_agent!(ctx) do
-    assert {:ok, _pid} =
-             Daemon.boot(
-               keyring_dir: ctx.keyring_dir,
-               tick_ms: :manual,
-               loop: :reactor,
-               oracle_seed: :present,
-               agent: "mokosh",
-               operator_seed: @operator_seed,
-               budget_cap: 32,
-               test_pid: self()
-             )
+  defp boot_agent!(ctx, extra \\ []) do
+    opts =
+      Keyword.merge(
+        [
+          keyring_dir: ctx.keyring_dir,
+          tick_ms: :manual,
+          loop: :reactor,
+          oracle_seed: :present,
+          agent: "mokosh",
+          operator_seed: @operator_seed,
+          budget_cap: 32,
+          test_pid: self()
+        ],
+        extra
+      )
+
+    assert {:ok, _pid} = Daemon.boot(opts)
+  end
+
+  defp attestations do
+    Enum.filter(DurableStore.set(), fn {_id, {claims, _sig}} ->
+      match?(%{type: "BootAttestation"}, Schema.resolve(claims))
+    end)
   end
 
   defp append_set!(ts, fields) do
@@ -213,6 +232,10 @@ defmodule Kyber.Agent.T19OracleSeedBootTest do
     # the attack: @oracle_seed_ts is a constant, so every id the fixed-ts
     # ladder can derive is pre-computable. A federation peer appends all
     # eleven negations BEFORE this daemon has ever booted.
+    #
+    # This is the HOSTILE-NEGATION class, and it must never deny startup —
+    # the other class, an unwritable store, refuses (see the boot-refusal
+    # test below).
     for bump <- 0..10,
         do: negate!(ctx.agent_seed, seed_wire_id(ctx.agent_seed, @oracle_seed_ts + bump))
 
@@ -385,11 +408,39 @@ defmodule Kyber.Agent.T19OracleSeedBootTest do
     refute MapSet.member?(daemon.negated_ids, live_id)
   end
 
-  test "closing the gate negates EVERY live seed claim, not just one (D6)", ctx do
-    # since the boot skip is author-scoped, a store legitimately carries
-    # more than one live seed claim — a foreign one and this daemon's own.
-    # Negating one of them leaves the reactor's gate open while the operator
-    # has been told it is closed.
+  test "closing the gate negates EVERY live seed claim THIS DAEMON SIGNED (D6)", ctx do
+    # a store legitimately carries more than one of this daemon's own live
+    # seed claims. Negating one of them leaves the reactor's gate open while
+    # the operator has been told it is closed.
+    boot_agent!(ctx)
+    assert [{boot_id, _claims}] = seed_claims()
+
+    # appended AFTER the boot: an own live claim already in the store would
+    # satisfy the author-scoped boot skip, and nothing would be minted
+    second_own = signed_wire(ctx.agent_seed, [@oracle_pointer], @oracle_seed_ts + 5)
+    assert :ok = DurableStore.append(second_own)
+    assert eventually(fn -> MapSet.member?(:sys.get_state(Daemon).seed_ids, second_own["id"]) end)
+
+    live_before = for {id, _claims} <- seed_claims(), not negated?(id), do: id
+    assert Enum.sort(live_before) == Enum.sort([boot_id, second_own["id"]])
+
+    append_set!(1_754_600_300_000.0, %{oracle_seed: "absent"})
+
+    # the gate the REACTOR reads is what has to be shut, not a count of
+    # negations: every live claim of ours must be retracted
+    assert eventually(fn -> Enum.all?(live_before, &negated?/1) end)
+    refute gate_open?()
+
+    daemon = :sys.get_state(Daemon)
+    assert Enum.all?(live_before, &MapSet.member?(daemon.negated_ids, &1))
+    assert Daemon.status().foreign_gate_claims_open == 0
+  end
+
+  test "a close retracts what this daemon SIGNED and REFUSES the rest (D6)", ctx do
+    # `oracle_seed: "absent"` is a config fold on ONE agent. Honoring it
+    # store-wide would write permanent negations against another principal's
+    # deltas — including the anchor another agent's boot attestation points
+    # at — which is not a side effect a single daemon's config fold owns.
     foreign = signed_wire(@foreign_seed, [@oracle_pointer], @oracle_seed_ts)
     assert :ok = DurableStore.append(foreign)
 
@@ -397,18 +448,27 @@ defmodule Kyber.Agent.T19OracleSeedBootTest do
 
     live_before = for {id, _claims} <- seed_claims(), not negated?(id), do: id
     assert length(live_before) == 2
-    assert foreign["id"] in live_before
+    assert [own_id] = live_before -- [foreign["id"]]
 
-    append_set!(1_754_600_300_000.0, %{oracle_seed: "absent"})
+    log =
+      capture_log(fn ->
+        append_set!(1_754_600_300_000.0, %{oracle_seed: "absent"})
+        assert eventually(fn -> Daemon.status().foreign_gate_claims_open == 1 end)
+      end)
 
-    # the gate the REACTOR reads is what has to be shut, not a count of
-    # negations: every live claim must be retracted
-    assert eventually(fn -> Enum.all?(live_before, &negated?/1) end)
-    assert Enum.all?(seed_claims(), fn {id, _claims} -> negated?(id) end)
-    refute gate_open?()
+    assert negated?(own_id)
+    refute negated?(foreign["id"])
 
-    daemon = :sys.get_state(Daemon)
-    assert Enum.all?(live_before, &MapSet.member?(daemon.negated_ids, &1))
+    # the gate is therefore STILL OPEN, and every channel says so rather than
+    # reporting a close that did not fully happen
+    assert gate_open?()
+    assert Daemon.status().gate_flip_failures >= 1
+    assert log =~ "oracle gate STILL OPEN on 1 foreign seed claim(s)"
+
+    # the claim holding it open is named, with its author in full, so the
+    # operator knows whose agent to go ask
+    assert log =~ "close REFUSED for foreign seed claim #{String.slice(foreign["id"], 0, 8)}"
+    assert log =~ "author #{Keys.author_for_seed(@foreign_seed)}"
   end
 
   test "closing the gate negates a live seed claim at ANY target (D6)", ctx do
@@ -416,10 +476,11 @@ defmodule Kyber.Agent.T19OracleSeedBootTest do
     # claim whose FIRST pointer has role "seed" opens the gate whatever its
     # target. A close scoped to the exact oracle pointer would leave this one
     # alive — model initiation still authorized after the operator was told
-    # the gate is closed.
+    # the gate is closed. The close's own scope is the SIGNING AUTHOR, so a
+    # decoy of ours at another target is ours to retract.
     decoy =
       signed_wire(
-        @foreign_seed,
+        ctx.agent_seed,
         [%{role: "seed", target: {:entity, "garden", "seed"}}],
         1_754_700_000_000.0
       )
@@ -433,6 +494,53 @@ defmodule Kyber.Agent.T19OracleSeedBootTest do
 
     assert eventually(fn -> not gate_open?() end)
     assert negated?(decoy["id"])
+    assert Daemon.status().foreign_gate_claims_open == 0
+  end
+
+  test "the boot attestation anchors to THIS daemon's OWN oracle mint", ctx do
+    # the operator attestation's `boot` pointer says "the operator attested
+    # THIS daemon's boot". A store holds several live seed claims — a
+    # federated peer's, and a decoy of ours leading with a "seed" role at
+    # another target — and an any-live read picks one arbitrarily, so the
+    # attestation can end up pointing at a mint this daemon never signed.
+    foreign = signed_wire(@foreign_seed, [@oracle_pointer], @oracle_seed_ts)
+    assert :ok = DurableStore.append(foreign)
+
+    decoy =
+      signed_wire(
+        ctx.agent_seed,
+        [%{role: "seed", target: {:entity, "garden", "seed"}}],
+        1_754_700_000_000.0
+      )
+
+    assert :ok = DurableStore.append(decoy)
+
+    boot_agent!(ctx)
+
+    own_author = Keys.author_for_seed(ctx.agent_seed)
+
+    assert [{own_id, _claims}] =
+             Enum.filter(seed_claims(), fn {_id, claims} ->
+               claims.author == own_author and Enum.member?(claims.pointers, @oracle_pointer)
+             end)
+
+    assert [{_att_id, {att_claims, _sig}}] = attestations()
+    att = Schema.resolve(att_claims)
+    assert att.agent == {:entity, own_author, "attested"}
+    assert att.boot == {:delta, own_id, "booted_under"}
+  end
+
+  test "a boot with only a FOREIGN live seed claim emits NO attestation", ctx do
+    foreign = signed_wire(@foreign_seed, [@oracle_pointer], @oracle_seed_ts)
+    assert :ok = DurableStore.append(foreign)
+
+    # :absent, so this daemon mints nothing — the only live seed claim is one
+    # it did not sign, and there is nothing of its own to attest to. Skipping
+    # is the same posture the rest of the attestation path takes.
+    boot_agent!(ctx, oracle_seed: :absent)
+
+    assert Enum.map(seed_claims(), &elem(&1, 0)) == [foreign["id"]]
+    assert attestations() == []
   end
 
   test "status carries the gate-flip failure counter, zero on a clean boot", ctx do
@@ -550,35 +658,46 @@ defmodule Kyber.Agent.T19OracleSeedBootTest do
              refusal_for(received_id)
   end
 
-  test "a boot whose seed append FAILS still boots, counts, and refuses", ctx do
-    # the real failure, not the counter helper: the log file is read-only, so
-    # the store's lazy open refuses and the mint never lands
-    break_appends!(ctx)
+  test "an UNWRITABLE store REFUSES the boot rather than booting silently", ctx do
+    # the OTHER failure class. A peer pre-negating ids must not deny startup
+    # (the fixed-ts ladder test above), but a store that will not take a
+    # write is not a gate problem at all: the daemon can record NOTHING —
+    # no refusal, no checkpoint, no attestation — so a successful boot here
+    # would report a running agent that is silently writing nothing.
+    unwritable_store!(ctx)
 
-    log = capture_log(fn -> boot!(ctx) end)
-
-    assert log =~ "NO live seed claim exists"
-    assert log =~ "refuse-only"
-    assert Daemon.status().gate_flip_failures == 1
-    assert seed_claims() == []
-
-    restore_appends!(ctx)
-
-    # the posture the message promised: model initiation refuses
-    received_id = received!("message:t19os:failsoft", "no gate", 1_754_660_000_000)
-    assert_receive {:reactor, {:dispatch, "received", ^received_id}}, 2_000
-
-    assert %{type: "GateDecision", verdict: "refuse", policy: "oracle_gate"} =
-             refusal_for(received_id)
+    assert {:error, {:oracle_seed, :persist_failed}} = boot(ctx)
+    refute Process.whereis(Daemon)
   end
 
-  test "a failed mint over a FOREIGN live seed says the gate is open, not refuse-only", ctx do
+  test "an unwritable store is inert for a boot that never asks for the gate", ctx do
+    # the refusal belongs to the seed assert, not to boot at large: an
+    # :absent boot writes no seed claim and is left exactly as it was
+    unwritable_store!(ctx)
+
+    assert {:ok, _pid} =
+             Daemon.boot(
+               keyring_dir: ctx.keyring_dir,
+               tick_ms: :manual,
+               loop: :reactor,
+               oracle_seed: :absent,
+               budget_cap: 32,
+               test_pid: self()
+             )
+  end
+
+  test "a failed mint over a FOREIGN live seed says the gate is open, not refuse-only", _ctx do
     foreign = signed_wire(@foreign_seed, [@oracle_pointer], @oracle_seed_ts)
     assert :ok = DurableStore.append(foreign)
 
-    break_appends!(ctx)
-
-    log = capture_log(fn -> boot!(ctx) end)
+    # the narration reads the ACTUAL store, so the store is the fixture and
+    # the refusal reason is the seam — reaching this through a real boot now
+    # needs a negation racing the append
+    log =
+      capture_log(fn ->
+        assert %{gate_flip_failures: 1} =
+                 Daemon.warn_gate_not_opened(%{narrate: false}, :gate_closed)
+      end)
 
     # the daemon has no claim of its own, but the reactor's gate is OPEN on
     # the foreign one — "refuse-only" would be a lie in exactly the case
@@ -586,101 +705,103 @@ defmodule Kyber.Agent.T19OracleSeedBootTest do
     assert log =~ "NOT opened by THIS daemon"
     assert log =~ "foreign claim this daemon cannot retract or keep alive"
     refute log =~ "boots refuse-only"
-    assert Daemon.status().gate_flip_failures == 1
-
-    restore_appends!(ctx)
-
-    received_id = received!("message:t19os:foreign-open", "foreign gate", 1_754_670_000_000)
-    assert_receive {:reactor, {:dispatch, "received", ^received_id}}, 2_000
-    assert poll_store(&prompt_ref?(&1, received_id))
   end
 
-  test "a close whose negations cannot land reports the gate STILL OPEN", ctx do
-    foreign = signed_wire(@foreign_seed, [@oracle_pointer], @oracle_seed_ts)
-    assert :ok = DurableStore.append(foreign)
-
-    # the fold delta is appended BEFORE the appends are broken and replayed
-    # into the daemon by hand: the feed's own delivery would race the chmod
-    set_id = append_set!(1_754_600_600_000.0, %{oracle_seed: "absent"})
-    {set_claims, _sig} = Map.fetch!(DurableStore.set(), set_id)
-
-    boot_agent!(ctx)
-    live_before = for {id, _claims} <- seed_claims(), not negated?(id), do: id
-    assert length(live_before) == 2
-
-    break_appends!(ctx)
+  test "a failed mint with NO live seed says the daemon boots refuse-only", _ctx do
+    assert seed_claims() == []
 
     log =
       capture_log(fn ->
-        # the same message the store's fan-out sends, for a delta that IS in
-        # the store; the call behind it is the barrier (the daemon's loop is
-        # serialized, so a reply means the fold ahead of it has run)
-        send(Daemon, {:delta, set_id, set_claims})
-        assert %{} = Daemon.status()
+        assert %{gate_flip_failures: 1} =
+                 Daemon.warn_gate_not_opened(%{narrate: false}, :gate_closed)
       end)
 
-    assert log =~ "oracle gate close refused"
-    assert log =~ "gate still open"
-    assert Daemon.status().gate_flip_failures >= 1
-
-    # the daemon survived and the store still tells the truth: nothing was
-    # retracted, so the gate the reactor reads is the gate the log describes
-    assert Process.alive?(Process.whereis(Daemon))
-    assert Enum.all?(live_before, fn id -> not negated?(id) end)
-    assert gate_open?()
-
-    restore_appends!(ctx)
+    assert log =~ "NO live seed claim exists"
+    assert log =~ "boots refuse-only"
+    refute log =~ "NOT opened by THIS daemon"
   end
 
-  test "a repeated absent fold re-negates nothing, and names each foreign author", ctx do
+  test "a close it cannot honor is refused ONCE across folds, and re-arms", ctx do
     foreign = signed_wire(@foreign_seed, [@oracle_pointer], @oracle_seed_ts)
     assert :ok = DurableStore.append(foreign)
 
     boot_agent!(ctx)
     live_before = for {id, _claims} <- seed_claims(), not negated?(id), do: id
-    assert length(live_before) == 2
+    assert [own_id] = live_before -- [foreign["id"]]
 
-    log =
+    first =
       capture_log(fn ->
         append_set!(1_754_600_700_000.0, %{oracle_seed: "absent"})
-        assert eventually(fn -> Enum.all?(live_before, &negated?/1) end)
+        assert eventually(fn -> Daemon.status().foreign_gate_claims_open == 1 end)
       end)
 
-    # the foreign retraction is attributed: a close that walks over another
-    # principal's claims is visible without the operator having opted into
-    # narration
-    assert log =~ "retracting foreign seed claim #{String.slice(foreign["id"], 0, 8)}"
-    assert log =~ "author #{Keys.author_for_seed(@foreign_seed)}"
+    assert refusals_in(first) == 1
+    failures = Daemon.status().gate_flip_failures
 
-    # exactly ONE negation per live claim, and a SECOND absent fold adds none:
-    # a re-fold against an already-closed gate must not re-negate a federated
-    # peer's claim on every pass
-    assert Enum.all?(live_before, fn id -> logged_negations_for(ctx, id) == 1 end)
+    # `oracle_seed` STANDS in the folded view, so every later AgentSet on this
+    # agent — about anything at all — re-enters the flip path. Without the
+    # latch each one re-scans the store and re-logs the same refusal.
+    second =
+      capture_log(fn ->
+        fold!(1_754_600_800_000.0, %{system_prompt: "a standing unrelated fold"})
+        fold!(1_754_600_900_000.0, %{oracle_seed: "absent"})
+      end)
 
+    assert refusals_in(second) == 0
+    assert Daemon.status().gate_flip_failures == failures
+
+    # exactly ONE negation against our own claim across all of it — a re-fold
+    # must not re-negate on every pass
+    assert logged_negations_for(ctx, own_id) == 1
+
+    # a gate-relevant delta from ANOTHER principal re-arms the flip: the
+    # answer it latched can have changed
+    third =
+      capture_log(fn ->
+        second_foreign = signed_wire(@foreign_seed, [@oracle_pointer], @oracle_seed_ts + 3)
+        assert :ok = DurableStore.append(second_foreign)
+        assert eventually(fn -> :sys.get_state(Daemon).gate_flip_latch == nil end)
+
+        fold!(1_754_601_000_000.0, %{oracle_seed: "absent"})
+      end)
+
+    assert refusals_in(third) == 1
+    assert third =~ "STILL OPEN on 2 foreign seed claim(s)"
+    assert Daemon.status().foreign_gate_claims_open == 2
+  end
+
+  # an UNWRITABLE store, uid-independent (a chmod means nothing to root): the
+  # log path is a symlink into a directory that does not exist, so the
+  # store's lazy open fails :enoent for everyone. Replay is untouched — a
+  # dangling link does not exist, and a first boot on a nonexistent log is
+  # not an error — and the daemon's lock (`<log>.lock`) lands beside the LINK
+  # in a real writable directory, so the boot reaches the seed assert.
+  defp unwritable_store!(ctx) do
+    Daemon.stop()
+    stop_app()
+
+    dir = Path.dirname(ctx.log_path)
+    broken = Path.join(dir, "unwritable.jsonl")
+    File.ln_s!(Path.join(dir, "gone/store.jsonl"), broken)
+
+    Application.put_env(:kyber, :log_path, broken)
+    assert {:ok, _} = Application.ensure_all_started(:kyber)
+    broken
+  end
+
+  # one fold, awaited: the daemon's loop is serialized, so a folds_since_boot
+  # bump means the AgentSet ahead of it has been applied
+  defp fold!(ts, fields) do
     folds = :sys.get_state(Daemon).folds_since_boot
-    append_set!(1_754_600_800_000.0, %{oracle_seed: "absent"})
+    append_set!(ts, fields)
     assert eventually(fn -> :sys.get_state(Daemon).folds_since_boot > folds end)
-
-    assert Enum.all?(live_before, fn id -> logged_negations_for(ctx, id) == 1 end)
   end
 
-  # a REAL append refusal, not a stubbed one: the store opens the log lazily
-  # and caches the io handle, so the handle is dropped (and closed) first and
-  # write permission is taken off the file — the next append re-opens into
-  # :eacces. The DIRECTORY stays writable: the daemon's boot lock lives there,
-  # and a read-only dir would refuse the boot for an unrelated reason.
-  defp break_appends!(ctx) do
-    :sys.replace_state(DurableStore, fn state ->
-      if is_pid(state.io), do: File.close(state.io)
-      %{state | io: nil}
-    end)
-
-    File.touch!(ctx.log_path)
-    File.chmod!(ctx.log_path, 0o444)
-    on_exit(fn -> File.chmod(ctx.log_path, 0o644) end)
+  defp refusals_in(log) do
+    log
+    |> String.split("\n")
+    |> Enum.count(&(&1 =~ "oracle gate STILL OPEN on"))
   end
-
-  defp restore_appends!(ctx), do: File.chmod!(ctx.log_path, 0o644)
 
   defp received!(message_id, body, ts) do
     {:ok, signed} =

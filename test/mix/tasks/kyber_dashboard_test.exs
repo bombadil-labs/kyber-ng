@@ -145,8 +145,8 @@ defmodule Mix.Tasks.Kyber.DashboardTest do
 
   test "a relocated TMPDIR cannot WIDEN the admission: TMPDIR=$HOME still refuses" do
     # TMPDIR is user-settable, so `under System.tmp_dir!()` alone would admit
-    # a real store flag-free the moment TMPDIR points at home. The literal
-    # /tmp component anchor is what stops it.
+    # a real store flag-free the moment TMPDIR points at home. The home-overlap
+    # check is what stops it.
     real = Path.join(System.user_home!(), ".kyber/store.jsonl")
 
     previous = System.get_env("TMPDIR")
@@ -195,6 +195,41 @@ defmodule Mix.Tasks.Kyber.DashboardTest do
 
     assert Dashboard.guard_oracle_seed(oracle_seed: "present", log: outside, dev_store: true) ==
              :ok
+  end
+
+  test "a tmp dir OUTSIDE /tmp is still flag-free (the non-Linux case)" do
+    # macOS resolves TMPDIR to `/var/folders/...`. A literal `/tmp` anchor
+    # would refuse every macOS store, teaching operators to pass --dev-store
+    # by reflex — which is the habit the tripwire exists to prevent. /var/tmp
+    # stands in for it here: outside /tmp, outside home, and POSIX-standard.
+    relocated =
+      Path.join("/var/tmp", "kyber-dash-varfolders-#{System.unique_integer([:positive])}")
+
+    File.mkdir_p!(relocated)
+
+    previous = System.get_env("TMPDIR")
+    System.put_env("TMPDIR", relocated)
+
+    on_exit(fn ->
+      if previous, do: System.put_env("TMPDIR", previous), else: System.delete_env("TMPDIR")
+      File.rm_rf(relocated)
+    end)
+
+    refute String.starts_with?(Path.expand(System.tmp_dir!()), "/tmp/")
+
+    assert Dashboard.guard_oracle_seed(
+             oracle_seed: "present",
+             log: Path.join(relocated, "store.jsonl")
+           ) == :ok
+
+    # the widening defence is unaffected: a real store under home is not
+    # under this tmp dir either
+    assert_raise Mix.Error, fn ->
+      Dashboard.guard_oracle_seed(
+        oracle_seed: "present",
+        log: Path.join(System.user_home!(), ".kyber/store.jsonl")
+      )
+    end
   end
 
   test "the guard is silent for --oracle-seed absent, whatever the store" do
