@@ -8,7 +8,8 @@ defmodule Mix.Tasks.Kyber.DashboardTest do
   What is pinned: the flat engine shape (no `:llm` wrapper — the reactor
   builds the handler), the AC22 redact seeding (api key AND operator seed,
   so neither survives to the wire on this path), the strict `--oracle-seed`
-  parse, and the 64-hex operator-seed gate.
+  parse, the viewer refusal of `--oracle-seed present` on a real store, and
+  the 64-hex operator-seed gate.
   """
 
   use ExUnit.Case, async: false
@@ -86,6 +87,160 @@ defmodule Mix.Tasks.Kyber.DashboardTest do
     # :absent (which would refuse every model initiation with no signal)
     assert_raise Mix.Error, ~r/--oracle-seed must be present or absent/, fn ->
       Dashboard.build_boot_opts([oracle_seed: "presnt"], "/k", nil, nil)
+    end
+  end
+
+  test "--oracle-seed present is refused unless the store is a tmp dev store" do
+    real = Path.join(System.user_home!(), ".kyber/store.jsonl")
+    tmp = Path.join(System.tmp_dir!(), "kyber-dashboard-test/store.jsonl")
+
+    error =
+      assert_raise Mix.Error, fn ->
+        Dashboard.guard_oracle_seed(oracle_seed: "present", log: real)
+      end
+
+    assert error.message =~ "would open the oracle gate on a real store"
+
+    # the guard covers the SEED CLAIM, not the dashboard's writes at large:
+    # a :reactor dashboard appends operational deltas whatever the flags say
+    assert error.message =~ "the boot mints a seed claim"
+    assert error.message =~ "still appends operational deltas"
+
+    # the refusal names the DELIBERATE paths and claims no store-wide
+    # protection: `kyber daemon --oracle-seed present` mints the same claim
+    # unguarded, and the message says so rather than implying otherwise
+    assert error.message =~ "The dashboard is a viewer"
+    assert error.message =~ "kyber daemon --oracle-seed present"
+    assert error.message =~ "kyber agent set <name> --oracle-seed present"
+    assert error.message =~ "--dev-store"
+
+    # no --log at all resolves to the configured store — also a real one
+    assert_raise Mix.Error, fn -> Dashboard.guard_oracle_seed(oracle_seed: "present") end
+
+    assert Dashboard.guard_oracle_seed(oracle_seed: "present", log: tmp) == :ok
+  end
+
+  test "tmp-ness is a path-component prefix: a /tmp-prefixed SIBLING is refused" do
+    sibling = Path.expand(System.tmp_dir!()) <> "data/store.jsonl"
+
+    assert_raise Mix.Error, fn ->
+      Dashboard.guard_oracle_seed(oracle_seed: "present", log: sibling)
+    end
+
+    # the same path with the explicit operator opt-in is admitted
+    assert Dashboard.guard_oracle_seed(oracle_seed: "present", log: sibling, dev_store: true) ==
+             :ok
+  end
+
+  test "--dev-store admits a real store; without it a real store stays refused" do
+    real = Path.join(System.user_home!(), ".kyber/store.jsonl")
+
+    assert Dashboard.guard_oracle_seed(oracle_seed: "present", log: real, dev_store: true) == :ok
+    assert Dashboard.guard_oracle_seed(oracle_seed: "present", dev_store: true) == :ok
+
+    assert_raise Mix.Error, fn ->
+      Dashboard.guard_oracle_seed(oracle_seed: "present", log: real, dev_store: false)
+    end
+  end
+
+  test "a relocated TMPDIR cannot WIDEN the admission: TMPDIR=$HOME still refuses" do
+    # TMPDIR is user-settable, so `under System.tmp_dir!()` alone would admit
+    # a real store flag-free the moment TMPDIR points at home. The home-overlap
+    # check is what stops it.
+    real = Path.join(System.user_home!(), ".kyber/store.jsonl")
+
+    previous = System.get_env("TMPDIR")
+    System.put_env("TMPDIR", System.user_home!())
+
+    on_exit(fn ->
+      if previous, do: System.put_env("TMPDIR", previous), else: System.delete_env("TMPDIR")
+    end)
+
+    assert Path.expand(System.tmp_dir!()) == Path.expand(System.user_home!())
+
+    assert_raise Mix.Error, fn ->
+      Dashboard.guard_oracle_seed(oracle_seed: "present", log: real)
+    end
+
+    # --dev-store remains the one way to admit a store outside /tmp
+    assert Dashboard.guard_oracle_seed(oracle_seed: "present", log: real, dev_store: true) == :ok
+  end
+
+  test "a TMPDIR relocated WITHIN /tmp moves the flag-free case" do
+    outside = Path.join(System.tmp_dir!(), "kyber-dash-outside/store.jsonl")
+
+    relocated =
+      Path.join(System.tmp_dir!(), "kyber-dash-tmpdir-#{System.unique_integer([:positive])}")
+
+    File.mkdir_p!(relocated)
+
+    previous = System.get_env("TMPDIR")
+    System.put_env("TMPDIR", relocated)
+
+    on_exit(fn ->
+      if previous, do: System.put_env("TMPDIR", previous), else: System.delete_env("TMPDIR")
+      File.rm_rf(relocated)
+    end)
+
+    # under the RELOCATED tmp dir: flag-free
+    assert Dashboard.guard_oracle_seed(
+             oracle_seed: "present",
+             log: Path.join(relocated, "store.jsonl")
+           ) == :ok
+
+    # under the OLD tmp dir but outside the relocated one: refused
+    assert_raise Mix.Error, fn ->
+      Dashboard.guard_oracle_seed(oracle_seed: "present", log: outside)
+    end
+
+    assert Dashboard.guard_oracle_seed(oracle_seed: "present", log: outside, dev_store: true) ==
+             :ok
+  end
+
+  test "a tmp dir OUTSIDE /tmp is still flag-free (the non-Linux case)" do
+    # macOS resolves TMPDIR to `/var/folders/...`. A literal `/tmp` anchor
+    # would refuse every macOS store, teaching operators to pass --dev-store
+    # by reflex — which is the habit the tripwire exists to prevent. /var/tmp
+    # stands in for it here: outside /tmp, outside home, and POSIX-standard.
+    relocated =
+      Path.join("/var/tmp", "kyber-dash-varfolders-#{System.unique_integer([:positive])}")
+
+    File.mkdir_p!(relocated)
+
+    previous = System.get_env("TMPDIR")
+    System.put_env("TMPDIR", relocated)
+
+    on_exit(fn ->
+      if previous, do: System.put_env("TMPDIR", previous), else: System.delete_env("TMPDIR")
+      File.rm_rf(relocated)
+    end)
+
+    refute String.starts_with?(Path.expand(System.tmp_dir!()), "/tmp/")
+
+    assert Dashboard.guard_oracle_seed(
+             oracle_seed: "present",
+             log: Path.join(relocated, "store.jsonl")
+           ) == :ok
+
+    # the widening defence is unaffected: a real store under home is not
+    # under this tmp dir either
+    assert_raise Mix.Error, fn ->
+      Dashboard.guard_oracle_seed(
+        oracle_seed: "present",
+        log: Path.join(System.user_home!(), ".kyber/store.jsonl")
+      )
+    end
+  end
+
+  test "the guard is silent for --oracle-seed absent, whatever the store" do
+    real = Path.join(System.user_home!(), ".kyber/store.jsonl")
+
+    assert Dashboard.guard_oracle_seed(oracle_seed: "absent", log: real) == :ok
+    assert Dashboard.guard_oracle_seed(log: real) == :ok
+
+    # the strict parse still runs ahead of the store check
+    assert_raise Mix.Error, ~r/--oracle-seed must be present or absent/, fn ->
+      Dashboard.guard_oracle_seed(oracle_seed: "presnt", log: real)
     end
   end
 

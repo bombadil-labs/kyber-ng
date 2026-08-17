@@ -610,15 +610,19 @@ defmodule Kyber.Agent.Reactor do
   # retraction-detection scans for a negates pointer targeting the seed id.
   # ANY-unretracted, not find-first: a D6 hot-flip cycle (close, re-open)
   # leaves a retracted seed alongside a fresh live one in the store.
+  #
+  # The retraction read is retracted_ids/1 — EVERY negates pointer on every
+  # claim, not the first one a claim carries. It has to be the same read the
+  # daemon's close path uses (daemon.ex scan_seed_claims/0): a claim whose
+  # second pointer negates the seed retracts it there, so a first-pointer-only
+  # read here would leave the gate open after the operator was told it was
+  # closed — a fail-open on the control that gates model spend.
   defp gate_open? do
-    Enum.any?(DurableStore.set(), fn {id, {claims, _sig}} ->
-      kind(claims) == "seed" and not retracted?(id)
-    end)
-  end
+    set = DurableStore.set()
+    retracted = retracted_ids(set)
 
-  defp retracted?(seed_id) do
-    Enum.any?(DurableStore.set(), fn {_id, {claims, _sig}} ->
-      match?({:delta, ^seed_id, _ctx}, pointer(claims, "negates"))
+    Enum.any?(set, fn {id, {claims, _sig}} ->
+      kind(claims) == "seed" and not MapSet.member?(retracted, id)
     end)
   end
 
@@ -784,14 +788,14 @@ defmodule Kyber.Agent.Reactor do
 
   # T14c D5/H3: the operator-key boot attestation. Boot opt :operator_seed
   # (hex), default nil => no attestation (existing boots unchanged); no
-  # UNRETRACTED seed claim in the store under [the boot carrying] the
-  # operator seed => no attestation — skip, never crash. The attested seed
-  # claim is THE oracle seed claim (T14a pin 17: asserted by the daemon at
-  # boot, signed by its boot key — "operator-key signing stays T14c" means
-  # the ATTESTATION is operator-signed, never the seed claim). Emission at
-  # init via DIRECT DurableStore.append (never Daemon.emit); ts = the seed
-  # claim's claims.timestamp — the only store-derived clock at boot — so
-  # reboots over one store merge to exactly one attestation (union-no-op).
+  # UNRETRACTED seed claim of THIS daemon's own in the store => no
+  # attestation — skip, never crash. The attested seed claim is THE oracle
+  # seed claim (T14a pin 17: asserted by the daemon at boot, signed by its
+  # boot key — "operator-key signing stays T14c" means the ATTESTATION is
+  # operator-signed, never the seed claim). Emission at init via DIRECT
+  # DurableStore.append (never Daemon.emit); ts = the seed claim's
+  # claims.timestamp — the only store-derived clock at boot — so reboots over
+  # one store merge to exactly one attestation (union-no-op).
   defp attest_boot(opts, agent_seed) do
     case Keyword.get(opts, :operator_seed) do
       nil ->
@@ -800,7 +804,7 @@ defmodule Kyber.Agent.Reactor do
       operator_seed ->
         agent_author = Keys.author_for_seed(agent_seed)
 
-        case unretracted_seed_claim(DurableStore.set()) do
+        case own_unretracted_seed_claim(DurableStore.set(), agent_author) do
           nil ->
             :ok
 
@@ -825,14 +829,31 @@ defmodule Kyber.Agent.Reactor do
     end
   end
 
-  # THE unretracted seed claim: kind "seed" (the oracle seed claim the
-  # daemon asserted at boot), no negates pointer at its id — the store
-  # only learns, so retraction-detection is the closing mechanism
-  defp unretracted_seed_claim(set) do
+  # the seed claim's fixed shape (pin 16/17) — the same pointer the daemon's
+  # boot assert mints. Duplicated rather than cross-referenced: it is the
+  # gate's wire shape, and both readers have to agree on it literally.
+  @oracle_seed_pointer %{role: "seed", target: {:entity, "oracle", "seed"}}
+
+  # THIS daemon's own unretracted oracle seed claim: its author, the exact
+  # oracle pointer, and no negates pointer at its id (the store only learns,
+  # so retraction-detection is the closing mechanism).
+  #
+  # The predicate matches the daemon's boot assert (daemon.ex
+  # own_oracle_seed?/2) rather than the gate read (pin 16, any-author,
+  # any-target): the attestation's `boot` pointer says "the operator attested
+  # THIS daemon's boot", so anchoring it to a foreign claim — or to a decoy
+  # leading with a "seed" role at some other target — would have the
+  # attestation point at a mint this daemon never signed. A store legitimately
+  # holds several live seed claims (the boot skip is author-scoped), so the
+  # any-live read picks one arbitrarily.
+  defp own_unretracted_seed_claim(set, agent_author) do
     retracted = retracted_ids(set)
 
     Enum.find_value(set, fn {id, {claims, _sig}} ->
-      if kind(claims) == "seed" and not MapSet.member?(retracted, id), do: {id, claims}
+      if claims.author == agent_author and
+           Enum.member?(claims.pointers, @oracle_seed_pointer) and
+           not MapSet.member?(retracted, id),
+         do: {id, claims}
     end)
   end
 

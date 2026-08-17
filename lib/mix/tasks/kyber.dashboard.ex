@@ -17,6 +17,17 @@ defmodule Mix.Tasks.Kyber.Dashboard do
   plus the daemon's model flags (`--api-key-env`, `--operator-seed-env`,
   `--model`, `--base-url`, `--oracle-seed present|absent`). The reactor
   boots `engine: :none` unless an api key is supplied.
+
+  A `:reactor` dashboard is a WRITER, not a viewer — it hosts the live
+  daemon (M4: one tree per agent, so `ctl send` letters flow through it) and
+  appends operational deltas whatever the flags say. What is guarded is the
+  one standing write: `--oracle-seed present` mints the seed claim that
+  authorizes model initiation, so ON THIS TASK it is admitted only against a
+  store under the system tmp dir or one the operator marks with
+  `--dev-store` (see `guard_oracle_seed/1`). The guard is scoped to this
+  entry point, not to the store: `kyber daemon --oracle-seed present` mints
+  the same claim unguarded, because an explicit flag on an explicit daemon
+  boot is already the deliberate gate-open.
   """
 
   use Mix.Task
@@ -33,9 +44,12 @@ defmodule Mix.Tasks.Kyber.Dashboard do
           operator_seed_env: :string,
           model: :string,
           base_url: :string,
-          oracle_seed: :string
+          oracle_seed: :string,
+          dev_store: :boolean
         ]
       )
+
+    :ok = guard_oracle_seed(opts)
 
     if opts[:log], do: Application.put_env(:kyber, :log_path, opts[:log])
 
@@ -112,6 +126,81 @@ defmodule Mix.Tasks.Kyber.Dashboard do
       engine: engine,
       narrate: true
     ]
+  end
+
+  # The guard covers ONE write on ONE entry point: the seed claim minted by
+  # `mix kyber.dashboard --oracle-seed present`. That claim is the standing
+  # authorization for model initiation and it outlives the dashboard
+  # process, so here it is admitted only against a dev store. The
+  # dashboard's reactor writes either way (refusals, checkpoints, the
+  # agent's own deltas — it IS the live daemon host, M4); the seed claim is
+  # the write that wants a deliberate gate-open, not a side effect of
+  # starting a viewer.
+  #
+  # This is NOT store-wide protection, and does not pretend to be: `kyber
+  # daemon --oracle-seed present` and the Discord gateway mint the identical
+  # claim unguarded, by design. Those are the operator's deliberate boot
+  # paths — an explicit flag on an explicit daemon boot IS the deliberate
+  # gate-open. The dashboard is the one entry point where the flag can ride
+  # along casually with a viewer, which is why it alone asks.
+  #
+  # Two ways to be a dev store, either sufficient: the `--log` path lies
+  # under the system tmp dir (flag-free, so tests and throwaway stores need
+  # nothing extra), or the operator passes `--dev-store` (the deliberate
+  # opt-in for a store anywhere else).
+  #
+  # tmp-ness is a path-COMPONENT prefix, not a string prefix: `/tmpdata` is
+  # not under `/tmp`. TMPDIR is user-settable, and a relocated TMPDIR CAN
+  # widen the admission on its own — `TMPDIR=$HOME` would make
+  # `~/.kyber/store.jsonl` "under tmp", admitting a real store flag-free.
+  # That widening is what the second half of the check defends against
+  # directly: a tmp dir that overlaps the operator's home is not a dev-store
+  # signal at all, so the guard falls back to demanding `--dev-store`.
+  #
+  # Anchoring on a literal `/tmp` component would do the same job on Linux
+  # and nowhere else: macOS resolves TMPDIR to `/var/folders/...`, so no
+  # macOS store would ever be flag-free and every operator there would learn
+  # to pass `--dev-store` by reflex — which is exactly the habit this
+  # tripwire exists to prevent.
+  @doc false
+  @spec guard_oracle_seed(keyword()) :: :ok
+  def guard_oracle_seed(opts) do
+    if oracle_seed(opts[:oracle_seed]) == :present and
+         not (tmp_store?(opts[:log]) or opts[:dev_store] == true) do
+      Mix.raise(
+        "--oracle-seed present would open the oracle gate on a real store: the boot mints " <>
+          "a seed claim, the standing authorization for model initiation. (The dashboard's " <>
+          "reactor still appends operational deltas — refusals, checkpoints — the seed " <>
+          "claim is the one write that wants a deliberate gate-open.) The dashboard is a " <>
+          "viewer; the deliberate gate-open is: kyber daemon --oracle-seed present, or " <>
+          "kyber agent set <name> --oracle-seed present. Pass --dev-store if this store " <>
+          "really is a dev store."
+      )
+    end
+
+    :ok
+  end
+
+  defp tmp_store?(nil), do: false
+
+  defp tmp_store?(log) do
+    tmp = Path.split(Path.expand(System.tmp_dir!()))
+
+    List.starts_with?(Path.split(Path.expand(log)), tmp) and not overlaps_home?(tmp)
+  end
+
+  # the widening case, both directions: a tmp dir INSIDE home (`TMPDIR=$HOME`,
+  # `TMPDIR=$HOME/tmp`) makes every real store look tmp, and a tmp dir that
+  # CONTAINS home (`TMPDIR=/`, `TMPDIR=/home`) does the same from above.
+  defp overlaps_home?(tmp) do
+    case System.user_home() do
+      nil ->
+        false
+
+      home ->
+        home = Path.split(Path.expand(home))
+        List.starts_with?(tmp, home) or List.starts_with?(home, tmp)
+    end
   end
 
   # T19 (P5 LOW): strict, mirroring resolve_operator_seed/1 — a typo'd

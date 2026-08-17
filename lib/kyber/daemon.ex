@@ -217,22 +217,30 @@ defmodule Kyber.Daemon do
         fired: 0,
         persisted: 0,
         pulsed: 0,
-        skipped: 0
+        skipped: 0,
+        gate_flip_failures: 0,
+        # the count of live seed claims the last close left standing because
+        # another principal signed them (close_gate_hot/2)
+        foreign_gate_claims_open: 0,
+        # the `want` of a flip this daemon could not honor (sync_oracle_gate/2)
+        gate_flip_latch: nil
       }
 
       state = agent_identity_init(state, opts)
 
       case loop do
         :reactor ->
-          # pin 17: the oracle_seed boot-opt assertion — `:present` appends
-          # ONE fixed-content seed delta at boot, signed by the daemon's
-          # existing boot key (fixed content => fixed content-derived id =>
-          # the two-boot AC5 companion holds). M2: retraction-detection (a
-          # negates pointer targeting the seed id) is the gate's closing
-          # mechanism — the reactor reads it from store state.
+          # pin 17: the oracle_seed boot-opt assertion — `:present` asserts
+          # ONE live seed delta at boot, signed by the daemon's existing
+          # boot key. M2: retraction-detection (a negates pointer targeting
+          # the seed id) is the gate's closing mechanism — the reactor reads
+          # it from store state. A gate it cannot open is narrated, not
+          # refused: the closed gate is the safe posture, an unbootable
+          # daemon is not. An UNWRITABLE store is the one exception — see
+          # assert_oracle_seed/2.
           reactor_opts = reactor_opts(opts, seed)
 
-          with :ok <- assert_oracle_seed(state, opts),
+          with {:ok, state} <- assert_oracle_seed(state, opts),
                {:ok, reactor} <- start_reactor(reactor_opts),
                # T15: the federation peer — opens a TCP listener so a sibling
                # agent (e.g. Liet) can import Wisp's signed claims. Only when
@@ -594,6 +602,9 @@ defmodule Kyber.Daemon do
   # companion (identical seeded commit sequence => identical delta-id sets)
   @oracle_seed_ts 1_700_000_000_000.0
 
+  # the seed claim's only pointer — the gate's fixed shape (pin 16/17)
+  @oracle_seed_pointer %{role: "seed", target: {:entity, "oracle", "seed"}}
+
   defp build_signed(state, pointers, ts) do
     raw = %{
       timestamp: ts,
@@ -809,41 +820,206 @@ defmodule Kyber.Daemon do
     end
   end
 
-  # pin 17: the oracle_seed assertion — :present appends ONE fixed-content
-  # seed delta (fixed timestamp + fixed pointers, signed by the daemon's
-  # boot key) so its content-derived id is deterministic across boots; the
-  # reactor's gate reads it from store state. :absent (the default) appends
-  # nothing. A failed append refuses the boot.
+  # pin 17: the oracle_seed assertion — :present appends ONE seed delta
+  # (signed by the daemon's boot key) when this daemon holds no live one;
+  # the reactor's gate reads it from store state. :absent (the default)
+  # appends nothing.
+  #
+  # The skip is scoped to THIS daemon's author: a live seed claim signed by
+  # another key would otherwise satisfy the boot flag, leaving the gate
+  # dependent on a claim this daemon cannot keep alive. The reactor's gate
+  # read stays author-agnostic (pin 16) — only the boot append is scoped.
+  #
+  # The two failure classes are NOT the same failure, so they do not get the
+  # same answer.
+  #
+  # A gate that cannot be OPENED does not refuse the boot: the gate is
+  # fail-closed by construction (no live seed => model initiation refuses),
+  # so the safe posture is available. Refusing the boot instead would hand a
+  # hostile peer a denial of startup — it appends negations against the ids
+  # this daemon would mint, and the daemon never comes up at all. That class
+  # (an exhausted ladder, a negation racing the append, a door refusal) is
+  # narrated LOUDLY and the daemon runs refuse-only until the gate is opened.
+  #
+  # An UNWRITABLE store refuses. `DurableStore.append` collapses every store
+  # I/O failure — the lazy open (:eacces, :enoent, :enotdir) and the write
+  # itself (:enospc, :eio) — to `{:error, :persist_failed}`; every other
+  # refusal shape comes from the door (Store.admit), which is a claim
+  # judgement, not a device. A daemon whose store will not take a write
+  # cannot record ANYTHING — no refusal, no checkpoint, no attestation — so
+  # booting "successfully" into it reports a running agent that is silently
+  # writing nothing.
   defp assert_oracle_seed(state, opts) do
     case Keyword.get(opts, :oracle_seed, :absent) do
       :present ->
-        wire =
-          build_signed(
-            state,
-            [%{role: "seed", target: {:entity, "oracle", "seed"}}],
-            @oracle_seed_ts
-          )
+        # read the store directly: the seed cache is built only under an
+        # agent identity, and the assert runs on every reactor boot
+        {seeds, negated} = scan_seed_claims()
 
-        case DurableStore.append(wire) do
-          :ok -> :ok
-          {:error, reason} -> {:error, {:oracle_seed, reason}}
+        if own_live_seed?(seeds, negated, state.author) do
+          {:ok, state}
+        else
+          with {:ok, wire} <- mint_seed_wire(state, negated),
+               :ok <- DurableStore.append(wire),
+               :ok <- confirm_oracle_gate(wire["id"]) do
+            {:ok, state}
+          else
+            {:error, :persist_failed} -> {:error, {:oracle_seed, :persist_failed}}
+            {:error, reason} -> {:ok, warn_gate_not_opened(state, reason)}
+          end
         end
 
       :absent ->
-        :ok
+        {:ok, state}
     end
+  end
+
+  # the message reads the ACTUAL gate before narrating. The boot skip is
+  # author-scoped, so a failed mint does not imply a closed gate: a foreign
+  # live seed claim holds the gate open for the reactor while this daemon has
+  # no claim of its own. Telling the operator "refuse-only" there is wrong in
+  # exactly the dangerous case — model initiation proceeds on a claim this
+  # daemon can neither keep alive nor retract.
+  #
+  # public (undocumented) so both messages stay under test: reaching this
+  # through a real boot needs a negation racing the append, and the store I/O
+  # class that used to be easy to stage now refuses the boot instead.
+  @doc false
+  @spec warn_gate_not_opened(map(), term()) :: map()
+  def warn_gate_not_opened(state, reason) do
+    if any_live_seed?() do
+      note_gate_flip_failure(
+        state,
+        "oracle gate NOT opened by THIS daemon (#{inspect(reason)}), but the gate is OPEN on a " <>
+          "foreign claim this daemon cannot retract or keep alive — model initiation may " <>
+          "proceed on that claim's authority"
+      )
+    else
+      note_gate_flip_failure(
+        state,
+        "oracle gate NOT opened (#{inspect(reason)}) and NO live seed claim exists — this " <>
+          "daemon boots refuse-only: model initiation will REFUSE until the gate is opened " <>
+          "(kyber agent set <name> --oracle-seed present)"
+      )
+    end
+  end
+
+  # `gate_flip_failures`: the count of gate-open/close requests this daemon
+  # could not honor — the boot assert and both D6 hot flips. Narration is
+  # opt-in (narrate: false by default), so a failed flip would otherwise be
+  # invisible to the operator who asked for it; the log line and this counter
+  # (status carries it) are the durable signal.
+  #
+  # public (undocumented) so the increment stays under test: the failure
+  # branches themselves need a store append or a racing negation to reach.
+  @doc false
+  @spec note_gate_flip_failure(map(), String.t()) :: map()
+  def note_gate_flip_failure(state, message) do
+    Logger.warning("kyber: " <> message)
+    narrate(state, message)
+    Map.update(state, :gate_flip_failures, 1, &(&1 + 1))
+  end
+
+  # this daemon's own live oracle claim: its author, the exact oracle
+  # pointer, and no retraction against it. The scan is broad (it matches the
+  # reactor's gate read), so the exact-pointer check lives here — see
+  # own_oracle_seed?/2.
+  defp own_live_seed?(seeds, negated, author) do
+    Enum.any?(seeds, fn {id, claims} ->
+      own_oracle_seed?(claims, author) and not MapSet.member?(negated, id)
+    end)
+  end
+
+  # A mint whose derived id is already negated is dead on arrival: the store
+  # dedups by content id and the retraction still holds. So the mint derives
+  # the id first and steps the timestamp until no retraction targets it —
+  # two stages, in order:
+  #
+  # 1. a ladder from the FIXED @oracle_seed_ts. On a store carrying no negation
+  #    against those ids the first candidate wins, which is what keeps the
+  #    boot id deterministic across boots (the two-boot AC5 companion).
+  # 2. a single mint at now_ts(), PLUS a locally-generated nonce pointer. Every other
+  #    field of the claim is public (ts, author, pointers), so a peer that
+  #    knows the shape can enumerate a millisecond window's worth of ids and
+  #    negate all of them — a now_ts alone is guessable, the nonce is not.
+  #    The nonce rides SECOND: the reactor derives the claim's kind from the
+  #    FIRST pointer's role (reactor.ex kind/1), so the seed pointer must
+  #    stay at the head for the gate read to see it.
+  #
+  # Stage 1 keeps the bare fixed-ts shape — that determinism is the two-boot
+  # AC5 companion. Stage 2 needs no ladder and cannot be exhausted: 128 bits
+  # of local randomness are not in anyone's pre-negated set, so a mint is
+  # always available and pre-computation buys an attacker nothing.
+  @seed_ts_bump_limit 10
+
+  defp mint_seed_wire(state, negated) do
+    with {:error, _reason} <- seed_ladder(state, @oracle_seed_ts, negated) do
+      {:ok, build_signed(state, [@oracle_seed_pointer, nonce_pointer()], now_ts())}
+    end
+  end
+
+  defp nonce_pointer do
+    %{
+      role: "nonce",
+      target: {:entity, "nonce", Base.encode16(:crypto.strong_rand_bytes(16), case: :lower)}
+    }
+  end
+
+  # public (undocumented) so the exhaustion refusal stays under test: with
+  # the nonce mint behind it, stage 1 running out is not reachable through a
+  # real boot. Reads only :author and :seed off the state.
+  @doc false
+  @spec seed_ladder(map(), float(), MapSet.t()) :: {:ok, map()} | {:error, :negated_seed_id}
+  def seed_ladder(state, base, negated) do
+    Enum.reduce_while(0..@seed_ts_bump_limit, {:error, :negated_seed_id}, fn bump, acc ->
+      wire = build_signed(state, [@oracle_seed_pointer], base + bump)
+
+      if MapSet.member?(negated, wire["id"]),
+        do: {:cont, acc},
+        else: {:halt, {:ok, wire}}
+    end)
+  end
+
+  # the postcondition on THE MINTED CLAIM: it is in the store and carries no
+  # retraction. An any-live read would pass on someone else's claim — or on
+  # an unrelated one — while this mint lay dead, which is exactly the case
+  # the append is trying to rule out. This is strictly stronger than the
+  # reactor's gate read (pin 16, any unretracted claim whose first pointer
+  # has role "seed"): the minted claim leads with @oracle_seed_pointer, so a
+  # live mint is by construction a claim that read finds.
+  #
+  # public (undocumented) so the postcondition stays under test: through a
+  # real boot it fails only on a negation racing the append.
+  @doc false
+  @spec confirm_oracle_gate(String.t()) :: :ok | {:error, :gate_closed}
+  def confirm_oracle_gate(minted_id) do
+    {seeds, negated} = scan_seed_claims()
+
+    if Map.has_key?(seeds, minted_id) and not MapSet.member?(negated, minted_id),
+      do: :ok,
+      else: {:error, :gate_closed}
   end
 
   # D6: the hot path keeps the oracle gate consistent with the fold. The
   # gate is a pure store read (reactor pin 16: open iff an unretracted seed
   # claim exists), so the flip is a delta operation — never reactor state:
-  # fold wants :present with no live seed => append one (the boot shape;
-  # the fixed ts unless a retracted seed already holds that content id, in
-  # which case a fresh ts mints a new claim the dedup can't absorb); fold
-  # wants :absent with a live seed => append its negation (retraction-is-
-  # negation, the store only learns). A gate already matching the fold
-  # appends nothing. Takes effect on the next dispatch — the next
+  # fold wants :present with no live seed OF THIS DAEMON'S OWN => append one
+  # through the SAME mint/confirm pair the boot assert uses (mint_seed_wire/2's
+  # two stages, confirm_oracle_gate/1's postcondition); fold wants :absent
+  # => append a negation against every live seed claim THIS DAEMON SIGNED
+  # (retraction-is-negation, the store only learns). A gate already matching
+  # the fold appends nothing. Takes effect on the next dispatch — the next
   # inference cycle, no reboot.
+  #
+  # Both sides are author-scoped, mirroring the boot assert: opening rests on
+  # a claim this daemon signs and can keep alive (and one carrying the exact
+  # oracle pointer), so a foreign live claim does not satisfy :present;
+  # closing retracts only what this daemon signed and refuses the rest
+  # loudly — see close_gate_hot/2 for why the blast radius stops there.
+  #
+  # A flip this daemon cannot honor is logged and counted (status carries
+  # `gate_flip_failures`) — the operator who asked for it never has to read
+  # the narration to learn it did not happen.
   defp sync_oracle_gate(state, fold_opts) do
     # the fold DECLARES the gate only when it sets `oracle_seed` explicitly:
     # boot_opts/2 rejects nil values, so an ABSENT key means "the fold never
@@ -854,53 +1030,269 @@ defmodule Kyber.Daemon do
         state
 
       {:ok, want} ->
-        {live_id, any_seed?} = cached_seed_state(state)
+        if Map.get(state, :gate_flip_latch) == want,
+          do: state,
+          else: flip_gate(state, want)
+    end
+  end
 
-        cond do
-          want == :present and live_id == nil ->
-            ts = if any_seed?, do: now_ts(), else: @oracle_seed_ts
-            wire = build_signed(state, [%{role: "seed", target: {:entity, "oracle", "seed"}}], ts)
+  defp flip_gate(state, want) do
+    # the latch is decided per flip: cleared going in, set again only by the
+    # paths below that hit a PERMANENT failure
+    state = clear_gate_flip_latch(state)
 
-            case DurableStore.append(wire) do
-              :ok ->
-                narrate(state, "oracle gate open via config hot-swap")
-                # the flip append is rare — a rebuild HERE (not per delta)
-                # keeps the cache exact without deriving the new claim's
-                # content id; the feed's re-delivery is then idempotent
-                init_seed_cache(state)
+    cond do
+      want == :present and cached_own_live_seed(state) == nil ->
+        open_gate_hot(state)
 
-              {:error, reason} ->
-                narrate(state, "oracle gate open refused #{inspect(reason)}")
-                state
-            end
+      want == :absent ->
+        case cached_live_seeds(state) do
+          [] -> state
+          live_ids -> close_gate_hot(state, live_ids)
+        end
 
-          want == :absent and live_id != nil ->
-            wire =
-              build_signed(state, [%{role: "negates", target: {:delta, live_id, "retracted"}}])
+      true ->
+        state
+    end
+  end
 
-            case DurableStore.append(wire) do
-              :ok ->
-                narrate(state, "oracle gate closed via config hot-swap")
-                %{state | negated_ids: MapSet.put(state.negated_ids, live_id)}
+  # The fold is STANDING: `oracle_seed` stays in the folded view, so every
+  # later AgentSet on this agent — about anything at all — re-enters the flip
+  # path. A flip that cannot be honored (foreign claims hold the gate open, a
+  # peer is negating the ids we mint) would then re-scan the store and re-log
+  # the same refusal on every fold. So an unhonorable `want` is LATCHED and
+  # skipped until something gate-relevant changes.
+  #
+  # "Unhonorable" is a PERMANENT failure, and only the failing path knows
+  # which class it is in — so each one says so explicitly here rather than
+  # having the latch infer it. The permanent classes are the ones a later
+  # fold has nothing new to try against: foreign claims hold the gate open
+  # (this daemon does not retract what it did not sign), or a peer is
+  # negating the ids this daemon mints.
+  #
+  # TRANSIENT store I/O — `{:error, :persist_failed}`, which collapses the
+  # lazy open and the write itself — NEVER latches. A disk that refused this
+  # write can take the next one, and latching there would leave the gate
+  # standing at the opposite of what the operator asked for, permanently,
+  # after one blip.
+  #
+  # track_seed_claims/3 clears the latch when a FOREIGN seed or negates delta
+  # arrives (see there): the store changed in a way that can change the
+  # answer. Our own negations are excluded — they are what produced the
+  # latched state, and letting them clear it would restore the spam.
+  defp set_gate_flip_latch(state, want), do: Map.put(state, :gate_flip_latch, want)
 
-              {:error, reason} ->
-                narrate(state, "oracle gate close refused #{inspect(reason)}")
-                state
-            end
+  defp clear_gate_flip_latch(state), do: Map.put(state, :gate_flip_latch, nil)
 
-          true ->
+  defp open_gate_hot(state) do
+    # the negated set is re-scanned rather than read off the cache: the mint
+    # needs the retraction targets themselves, and the flip is rare enough
+    # to pay for one walk
+    {_seeds, negated} = scan_seed_claims()
+
+    with {:ok, wire} <- mint_seed_wire(state, negated),
+         :ok <- DurableStore.append(wire) do
+      state =
+        case confirm_oracle_gate(wire["id"]) do
+          :ok ->
+            narrate(state, "oracle gate open via config hot-swap")
             state
+
+          # a negation raced the append: the mint is dead on arrival. Something
+          # is actively negating what this daemon mints, so re-minting on every
+          # later fold is spam — PERMANENT. The racing negation is itself a
+          # foreign delta, so the feed re-arms the latch when it arrives.
+          {:error, :gate_closed} ->
+            state
+            |> note_gate_flip_failure("oracle gate open FAILED — gate closed")
+            |> set_gate_flip_latch(:present)
+        end
+
+      # the flip append is rare — a rebuild HERE (not per delta) keeps the
+      # cache exact without deriving the new claim's content id; the feed's
+      # re-delivery is then idempotent
+      init_seed_cache(state)
+    else
+      # the store did not take the mint. TRANSIENT: the next fold retries,
+      # so this must not latch.
+      {:error, :persist_failed} ->
+        note_gate_flip_failure(
+          state,
+          "oracle gate open refused :persist_failed — the store did not take the mint; the " <>
+            "next fold RETRIES"
+        )
+
+      {:error, reason} ->
+        state
+        |> note_gate_flip_failure("oracle gate open refused #{inspect(reason)}")
+        |> set_gate_flip_latch(:present)
+    end
+  end
+
+  # one negation per live claim THIS DAEMON SIGNED. A partial close still
+  # records what landed, so a later fold (or the feed's own re-delivery)
+  # converges on the rest rather than re-negating ids already retracted.
+  #
+  # The close is AUTHOR-SCOPED, and that leaves the gate open in a case the
+  # operator asked to shut. The gate is store-global (pin 16 reads the whole
+  # store with no agent scoping, and the seed claim's target
+  # {:entity, "oracle", "seed"} carries no agent context), so closing it
+  # completely would mean writing permanent negations against every live seed
+  # claim in the store — including other agents' attestation anchors (the
+  # reactor's `boot` pointer is a live seed claim) and a federated peer's
+  # claims. `oracle_seed: "absent"` is a config fold on ONE agent; it is not
+  # a mandate for that agent to retract other principals' deltas, and
+  # retraction is permanent — the store only learns.
+  #
+  # So the daemon closes what it signed and REFUSES the rest, loudly: each
+  # foreign claim left alive is logged with its author, the flip counts as a
+  # failure, and status carries `foreign_gate_claims_open`. The reactor's gate
+  # read will still say OPEN, which is the honest answer — the operator asked
+  # for a close, got a partial one, and the status says which claims held it
+  # open and that this daemon did not sign them. A store-wide close is an
+  # operator action against those claims' own agents, not a side effect here.
+  defp close_gate_hot(state, live_ids) do
+    # the split is by SIGNING AUTHOR, not by the cache's own_seed_ids: that
+    # set is the OPEN side's oracle-pointer-scoped read, and a claim of ours
+    # leading with a "seed" role at some other target still holds the gate
+    # open for the reactor and is still ours to retract.
+    authors = seed_authors(live_ids)
+    {own_ids, foreign_ids} = Enum.split_with(live_ids, &(authors[&1] == state.author))
+
+    state =
+      Enum.reduce(own_ids, state, fn id, acc ->
+        wire = build_signed(acc, [%{role: "negates", target: {:delta, id, "retracted"}}])
+
+        case DurableStore.append(wire) do
+          :ok ->
+            %{acc | negated_ids: MapSet.put(acc.negated_ids, id)}
+
+          {:error, reason} ->
+            note_gate_flip_failure(acc, "oracle gate close refused for #{id}: #{inspect(reason)}")
+        end
+      end)
+
+    state = Map.put(state, :foreign_gate_claims_open, length(foreign_ids))
+    Enum.each(foreign_ids, &note_foreign_gate_claim(state, &1, authors[&1]))
+
+    # the postcondition is read off the STORE, not the cache: the narration
+    # must not report a closed gate the reactor would still read as open
+    if foreign_ids != [] do
+      state
+      |> note_gate_flip_failure(
+        "oracle gate STILL OPEN on #{length(foreign_ids)} foreign seed claim(s) — the close " <>
+          "was refused for claims this daemon did not sign; model initiation may proceed on " <>
+          "their authority until their own agents retract them"
+      )
+      |> set_gate_flip_latch(:absent)
+    else
+      close_postcondition(state)
+    end
+  end
+
+  # the gate is open when the operator asked for it shut; the only question
+  # left is whether another fold could shut it. The discriminator is the
+  # SIGNING AUTHOR of what is still live:
+  #
+  # - all OURS => the negations above did not land (the store refused the
+  #   write). TRANSIENT — the claims are still ours to retract and the next
+  #   fold must retry, so the latch stays clear.
+  # - one we did NOT sign => a permanent hold, for the same reason the split
+  #   above refuses foreign claims. Latch it.
+  #
+  # Reaching the foreign half HERE takes a foreign claim landing between the
+  # author split above and this scan: every foreign claim the cache already
+  # knew about went to the branch above.
+  defp close_postcondition(state) do
+    case live_seed_authors() do
+      [] ->
+        narrate(state, "oracle gate closed via config hot-swap")
+        state
+
+      authors ->
+        if Enum.all?(authors, &(&1 == state.author)) do
+          note_gate_flip_failure(
+            state,
+            "oracle gate close FAILED — gate still open on this daemon's OWN seed claim(s): the " <>
+              "negations did not land. The next fold RETRIES the close."
+          )
+        else
+          state
+          |> note_gate_flip_failure(
+            "oracle gate close FAILED — gate still open on a seed claim this daemon did not " <>
+              "sign, which landed mid-close; this daemon does not retract what it did not sign"
+          )
+          |> set_gate_flip_latch(:absent)
         end
     end
   end
 
+  # a foreign claim the close REFUSED to touch goes to the LOG as well as the
+  # narration: narration is opt-in (narrate: false by default), and the
+  # identity of whoever is holding the gate open is precisely the thing an
+  # operator needs without having asked for it in advance.
+  #
+  # The author rides in FULL: `short/1` keeps eight characters, which the
+  # "ed25519:" prefix consumes entirely — a peer identity has to be
+  # unambiguous here or the line says nothing about who to go ask.
+  defp note_foreign_gate_claim(state, id, author) do
+    message =
+      "oracle gate close REFUSED for foreign seed claim #{short(id)} (author #{author}) — " <>
+        "this daemon did not sign it"
+
+    Logger.warning("kyber: " <> message)
+    narrate(state, message)
+  end
+
+  defp seed_authors(ids) do
+    wanted = MapSet.new(ids)
+
+    for {id, {claims, _sig}} <- DurableStore.set(),
+        MapSet.member?(wanted, id),
+        into: %{},
+        do: {id, claims.author}
+  end
+
+  defp any_live_seed?, do: live_seed_authors() != []
+
+  # the signing author of every live seed claim in the store — the close
+  # postcondition's discriminator (see close_postcondition/1)
+  defp live_seed_authors do
+    {seeds, negated} = scan_seed_claims()
+
+    for {id, claims} <- seeds, not MapSet.member?(negated, id), do: claims.author
+  end
+
   # P5 round-6 LOW-2: the gate's seed-claim state is CACHED — one boot-time
   # scan seeds it, the feed keeps it current — so the daemon's serialized
-  # loop never walks the full store per AgentSet. Same reading as the old
-  # full scan: {live unretracted seed claim id | nil, any seed claim at
-  # all?} — the second element tells the re-open path the fixed-content
-  # boot id is already taken by a retracted claim.
+  # loop never walks the full store per AgentSet.
   defp init_seed_cache(state) do
+    {seeds, negated} = scan_seed_claims()
+
+    own =
+      for {id, claims} <- seeds,
+          own_oracle_seed?(claims, state.author),
+          into: MapSet.new(),
+          do: id
+
+    Map.merge(state, %{
+      seed_ids: MapSet.new(Map.keys(seeds)),
+      own_seed_ids: own,
+      negated_ids: negated
+    })
+  end
+
+  # one full-store scan: {%{seed claim id => claims}, negation targets}. The
+  # claims ride along so the boot assert can scope its skip by author and by
+  # the exact oracle pointer; the D6 hot-path cache keeps ids only.
+  #
+  # The seed predicate is the REACTOR's (reactor.ex gate_open?/0: a claim
+  # whose FIRST pointer has role "seed", whatever its target). It has to be
+  # the same read on both sides: the close path negates exactly what this
+  # scan returns, so a claim this scan misses while the reactor counts it
+  # leaves model initiation authorized after the operator has been told the
+  # gate is closed — a fail-open on the control that gates model spend.
+  defp scan_seed_claims do
     set = DurableStore.set()
 
     negated =
@@ -911,21 +1303,38 @@ defmodule Kyber.Daemon do
 
     seeds =
       for {id, {claims, _sig}} <- set,
-          match?([%{role: "seed"} | _rest], claims.pointers),
-          into: MapSet.new(),
-          do: id
+          seed_claim?(claims),
+          into: %{},
+          do: {id, claims}
 
-    Map.merge(state, %{seed_ids: seeds, negated_ids: negated})
+    {seeds, negated}
   end
+
+  defp seed_claim?(claims), do: match?([%{role: "seed"} | _rest], claims.pointers)
+
+  # the OPEN side is narrower than the close side on purpose: opening rests
+  # on a claim this daemon signed AND carrying the exact oracle pointer. A
+  # claim of ours that merely leads with a "seed" role at some other target
+  # is not the oracle gate, so it must not satisfy a boot assert or a fold
+  # asking for :present — the daemon would skip the mint and run on a claim
+  # that never spoke about the oracle.
+  defp own_oracle_seed?(claims, author),
+    do: claims.author == author and Enum.member?(claims.pointers, @oracle_seed_pointer)
 
   # negation targets are tracked unconditionally, never only for known
   # seeds: merge-is-union means a federated negation can land BEFORE the
   # seed claim it retracts
   defp track_seed_claims(state, id, claims) do
-    seed_ids =
-      if match?([%{role: "seed"} | _rest], claims.pointers),
-        do: MapSet.put(state.seed_ids, id),
-        else: state.seed_ids
+    seed? = seed_claim?(claims)
+
+    seed_ids = if seed?, do: MapSet.put(state.seed_ids, id), else: state.seed_ids
+
+    own_seed_ids =
+      if seed? and own_oracle_seed?(claims, state.author),
+        do: MapSet.put(state.own_seed_ids, id),
+        else: state.own_seed_ids
+
+    negates? = Enum.any?(claims.pointers, &match?(%{role: "negates", target: {:delta, _, _}}, &1))
 
     negated_ids =
       Enum.reduce(claims.pointers, state.negated_ids, fn
@@ -933,12 +1342,31 @@ defmodule Kyber.Daemon do
         _other, acc -> acc
       end)
 
-    %{state | seed_ids: seed_ids, negated_ids: negated_ids}
+    # a gate-relevant delta from SOMEONE ELSE can change the answer a latched
+    # flip already gave, so it re-arms the flip path (sync_oracle_gate/2). Our
+    # own seed and negates deltas are exactly what the latched flip wrote.
+    gate_flip_latch =
+      if (seed? or negates?) and claims.author != state.author,
+        do: nil,
+        else: state.gate_flip_latch
+
+    %{
+      state
+      | seed_ids: seed_ids,
+        own_seed_ids: own_seed_ids,
+        negated_ids: negated_ids,
+        gate_flip_latch: gate_flip_latch
+    }
   end
 
-  defp cached_seed_state(state) do
-    live = Enum.find(state.seed_ids, &(not MapSet.member?(state.negated_ids, &1)))
-    {live, MapSet.size(state.seed_ids) > 0}
+  # the OPEN side reads only this daemon's own claims (see sync_oracle_gate/2)
+  defp cached_own_live_seed(state) do
+    Enum.find(state.own_seed_ids, &(not MapSet.member?(state.negated_ids, &1)))
+  end
+
+  # the CLOSE side reads every author's
+  defp cached_live_seeds(state) do
+    Enum.reject(state.seed_ids, &MapSet.member?(state.negated_ids, &1))
   end
 
   # ------------------------------------------------------------------ T14i
@@ -1739,12 +2167,19 @@ defmodule Kyber.Daemon do
       # P5 round-6 LOW-2: the fold-once proof — N feed deltas move this by
       # exactly N (rollbacks add their own single re-fold)
       folds_since_boot: state.folds_since_boot,
+      gate_flip_failures: Map.get(state, :gate_flip_failures, 0),
+      # the gate is NOT fully closed when this is non-zero: a close retracted
+      # what this daemon signed and refused the rest (close_gate_hot/2)
+      foreign_gate_claims_open: Map.get(state, :foreign_gate_claims_open, 0),
       config: %{fold: fold_summary(state.fold_view), live: state.live}
     })
   end
 
   defp status_map(state) do
-    Map.take(state, [:cursor, :author, :log_path, :fired, :persisted, :pulsed, :skipped])
+    state
+    |> Map.take([:cursor, :author, :log_path, :fired, :persisted, :pulsed, :skipped])
+    |> Map.put(:gate_flip_failures, Map.get(state, :gate_flip_failures, 0))
+    |> Map.put(:foreign_gate_claims_open, Map.get(state, :foreign_gate_claims_open, 0))
   end
 
   defp kind(%{claims: %{pointers: [%{role: role} | _rest]}}), do: role
