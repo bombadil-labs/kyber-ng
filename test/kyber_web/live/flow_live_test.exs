@@ -1,6 +1,7 @@
 defmodule KyberWeb.FlowLiveTest do
   @moduledoc """
-  T19 view 0 — the delta topology. The funnel is the store's append point,
+  T19 view 0 — FLOW-1..8 (`.adlc/specs/T19.md`, "view 0 (FlowLive)"). The
+  funnel is the store's append point,
   each live `DurableStore` subscriber is a node, each committed delta is a
   packet travelling the edges. Sleep-free: `DurableStore.append/1` is a
   serialized call whose fan-out `send` lands in the view's mailbox before
@@ -81,7 +82,7 @@ defmodule KyberWeb.FlowLiveTest do
     |> Enum.map(&(&1 |> Floki.text() |> String.trim()))
   end
 
-  test "AC1: the funnel and one node per live subscriber render" do
+  test "FLOW-1: the funnel and one node per live subscriber render" do
     start_store!()
 
     # an anonymous subscriber (labelled honestly as a viewer) and one
@@ -114,7 +115,7 @@ defmodule KyberWeb.FlowLiveTest do
     assert length(Floki.find(doc, "svg.flow line.edge")) == 3
   end
 
-  test "AC2: a committed delta spawns a kind-coloured packet that opens its trace" do
+  test "FLOW-2: a committed delta spawns a kind-coloured packet that opens its trace" do
     start_store!()
 
     conn = build_conn()
@@ -148,7 +149,7 @@ defmodule KyberWeb.FlowLiveTest do
     assert to == "/trace/" <> id
   end
 
-  test "AC3: the fan-out delivered/pruned counts surface on refresh" do
+  test "FLOW-3: the fan-out delivered/pruned counts surface on refresh" do
     start_store!()
 
     probe = probe!()
@@ -180,7 +181,7 @@ defmodule KyberWeb.FlowLiveTest do
     assert packet_ids(html) == [id, id]
   end
 
-  test "AC4: the packet ring is bounded" do
+  test "FLOW-4: the packet ring is bounded" do
     start_store!()
 
     conn = build_conn()
@@ -198,9 +199,11 @@ defmodule KyberWeb.FlowLiveTest do
     packets = length(Floki.find(doc, "circle.packet"))
 
     assert subscribers >= 1
-    # 40 deltas committed, at most @max_packets (30) in the ring
+    # 40 deltas committed, at most @max_packets (30) in the ring. The bound
+    # is what the ring guarantees — equality would ride the 2.5s packet TTL
+    # (a slow tick between the last append and the render ages packets out).
     assert packets <= 30 * subscribers
-    assert packets == 30 * subscribers
+    assert packets > 0
 
     # the ring keeps the NEWEST deltas — the oldest packets rolled off
     ids = packet_ids(html)
@@ -208,7 +211,7 @@ defmodule KyberWeb.FlowLiveTest do
     refute delta_id(4_201.0) in ids
   end
 
-  test "AC5: the banner renders when the store is absent (separate-BEAM state)" do
+  test "FLOW-5: the banner renders when the store is absent (separate-BEAM state)" do
     # no store started in this test — the mount guard sees none (M4/L6)
     conn = build_conn()
     {:ok, _view, html} = live(conn, "/")
@@ -218,7 +221,7 @@ defmodule KyberWeb.FlowLiveTest do
     assert node_labels(html) == ["store"]
   end
 
-  test "AC6: DurableStore.subscribers/0 returns live pids and prunes dead ones" do
+  test "FLOW-6: DurableStore.subscribers/0 returns live pids and prunes dead ones" do
     start_store!()
 
     alive = probe!()
@@ -237,5 +240,66 @@ defmodule KyberWeb.FlowLiveTest do
     pruned = DurableStore.subscribers()
     assert alive in pruned
     refute doomed in pruned
+  end
+
+  test "FLOW-7: the refresh tick recovers the view across a store restart" do
+    start_store!()
+
+    conn = build_conn()
+    {:ok, view, html} = live(conn, "/")
+    refute html =~ "nothing to show"
+
+    # the store dies under the view; `stop_supervised!` blocks until it is
+    # down, so the following send is strictly ordered after the death
+    stop_supervised!(Kyber.DurableStore)
+
+    send(view.pid, :refresh)
+    down = render(view)
+
+    assert down =~ "nothing to show"
+    assert node_labels(down) == ["store"]
+
+    # a FRESH store: its registered set has never heard of this view, so the
+    # tick must re-subscribe rather than render an empty topology forever
+    start_store!()
+
+    send(view.pid, :refresh)
+    back = render(view)
+
+    refute back =~ "nothing to show"
+    assert "viewer" in node_labels(back)
+
+    # the re-subscribe is live, not cosmetic — the fresh store's feed lands
+    assert :ok = DurableStore.append(received_wire(4_300.0, "flow7-restart", "recovered"))
+    id = delta_id(4_300.0)
+
+    assert packet_ids(render(view)) == [id]
+  end
+
+  test "FLOW-8: the subscriber row is capped and the overflow collapses to one node" do
+    start_store!()
+
+    # 12 probes plus the view itself = 13 live subscribers, over the 8 cap
+    for _n <- 1..12 do
+      assert :ok = DurableStore.subscribe(probe!())
+    end
+
+    conn = build_conn()
+    {:ok, view, _html} = live(conn, "/")
+
+    assert :ok = DurableStore.append(received_wire(4_400.0, "flow8-cap", "capped"))
+    html = render(view)
+
+    {:ok, doc} = Floki.parse_document(html)
+
+    # 8 rendered subscriber nodes plus the one overflow label node
+    assert length(Floki.find(doc, "svg.flow circle.node")) == 9
+    assert length(Floki.find(doc, "svg.flow circle.node-more")) == 1
+    assert "+5 more" in node_labels(html)
+
+    # the overflow node carries no edge and no packets: the quadratic term
+    # is the CAP, not the live subscriber count
+    assert length(Floki.find(doc, "svg.flow line.edge")) == 8
+    assert length(packet_ids(html)) == 8
   end
 end

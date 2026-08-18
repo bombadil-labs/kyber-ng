@@ -2,9 +2,12 @@ defmodule KyberWeb.FlowLive do
   @moduledoc """
   T19 view 0 — the delta topology. The store's append point is the funnel at
   top-center; every live `DurableStore` subscriber is a node in the row
-  below; one edge per subscriber. A committed delta arriving on the pinned
-  `subscribe_seeded/1` feed (F2 — no commit gap) spawns a packet that travels
-  each edge, so the fan-out is visible as motion rather than as a number.
+  below (capped at `@max_nodes`, the rest collapsed into a "+N more" label
+  node — every tab is a subscriber, so an uncapped row is quadratic in
+  viewers); one edge per rendered subscriber. A committed delta arriving on
+  the pinned `subscribe_seeded/1` feed (F2 — no commit gap) spawns a packet
+  that travels each edge, so the fan-out is visible as motion rather than as
+  a number.
 
   The view is itself a subscriber, so it always renders at least its own
   node. Node labels are honest: a registered pid is labelled by the last
@@ -21,6 +24,12 @@ defmodule KyberWeb.FlowLive do
   Separate-BEAM / store-down states render the same explicit banner as
   view 1 (M4/L6). Animation is CSS (offset-path + keyframes) inside the SVG —
   no JS, no npm.
+
+  The refresh tick is the only recovery driver: it re-reads store liveness,
+  re-subscribes when the store restarted under the view, and re-asserts the
+  banner when it went away. Every store read is guarded (`store_call/1`), so
+  a store that dies between the liveness check and the call cannot take the
+  socket — and every dashboard tab — down with it.
   """
 
   use Phoenix.LiveView
@@ -34,6 +43,10 @@ defmodule KyberWeb.FlowLive do
   @max_packets 30
   # a packet leaves the DOM once its animation has finished (dur + slack)
   @packet_ttl_ms 2_500
+  # every open tab is itself a subscriber, so an uncapped row would render
+  # packets * viewers circles — quadratic in viewers. The overflow is
+  # reported as a "+N more" label node instead.
+  @max_nodes 8
 
   @scene_width 900
   @funnel %{x: 450, y: 90}
@@ -41,34 +54,21 @@ defmodule KyberWeb.FlowLive do
 
   @impl true
   def mount(_params, _session, socket) do
-    store_up? = Process.whereis(DurableStore) != nil
-
-    banner =
-      cond do
-        not store_up? ->
-          "nothing to show — no store on this BEAM (run `mix kyber.dashboard`)"
-
-        not Collector.live?() ->
-          "no span collector on this BEAM — deltas stream, but traces are unavailable"
-
-        true ->
-          nil
-      end
-
-    if store_up? and connected?(socket) do
+    if connected?(socket) do
       # the pinned source: the view IS a subscriber node, so it appears in
       # its own topology and receives the live feed
-      {:ok, _seeded} = DurableStore.subscribe_seeded(self())
+      store_call(fn -> DurableStore.subscribe_seeded(self()) end)
+      # ticks even with no store: the tick is what notices one arriving
       Process.send_after(self(), :refresh, @refresh_ms)
     end
 
     socket =
       socket
-      |> assign(:banner, banner)
+      |> assign(:banner, banner(store_up?()))
       |> assign(:funnel, @funnel)
       |> assign(:packets, [])
       |> assign(:seq, 0)
-      |> assign(:subscribers, layout(read_subscribers()))
+      |> assign_topology(read_subscribers())
 
     {:ok, socket}
   end
@@ -102,44 +102,116 @@ defmodule KyberWeb.FlowLive do
   def handle_info(:refresh, socket) do
     Process.send_after(self(), :refresh, @refresh_ms)
 
+    socket = sync_store(socket)
+
     packets =
       socket.assigns.packets
       |> Enum.reject(&(now_ms() - &1.at > @packet_ttl_ms))
       |> Enum.map(&refresh_counts/1)
 
-    socket =
-      socket
-      |> assign(:packets, packets)
-      |> assign(:subscribers, layout(read_subscribers()))
-
-    {:noreply, socket}
+    {:noreply, assign(socket, :packets, packets)}
   end
 
   def handle_info(_message, socket), do: {:noreply, socket}
 
-  # ------------------------------------------------------------- topology
+  # -------------------------------------------------------------- liveness
+
+  defp store_up?, do: Process.whereis(DurableStore) != nil
+
+  # `subscribers/0` and `subscribe_seeded/1` are blocking calls into the
+  # store's append-serialization process: it can die between the liveness
+  # check and the call, and an exiting call would take the socket with it.
+  defp store_call(fun) when is_function(fun, 0) do
+    if store_up?() do
+      try do
+        fun.()
+      catch
+        :exit, _ -> nil
+      end
+    end
+  end
 
   defp read_subscribers do
-    if Process.whereis(DurableStore), do: Enum.reverse(DurableStore.subscribers()), else: []
+    store_call(fn -> Enum.reverse(DurableStore.subscribers()) end) || []
+  end
+
+  defp banner(store_up?) do
+    cond do
+      not store_up? ->
+        "nothing to show — no store on this BEAM (run `mix kyber.dashboard`)"
+
+      not Collector.live?() ->
+        "no span collector on this BEAM — deltas stream, but traces are unavailable"
+
+      true ->
+        nil
+    end
+  end
+
+  # The tick is the recovery driver. A store that went away re-asserts the
+  # banner and empties the row; a store that came back — or restarted under
+  # the view, so the fresh registered set has never heard of it — is
+  # re-subscribed. The fresh store mints fresh ids, so the ring is cleared
+  # with the re-subscribe rather than left holding unreachable deltas.
+  defp sync_store(socket) do
+    subscribers = read_subscribers()
+
+    {socket, subscribers} =
+      cond do
+        not store_up?() ->
+          {assign(socket, :banner, banner(false)), []}
+
+        self() in subscribers ->
+          {socket, subscribers}
+
+        true ->
+          store_call(fn -> DurableStore.subscribe_seeded(self()) end)
+
+          {socket |> assign(:banner, banner(true)) |> assign(:packets, []), read_subscribers()}
+      end
+
+    assign_topology(socket, subscribers)
+  end
+
+  # ------------------------------------------------------------- topology
+
+  defp assign_topology(socket, pids) do
+    {nodes, more} = layout(pids)
+
+    socket |> assign(:subscribers, nodes) |> assign(:more, more)
   end
 
   # the row is re-spread on every refresh — subscribers join and leave as
-  # views connect and disconnect, so no position is ever hardcoded
+  # views connect and disconnect, so no position is ever hardcoded. Only the
+  # rendered (capped) nodes carry edges and packets; the overflow is one
+  # label node holding the last slot.
   defp layout(pids) do
-    n = length(pids)
+    shown = Enum.take(pids, @max_nodes)
+    hidden = length(pids) - length(shown)
+    slots = length(shown) + min(hidden, 1)
 
-    pids
-    |> Enum.with_index()
-    |> Enum.map(fn {pid, i} ->
-      %{
-        pid: pid,
-        key: :erlang.phash2(pid),
-        label: label_for(pid),
-        x: round(@scene_width * (i + 1) / (n + 1)),
-        y: @subscriber_y
-      }
-    end)
+    nodes =
+      shown
+      |> Enum.with_index()
+      |> Enum.map(fn {pid, i} ->
+        %{
+          pid: pid,
+          key: :erlang.phash2(pid),
+          label: label_for(pid),
+          x: spread(i, slots),
+          y: @subscriber_y
+        }
+      end)
+
+    more =
+      if hidden > 0 do
+        %{label: "+#{hidden} more", x: spread(length(shown), slots), y: @subscriber_y}
+      end
+
+    {nodes, more}
   end
+
+  defp spread(i, slots), do: round(@scene_width * (i + 1) / (slots + 1))
 
   defp label_for(pid) do
     if pid == Process.whereis(Kyber.Daemon) do
@@ -209,6 +281,13 @@ defmodule KyberWeb.FlowLive do
         <g :for={s <- @subscribers}>
           <circle class="node" cx={s.x} cy={s.y} r="18" />
           <text class="node-label" x={s.x} y={s.y + 36} text-anchor="middle"><%= s.label %></text>
+        </g>
+
+        <g :if={@more}>
+          <circle class="node node-more" cx={@more.x} cy={@more.y} r="18" />
+          <text class="node-label muted" x={@more.x} y={@more.y + 36} text-anchor="middle">
+            <%= @more.label %>
+          </text>
         </g>
 
         <%= for p <- @packets, s <- @subscribers do %>
