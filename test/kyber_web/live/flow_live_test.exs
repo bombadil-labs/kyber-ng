@@ -111,7 +111,11 @@ defmodule KyberWeb.FlowLiveTest do
 
     daemon = probe!()
     Process.register(daemon, Kyber.Daemon)
-    on_exit(fn -> Process.unregister(Kyber.Daemon) end)
+    # only the registration THIS test made is undone — an unconditional
+    # unregister would clobber whoever else holds the global name
+    on_exit(fn ->
+      if Process.whereis(Kyber.Daemon) == daemon, do: Process.unregister(Kyber.Daemon)
+    end)
     assert :ok = DurableStore.subscribe(daemon)
 
     conn = build_conn()
@@ -339,6 +343,19 @@ defmodule KyberWeb.FlowLiveTest do
     {:ok, live_doc} = Floki.parse_document(live_html)
     assert length(Floki.find(live_doc, "tbody tr")) == 2
     assert Floki.find(live_doc, "tr#flow-row-2") != []
+
+    # a tab opened NOW, against a store that already holds both deltas, reads
+    # the same store as the recovered one: mount seeds the table from its own
+    # subscribe ack, so a fresh page is not an empty table under a full store
+    {:ok, _fresh, fresh_html} = live(build_conn(), "/")
+
+    {:ok, fresh_doc} = Floki.parse_document(fresh_html)
+    assert length(Floki.find(fresh_doc, "tbody tr")) == 2
+    assert fresh_html =~ String.slice(before_id, 0, 12)
+    assert fresh_html =~ String.slice(id, 0, 12)
+    # history is the table, not the animation: nothing is in flight on a
+    # freshly mounted view
+    assert packet_ids(fresh_html) == []
   end
 
   test "FLOW-8: the subscriber row is capped and the overflow collapses to one node" do

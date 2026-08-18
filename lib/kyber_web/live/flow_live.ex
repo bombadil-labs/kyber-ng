@@ -47,7 +47,9 @@ defmodule KyberWeb.FlowLive do
   behind its append queue otherwise renders as a healthy idle one. The
   re-subscribe ack carries the store's current set, so the recent table is
   rebuilt from that snapshot rather than emptied — a restarted store still
-  holds every delta it replayed from its log.
+  holds every delta it replayed from its log. Mount seeds the table from the
+  same ack, so a freshly opened tab and a recovered one report the same
+  store rather than two different truths about it.
 
   `DurableStore.subscribers/0` is a blocking call into the process that
   serializes appends, and it sweeps the whole subscriber set for liveness —
@@ -102,17 +104,25 @@ defmodule KyberWeb.FlowLive do
 
   @impl true
   def mount(_params, _session, socket) do
-    {subscribed?, banner} =
+    {subscribed?, banner, history} =
       if connected?(socket) do
         # the pinned source: the view IS a subscriber node, so it appears in
-        # its own topology and receives the live feed
-        ack = store_call(fn -> DurableStore.subscribe_seeded(self()) end)
+        # its own topology and receives the live feed. The ack carries the
+        # store's current set, and the table is rebuilt from it exactly as a
+        # re-subscribe rebuilds it — a freshly opened tab reads the store it
+        # is attached to, not an empty page that a later recovery would fill.
+        {ack, history} =
+          case store_call(fn -> DurableStore.subscribe_seeded(self()) end) do
+            {:ok, {:ok, set}} -> {{:ok, set}, seed_history(set)}
+            other -> {other, []}
+          end
+
         # ticks even with no store: the tick is what notices one arriving
         Process.send_after(self(), :refresh, @refresh_ms)
         acked? = match?({:ok, {:ok, _set}}, ack)
-        {acked?, mount_banner(acked?)}
+        {acked?, mount_banner(acked?), history}
       else
-        {false, banner(store_up?())}
+        {false, banner(store_up?()), []}
       end
 
     socket =
@@ -120,8 +130,8 @@ defmodule KyberWeb.FlowLive do
       |> assign(:banner, banner)
       |> assign(:funnel, @funnel)
       |> assign(:packets, [])
-      |> assign(:history, [])
-      |> assign(:seq, 0)
+      |> assign(:history, history)
+      |> assign(:seq, length(history))
       |> assign(:subscribed?, subscribed?)
       |> assign(:tick, 0)
       |> assign(:slow_ticks, 0)
@@ -278,7 +288,11 @@ defmodule KyberWeb.FlowLive do
   defp check_membership(socket) do
     case read_subscribers() do
       {:ok, subscribers} ->
-        socket = clear_slow(socket)
+        # the banner is re-read on the healthy path too: the collector can die
+        # while the view stays attached to a fine store, and its notice would
+        # otherwise never appear (a healthy read returns nil, so this is a
+        # no-op whenever nothing changed)
+        socket = socket |> clear_slow() |> assign(:banner, banner(true))
 
         # a pid that is in the set but whose subscribe was never ACKED is
         # already on the feed — the call ran, only the reply was lost — but
@@ -322,6 +336,11 @@ defmodule KyberWeb.FlowLive do
     else
       :slow -> note_slow(socket)
       :down -> assign_detached(socket)
+      # the guarantee that a failing subscribe can never take the socket down
+      # is structural, not a coincidence of the reply shapes known today: an
+      # unknown-but-successful reply leaves the view as it was, and the next
+      # tick re-evaluates it
+      _other -> socket
     end
   end
 
