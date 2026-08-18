@@ -47,7 +47,7 @@ defmodule Kyber.Agent.ToolBoundsTest do
   end
 
   defp tmp_workspace do
-    base = Path.join(System.tmp_dir!(), "kyber-t14d-bounds-#{System.unique_integer([:positive])}")
+    base = Path.join(System.tmp_dir!(), "kyber-t14d-bounds-#{System.os_time()}-#{System.unique_integer([:positive])}")
     ws = Path.join(base, "workspace")
     File.mkdir_p!(ws)
     on_exit(fn -> File.rm_rf(base) end)
@@ -174,7 +174,7 @@ defmodule Kyber.Agent.ToolBoundsTest do
   # construction (the seam: hardcoded entry counts, context injection is
   # UNLICENSED for the entry cap)
   defp fixture_dir(ws, entries) do
-    dir = Path.join(ws, "fixture-#{entries}-#{System.unique_integer([:positive])}")
+    dir = Path.join(ws, "fixture-#{entries}-#{System.os_time()}-#{System.unique_integer([:positive])}")
     File.mkdir_p!(dir)
 
     for i <- 1..entries do
@@ -347,7 +347,7 @@ defmodule Kyber.Agent.ToolBoundsTest do
     assert source =~ "@default_shell_timeout 5_000"
     assert source =~ "@default_output_cap 65_536"
 
-    ws = Path.join(System.tmp_dir!(), "kyber-t14d-b3-#{System.unique_integer([:positive])}")
+    ws = Path.join(System.tmp_dir!(), "kyber-t14d-b3-#{System.os_time()}-#{System.unique_integer([:positive])}")
     File.mkdir_p!(ws)
     on_exit(fn -> File.rm_rf(ws) end)
 

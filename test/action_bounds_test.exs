@@ -38,7 +38,7 @@ defmodule Kyber.Agent.ActionBoundsTest do
   end
 
   defp tmp_workspace do
-    base = Path.join(System.tmp_dir!(), "kyber-t12-bounds-#{System.unique_integer([:positive])}")
+    base = Path.join(System.tmp_dir!(), "kyber-t12-bounds-#{System.os_time()}-#{System.unique_integer([:positive])}")
     ws = Path.join(base, "workspace")
     File.mkdir_p!(ws)
     File.write!(Path.join(ws, "notes.txt"), @fixture_content)
@@ -198,7 +198,7 @@ defmodule Kyber.Agent.ActionBoundsTest do
     context = Action.context(workspace: ws)
     File.write!(Path.join(ws, "ok.txt"), "inside")
 
-    outside = Path.join(System.tmp_dir!(), "kyber-outside-#{System.unique_integer([:positive])}")
+    outside = Path.join(System.tmp_dir!(), "kyber-outside-#{System.os_time()}-#{System.unique_integer([:positive])}")
     File.mkdir_p!(outside)
     File.write!(Path.join(outside, "secret.txt"), "secret")
     File.ln_s!(outside, Path.join(ws, "evil"))

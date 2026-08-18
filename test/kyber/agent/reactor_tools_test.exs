@@ -214,7 +214,7 @@ defmodule Kyber.Agent.ReactorToolsTest do
   # ------------------------------------------------------------------- AC1
 
   test "AC1 advertise: a reactor-booted daemon with a workspace advertises the FULL default tool set (registry + memory + skill)", ctx do
-    ws = Path.join(System.tmp_dir!(), "kyber-reactortools-ws-#{System.unique_integer([:positive])}")
+    ws = Path.join(System.tmp_dir!(), "kyber-reactortools-ws-#{System.os_time()}-#{System.unique_integer([:positive])}")
     File.mkdir_p!(ws)
     on_exit(fn -> File.rm_rf(ws) end)
 
@@ -251,7 +251,7 @@ defmodule Kyber.Agent.ReactorToolsTest do
   end
 
   test "AC1 profile intersect: the SAME workspace default NARROWS to the profile's allow_tool (the H8 witness, reactor path)", ctx do
-    ws = Path.join(System.tmp_dir!(), "kyber-reactortools-ws-#{System.unique_integer([:positive])}")
+    ws = Path.join(System.tmp_dir!(), "kyber-reactortools-ws-#{System.os_time()}-#{System.unique_integer([:positive])}")
     File.mkdir_p!(ws)
     on_exit(fn -> File.rm_rf(ws) end)
 
@@ -273,7 +273,7 @@ defmodule Kyber.Agent.ReactorToolsTest do
   end
 
   test "AC1 explicit-tools-wins (M1): an explicit :tools registry is used AS-IS — never merged with the workspace default", ctx do
-    ws = Path.join(System.tmp_dir!(), "kyber-reactortools-ws-#{System.unique_integer([:positive])}")
+    ws = Path.join(System.tmp_dir!(), "kyber-reactortools-ws-#{System.os_time()}-#{System.unique_integer([:positive])}")
     File.mkdir_p!(ws)
     on_exit(fn -> File.rm_rf(ws) end)
 
@@ -290,7 +290,7 @@ defmodule Kyber.Agent.ReactorToolsTest do
   end
 
   test "AC1 EXECUTE: the same reactor-booted daemon EXECUTES an allowed fs.read through the engine's tool executor — REAL content, status ok, never the arg-error string", ctx do
-    ws = Path.join(System.tmp_dir!(), "kyber-reactortools-ws-#{System.unique_integer([:positive])}")
+    ws = Path.join(System.tmp_dir!(), "kyber-reactortools-ws-#{System.os_time()}-#{System.unique_integer([:positive])}")
     File.mkdir_p!(ws)
     File.write!(Path.join(ws, "hello.txt"), "inside")
     on_exit(fn -> File.rm_rf(ws) end)
@@ -369,7 +369,7 @@ defmodule Kyber.Agent.ReactorToolsTest do
     # the workspace default is a MAP by construction; explicit-tools boots
     # that feed the executor with a map keep the map contract — the witness
     # is the ToolResult arriving through a registry that IS a map
-    ws = Path.join(System.tmp_dir!(), "kyber-reactortools-ws-#{System.unique_integer([:positive])}")
+    ws = Path.join(System.tmp_dir!(), "kyber-reactortools-ws-#{System.os_time()}-#{System.unique_integer([:positive])}")
     File.mkdir_p!(ws)
     File.write!(Path.join(ws, "hello.txt"), "inside")
     on_exit(fn -> File.rm_rf(ws) end)

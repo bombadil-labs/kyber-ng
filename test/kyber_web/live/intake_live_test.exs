@@ -18,7 +18,7 @@ defmodule KyberWeb.IntakeLiveTest do
   @human_seed String.duplicate("cd", 32)
 
   defp start_store! do
-    dir = Path.join(System.tmp_dir!(), "kyber-intake-#{System.unique_integer([:positive])}")
+    dir = Path.join(System.tmp_dir!(), "kyber-intake-#{System.os_time()}-#{System.unique_integer([:positive])}")
     File.mkdir_p!(dir)
     start_supervised!({DurableStore, Path.join(dir, "store.jsonl")})
   end

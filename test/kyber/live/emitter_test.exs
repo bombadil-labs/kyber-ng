@@ -18,7 +18,7 @@ defmodule Kyber.Live.EmitterTest do
   # ------------------------------------------------------------ helpers
 
   defp tmp_store do
-    dir = Path.join(System.tmp_dir!(), "kyber-emitter-#{System.unique_integer([:positive])}")
+    dir = Path.join(System.tmp_dir!(), "kyber-emitter-#{System.os_time()}-#{System.unique_integer([:positive])}")
     File.mkdir_p!(dir)
     Path.join(dir, "store.jsonl")
   end
@@ -112,7 +112,7 @@ defmodule Kyber.Live.EmitterTest do
     # the reactor's receive-path (turn span, dispatch span, refusal end) —
     # boot a daemon with loop: :reactor and a test observer; the emitted
     # claims in the store must be identical whether or not a collector runs
-    keyring_dir = Path.join(System.tmp_dir!(), "kyber-emitter-kr-#{System.unique_integer([:positive])}")
+    keyring_dir = Path.join(System.tmp_dir!(), "kyber-emitter-kr-#{System.os_time()}-#{System.unique_integer([:positive])}")
     File.mkdir_p!(keyring_dir)
     :ok = Kyber.Keys.import_human_seed(@human_seed, keyring_dir)
     {:ok, agent_seed} = Kyber.Keys.mint_agent_seed(keyring_dir)

@@ -80,7 +80,7 @@ defmodule Kyber.Agent.BoundaryMatrixTest do
   end
 
   defp url_handler(set) do
-    ws = Path.join(System.tmp_dir!(), "kyber-t14d-matrix-#{System.unique_integer([:positive])}")
+    ws = Path.join(System.tmp_dir!(), "kyber-t14d-matrix-#{System.os_time()}-#{System.unique_integer([:positive])}")
     File.mkdir_p!(ws)
     on_exit(fn -> File.rm_rf(ws) end)
 
