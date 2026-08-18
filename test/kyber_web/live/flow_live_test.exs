@@ -14,6 +14,7 @@ defmodule KyberWeb.FlowLiveTest do
 
   alias Kyber.{DurableStore, Events, Wire}
   alias Kyber.Trace.Collector
+  alias KyberWeb.FlowLive
 
   @human_seed String.duplicate("cd", 32)
 
@@ -71,6 +72,18 @@ defmodule KyberWeb.FlowLiveTest do
   # parks on a message that is never sent, so the delta feed accumulates in
   # the mailbox instead of matching and letting the probe exit
   defp park, do: spawn(fn -> receive do: (:__never_sent__ -> :ok) end)
+
+  # the view blocks its store calls behind a throttle, so a recovery needs a
+  # whole throttle window of ticks — any `refresh_ticks()` consecutive ticks
+  # cross the counter's zero exactly once, whatever it started at (and a
+  # real 1s timer tick landing in the middle cannot break that)
+  defp tick_through_throttle(view) do
+    for _n <- 1..FlowLive.refresh_ticks(), do: send(view.pid, :refresh)
+  end
+
+  # the RAW registered set — `DurableStore.subscribers/0` prunes dead pids
+  # from its reply, so it cannot tell an unsubscribe from a corpse
+  defp registered_subscribers, do: :sys.get_state(DurableStore).subscribers
 
   defp packet_ids(html) do
     {:ok, doc} = Floki.parse_document(html)
@@ -294,7 +307,10 @@ defmodule KyberWeb.FlowLiveTest do
     # topology forever
     start_store!(path)
 
-    send(view.pid, :refresh)
+    # recovery is a pair of blocking store calls, so it waits for the same
+    # throttle the membership read does (FLOW-9) — one tick is no longer
+    # enough to heal
+    tick_through_throttle(view)
     back = render(view)
 
     refute back =~ "nothing to show"
@@ -356,5 +372,91 @@ defmodule KyberWeb.FlowLiveTest do
     # keyed by pid hash and every rendered node carries the packet, so the
     # view's own packet circle is the proof that its node is in the row.
     assert Floki.find(doc, ~s(circle.packet[id="packet-1-#{:erlang.phash2(view.pid)}"])) != []
+  end
+
+  test "FLOW-9: a detached view's recovery is throttled, not attempted every tick" do
+    # no store at mount, so the view is detached with a KNOWN tick counter:
+    # mount leaves it at 0 and every `:refresh` below advances it by one
+    conn = build_conn()
+    {:ok, view, html} = live(conn, "/")
+    assert html =~ "nothing to show"
+
+    start_store!()
+
+    # tick 1 of the throttle window: the store is back, but re-subscribing
+    # is two blocking calls into the process that serializes appends — the
+    # view waits for its window instead of storming a store that may be the
+    # slow one that detached it in the first place
+    send(view.pid, :refresh)
+    assert render(view) =~ "nothing to show"
+    refute view.pid in registered_subscribers()
+
+    # the rest of the window: recovery lands, once
+    tick_through_throttle(view)
+    healed = render(view)
+
+    refute healed =~ "nothing to show"
+    assert "viewer" in node_labels(healed)
+    assert view.pid in registered_subscribers()
+  end
+
+  test "FLOW-10: a view unsubscribes when it terminates" do
+    start_store!()
+
+    conn = build_conn()
+    {:ok, view, _html} = live(conn, "/")
+    pid = view.pid
+
+    assert pid in registered_subscribers()
+
+    # a graceful stop runs terminate/2, and `GenServer.stop/1` returns only
+    # once the process is down — so the unsubscribe call has already been
+    # serialized into the store. (A hard kill cannot run terminate; that
+    # case is the store's own fan-out prune, tested as FLOW-6.)
+    :ok = GenServer.stop(pid)
+
+    refute pid in registered_subscribers()
+  end
+
+  test "FLOW-11: a mount whose subscribe is not acked never renders as healthy" do
+    # a stand-in registered under the store's name: it is ALIVE (so the
+    # store-down banner does not apply) but refuses the first subscribe,
+    # which is what a call timing out behind the append queue looks like
+    # to the view — the reply is simply not the ack
+    stub_store!()
+
+    conn = build_conn()
+    {:ok, _view, html} = live(conn, "/")
+
+    # without this the page renders no banner and no nodes: a blank that
+    # reads as a healthy idle store while the view is off the delta feed
+    assert html =~ "connecting to the store"
+    assert node_labels(html) == ["store"]
+  end
+
+  # replies to the store's call protocol: the FIRST subscribe_seeded is
+  # refused, every later one is acked (so the view's own refresh tick
+  # recovers against it rather than crashing on an unexpected reply)
+  defp stub_store! do
+    pid = spawn(fn -> stub_loop(:refuse) end)
+    Process.register(pid, DurableStore)
+    on_exit(fn -> Process.exit(pid, :kill) end)
+    pid
+  end
+
+  defp stub_loop(mode) do
+    receive do
+      {:"$gen_call", from, {:subscribe_seeded, _pid}} ->
+        GenServer.reply(from, if(mode == :refuse, do: {:error, :unavailable}, else: {:ok, %{}}))
+        stub_loop(:ack)
+
+      {:"$gen_call", from, :subscribers} ->
+        GenServer.reply(from, [])
+        stub_loop(mode)
+
+      {:"$gen_call", from, _other} ->
+        GenServer.reply(from, :ok)
+        stub_loop(mode)
+    end
   end
 end

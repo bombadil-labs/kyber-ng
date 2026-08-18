@@ -31,10 +31,15 @@ defmodule KyberWeb.FlowLive do
 
   The refresh tick is the only recovery driver: it re-reads store liveness,
   re-subscribes when the store restarted under the view, and re-asserts the
-  banner when it went away. Every store read is guarded (`store_call/1`), so
-  a store that dies between the liveness check and the call cannot take the
-  socket — and every dashboard tab — down with it, and a re-subscribe that
-  fails is never rendered as a healthy topology. `store_call/1` separates a
+  banner when it went away. Recovery is throttled to the same
+  `@topology_refresh_ticks` cadence as the membership read, because it is
+  made of the same blocking store calls — a detached tab retrying every
+  tick is the call storm the throttle exists to prevent. Every store read is
+  guarded (`store_call/1`), so a store that dies between the liveness check
+  and the call cannot take the socket — and every dashboard tab — down with
+  it, and a subscribe that fails is never rendered as a healthy topology:
+  not at mount either, where the store being registered would otherwise
+  leave an unacked view with no banner and no nodes. `store_call/1` separates a
   call that TIMED OUT (`:slow` — the store is alive but behind a queue of
   appends, so the tick keeps the last-known topology and re-reads next tick)
   from one that exited for any other reason (`:down` — only that detaches);
@@ -50,7 +55,10 @@ defmodule KyberWeb.FlowLive do
   proportion to viewers². Liveness (`Process.whereis`) is checked every
   tick because it is free; the subscriber ROW is re-read only every
   `@topology_refresh_ticks` ticks, which is indistinguishable from every
-  tick at human timescales.
+  tick at human timescales. A view also unsubscribes in `terminate/2`, so a
+  closed tab leaves the set at once rather than lingering until the next
+  delta's fan-out prune; a hard-killed view cannot run terminate and is
+  left to that prune.
   """
 
   use Phoenix.LiveView
@@ -74,32 +82,42 @@ defmodule KyberWeb.FlowLive do
   # packets * viewers circles — quadratic in viewers. The overflow is
   # reported as a "+N more" label node instead.
   @max_nodes 8
-  # consecutive timed-out ticks (~3s) before the view reports the store as
-  # slow rather than rendering a stale topology in silence
+  # consecutive timed-out topology reads before the view reports the store
+  # as slow rather than rendering a stale topology in silence
   @slow_hint_ticks 3
   @slow_hint "store is slow — queued behind appends (topology is from the last healthy tick)"
+  # a subscribe can fail while the store is REGISTERED (a call that timed
+  # out behind the append queue): the view is not on the delta feed, and a
+  # node-less topology under no banner reads as a healthy empty store
+  @connecting "connecting to the store — not on the delta feed yet (the refresh tick retries)"
 
   @scene_width 900
   @funnel %{x: 450, y: 90}
   @subscriber_y 300
 
+  @doc false
+  # the recovery/membership throttle, read by the test so it can drive
+  # exactly as many ticks as a recovery needs without pinning the interval
+  def refresh_ticks, do: @topology_refresh_ticks
+
   @impl true
   def mount(_params, _session, socket) do
-    subscribed? =
+    {subscribed?, banner} =
       if connected?(socket) do
         # the pinned source: the view IS a subscriber node, so it appears in
         # its own topology and receives the live feed
         ack = store_call(fn -> DurableStore.subscribe_seeded(self()) end)
         # ticks even with no store: the tick is what notices one arriving
         Process.send_after(self(), :refresh, @refresh_ms)
-        match?({:ok, _reply}, ack)
+        acked? = match?({:ok, {:ok, _set}}, ack)
+        {acked?, mount_banner(acked?)}
       else
-        false
+        {false, banner(store_up?())}
       end
 
     socket =
       socket
-      |> assign(:banner, banner(store_up?()))
+      |> assign(:banner, banner)
       |> assign(:funnel, @funnel)
       |> assign(:packets, [])
       |> assign(:history, [])
@@ -166,6 +184,16 @@ defmodule KyberWeb.FlowLive do
 
   def handle_info(_message, socket), do: {:noreply, socket}
 
+  # A closed tab leaves the subscriber set here rather than lingering as a
+  # corpse until some later delta's fan-out prunes it. The call is guarded
+  # like every other: `unsubscribe/1` into a missing store EXITS, and the
+  # result is nothing terminate could act on anyway.
+  @impl true
+  def terminate(_reason, _socket) do
+    store_call(fn -> DurableStore.unsubscribe(self()) end)
+    :ok
+  end
+
   # -------------------------------------------------------------- liveness
 
   defp store_up?, do: Process.whereis(DurableStore) != nil
@@ -201,6 +229,18 @@ defmodule KyberWeb.FlowLive do
     end
   end
 
+  # an unacked mount is NOT a healthy one: the store being registered makes
+  # `banner/1` return nil, so without this the page renders with no banner
+  # and no nodes — a blank that reads as an idle store. Not being on the
+  # delta feed outranks the collector's own (transient, trace-only) notice.
+  defp mount_banner(acked?) do
+    cond do
+      not store_up?() -> banner(false)
+      not acked? -> @connecting
+      true -> banner(true)
+    end
+  end
+
   defp banner(store_up?) do
     cond do
       not store_up? ->
@@ -218,39 +258,43 @@ defmodule KyberWeb.FlowLive do
   # banner and empties the row; a store that came back — or restarted under
   # the view, so the fresh registered set has never heard of it — is
   # re-subscribed. Losing the store is observed every tick (liveness is
-  # free); a store that died and restarted BETWEEN two ticks is caught by
-  # the throttled membership check instead.
+  # free); every path that BLOCKS on the store, recovery included, waits
+  # for the throttle: a detached tab retrying its two calls every second is
+  # the same load on the append path that the membership throttle exists to
+  # prevent, and it lands hardest on the slow store that caused the detach.
+  # A store that died and restarted between two ticks is caught by the same
+  # membership check.
   defp sync_store(socket) do
     tick = rem(socket.assigns.tick + 1, @topology_refresh_ticks)
     socket = assign(socket, :tick, tick)
 
     cond do
-      not store_up?() ->
+      not store_up?() -> assign_detached(socket)
+      tick != 0 -> socket
+      true -> check_membership(socket)
+    end
+  end
+
+  defp check_membership(socket) do
+    case read_subscribers() do
+      {:ok, subscribers} ->
+        socket = clear_slow(socket)
+
+        # a pid that is in the set but whose subscribe was never ACKED is
+        # already on the feed — the call ran, only the reply was lost — but
+        # its history was never seeded, so it re-subscribes ONCE to rebuild
+        # (the call is idempotent) rather than once per tick forever
+        if self() in subscribers and socket.assigns.subscribed?,
+          do: assign_topology(socket, subscribers),
+          else: resubscribe(socket)
+
+      # a busy store is still the store: keep the last-known topology and
+      # re-read on the next tick rather than retrying inside this one
+      :slow ->
+        note_slow(socket)
+
+      :down ->
         assign_detached(socket)
-
-      not socket.assigns.subscribed? ->
-        resubscribe(socket)
-
-      tick != 0 ->
-        socket
-
-      true ->
-        case read_subscribers() do
-          {:ok, subscribers} ->
-            socket = clear_slow(socket)
-
-            if self() in subscribers,
-              do: assign_topology(socket, subscribers),
-              else: resubscribe(socket)
-
-          # a busy store is still the store: keep the last-known topology and
-          # re-read on the next tick rather than retrying inside this one
-          :slow ->
-            note_slow(socket)
-
-          :down ->
-            assign_detached(socket)
-        end
     end
   end
 
