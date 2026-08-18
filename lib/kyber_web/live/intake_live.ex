@@ -1,6 +1,6 @@
 defmodule KyberWeb.IntakeLive do
   @moduledoc """
-  T19 view 1 — the delta intake waterfall (AC1). Source: the pinned
+  T19 view 1 at `/intake` — the delta intake waterfall (AC1). Source: the pinned
   `DurableStore.subscribe_seeded/1` seam (F2 — no commit gap): every
   committed delta lands in the LiveView `stream/4` in commit order. Each
   row shows the delta id (clickable — AC3 click-through to view 2), its

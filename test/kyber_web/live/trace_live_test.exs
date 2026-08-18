@@ -117,7 +117,7 @@ defmodule KyberWeb.TraceLiveTest do
     emit_trace(id, id <> "-req", id <> "-call")
 
     conn = build_conn()
-    {:ok, view, html} = live(conn, "/")
+    {:ok, view, html} = live(conn, "/intake")
     assert html =~ String.slice(id, 0, 12)
 
     # click the row -> push_navigate to view 2 (AC3: traces first — the id
