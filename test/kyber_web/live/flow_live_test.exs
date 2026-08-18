@@ -259,6 +259,18 @@ defmodule KyberWeb.FlowLiveTest do
     assert down =~ "nothing to show"
     assert node_labels(down) == ["store"]
 
+    # banner and row agree: a re-subscribe that could not be acked never
+    # renders a healthy topology (no nodes, no edges) while detached — and
+    # a second tick against the dead store neither raises nor "recovers"
+    send(view.pid, :refresh)
+    still_down = render(view)
+
+    {:ok, down_doc} = Floki.parse_document(still_down)
+    assert still_down =~ "nothing to show"
+    assert Floki.find(down_doc, "svg.flow circle.node") == []
+    assert Floki.find(down_doc, "svg.flow line.edge") == []
+    assert packet_ids(still_down) == []
+
     # a FRESH store: its registered set has never heard of this view, so the
     # tick must re-subscribe rather than render an empty topology forever
     start_store!()

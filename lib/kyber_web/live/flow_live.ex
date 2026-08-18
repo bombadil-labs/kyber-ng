@@ -29,7 +29,16 @@ defmodule KyberWeb.FlowLive do
   re-subscribes when the store restarted under the view, and re-asserts the
   banner when it went away. Every store read is guarded (`store_call/1`), so
   a store that dies between the liveness check and the call cannot take the
-  socket — and every dashboard tab — down with it.
+  socket — and every dashboard tab — down with it, and a re-subscribe that
+  fails is never rendered as a healthy topology.
+
+  `DurableStore.subscribers/0` is a blocking call into the process that
+  serializes appends, and it sweeps the whole subscriber set for liveness —
+  so every open tab calling it every tick would tax the append path in
+  proportion to viewers². Liveness (`Process.whereis`) is checked every
+  tick because it is free; the subscriber ROW is re-read only every
+  `@topology_refresh_ticks` ticks, which is indistinguishable from every
+  tick at human timescales.
   """
 
   use Phoenix.LiveView
@@ -38,6 +47,9 @@ defmodule KyberWeb.FlowLive do
   alias Kyber.Trace.Collector
 
   @refresh_ms 1_000
+  # the subscriber row is re-read every Nth tick, not every tick — see the
+  # moduledoc: the read is a blocking, O(subscribers) call per open tab
+  @topology_refresh_ticks 5
   # the packet ring is a bounded window over an unbounded store; the DOM
   # packet count can never exceed @max_packets * length(subscribers)
   @max_packets 30
@@ -54,13 +66,17 @@ defmodule KyberWeb.FlowLive do
 
   @impl true
   def mount(_params, _session, socket) do
-    if connected?(socket) do
-      # the pinned source: the view IS a subscriber node, so it appears in
-      # its own topology and receives the live feed
-      store_call(fn -> DurableStore.subscribe_seeded(self()) end)
-      # ticks even with no store: the tick is what notices one arriving
-      Process.send_after(self(), :refresh, @refresh_ms)
-    end
+    subscribed? =
+      if connected?(socket) do
+        # the pinned source: the view IS a subscriber node, so it appears in
+        # its own topology and receives the live feed
+        ack = store_call(fn -> DurableStore.subscribe_seeded(self()) end)
+        # ticks even with no store: the tick is what notices one arriving
+        Process.send_after(self(), :refresh, @refresh_ms)
+        match?({:ok, _reply}, ack)
+      else
+        false
+      end
 
     socket =
       socket
@@ -68,7 +84,9 @@ defmodule KyberWeb.FlowLive do
       |> assign(:funnel, @funnel)
       |> assign(:packets, [])
       |> assign(:seq, 0)
-      |> assign_topology(read_subscribers())
+      |> assign(:subscribed?, subscribed?)
+      |> assign(:tick, 0)
+      |> assign_topology(subscriber_row())
 
     {:ok, socket}
   end
@@ -109,7 +127,14 @@ defmodule KyberWeb.FlowLive do
       |> Enum.reject(&(now_ms() - &1.at > @packet_ttl_ms))
       |> Enum.map(&refresh_counts/1)
 
-    {:noreply, assign(socket, :packets, packets)}
+    # steady state is an unchanged list: re-assigning it would make LiveView
+    # re-diff the packets × subscribers block every second for nothing
+    socket =
+      if packets == socket.assigns.packets,
+        do: socket,
+        else: assign(socket, :packets, packets)
+
+    {:noreply, socket}
   end
 
   def handle_info(_message, socket), do: {:noreply, socket}
@@ -121,18 +146,29 @@ defmodule KyberWeb.FlowLive do
   # `subscribers/0` and `subscribe_seeded/1` are blocking calls into the
   # store's append-serialization process: it can die between the liveness
   # check and the call, and an exiting call would take the socket with it.
+  # `:down` is the store being gone — distinct from a reply that is itself
+  # `nil`, and never confusable with success.
   defp store_call(fun) when is_function(fun, 0) do
     if store_up?() do
       try do
-        fun.()
+        {:ok, fun.()}
       catch
-        :exit, _ -> nil
+        :exit, _ -> :down
       end
+    else
+      :down
     end
   end
 
   defp read_subscribers do
-    store_call(fn -> Enum.reverse(DurableStore.subscribers()) end) || []
+    store_call(fn -> Enum.reverse(DurableStore.subscribers()) end)
+  end
+
+  defp subscriber_row do
+    case read_subscribers() do
+      {:ok, subscribers} -> subscribers
+      :down -> []
+    end
   end
 
   defp banner(store_up?) do
@@ -151,26 +187,59 @@ defmodule KyberWeb.FlowLive do
   # The tick is the recovery driver. A store that went away re-asserts the
   # banner and empties the row; a store that came back — or restarted under
   # the view, so the fresh registered set has never heard of it — is
-  # re-subscribed. The fresh store mints fresh ids, so the ring is cleared
-  # with the re-subscribe rather than left holding unreachable deltas.
+  # re-subscribed. Losing the store is observed every tick (liveness is
+  # free); a store that died and restarted BETWEEN two ticks is caught by
+  # the throttled membership check instead.
   defp sync_store(socket) do
-    subscribers = read_subscribers()
+    tick = rem(socket.assigns.tick + 1, @topology_refresh_ticks)
+    socket = assign(socket, :tick, tick)
 
-    {socket, subscribers} =
-      cond do
-        not store_up?() ->
-          {assign(socket, :banner, banner(false)), []}
+    cond do
+      not store_up?() ->
+        assign_detached(socket)
 
-        self() in subscribers ->
-          {socket, subscribers}
+      not socket.assigns.subscribed? ->
+        resubscribe(socket)
 
-        true ->
-          store_call(fn -> DurableStore.subscribe_seeded(self()) end)
+      tick != 0 ->
+        socket
 
-          {socket |> assign(:banner, banner(true)) |> assign(:packets, []), read_subscribers()}
-      end
+      true ->
+        case read_subscribers() do
+          {:ok, subscribers} ->
+            if self() in subscribers,
+              do: assign_topology(socket, subscribers),
+              else: resubscribe(socket)
 
-    assign_topology(socket, subscribers)
+          :down ->
+            assign_detached(socket)
+        end
+    end
+  end
+
+  # The re-subscribe must be ACKED before the view may render as healthy: a
+  # store that dies during the call leaves the view permanently off the
+  # delta feed, and a healthy-looking topology would hide that forever. The
+  # fresh store mints fresh ids, so the ring is cleared with the
+  # re-subscribe rather than left holding unreachable deltas.
+  defp resubscribe(socket) do
+    with {:ok, _reply} <- store_call(fn -> DurableStore.subscribe_seeded(self()) end),
+         {:ok, subscribers} <- read_subscribers() do
+      socket
+      |> assign(:banner, banner(true))
+      |> assign(:subscribed?, true)
+      |> assign(:packets, [])
+      |> assign_topology(subscribers)
+    else
+      :down -> assign_detached(socket)
+    end
+  end
+
+  defp assign_detached(socket) do
+    socket
+    |> assign(:banner, banner(false))
+    |> assign(:subscribed?, false)
+    |> assign_topology([])
   end
 
   # ------------------------------------------------------------- topology
