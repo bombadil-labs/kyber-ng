@@ -49,7 +49,7 @@ defmodule KyberWeb.IntakeLiveTest do
   test "AC1: committed deltas stream live, in commit order, with kinds and the untraced state" do
     start_store!()
     conn = build_conn()
-    {:ok, view, _html} = live(conn, "/")
+    {:ok, view, _html} = live(conn, "/intake")
 
     assert :ok = DurableStore.append(received_wire(2_000.0, "ac1-m1", "first"))
     assert :ok = DurableStore.append(received_wire(2_001.0, "ac1-m2", "second"))
@@ -95,7 +95,7 @@ defmodule KyberWeb.IntakeLiveTest do
     assert :ok = DurableStore.subscribe(probe)
 
     conn = build_conn()
-    {:ok, view, _html} = live(conn, "/")
+    {:ok, view, _html} = live(conn, "/intake")
 
     assert :ok = DurableStore.append(received_wire(2_100.0, "ac1-counts", "counted"))
     id = delta_id(2_100.0)
@@ -112,7 +112,7 @@ defmodule KyberWeb.IntakeLiveTest do
   test "AC1: duplicate re-appends surface via the store_append span's :duplicate outcome" do
     start_store!()
     conn = build_conn()
-    {:ok, view, _html} = live(conn, "/")
+    {:ok, view, _html} = live(conn, "/intake")
 
     wire = received_wire(2_200.0, "ac1-dup", "duplicate me")
     assert :ok = DurableStore.append(wire)
@@ -136,7 +136,7 @@ defmodule KyberWeb.IntakeLiveTest do
     # no store started in this test — the view's mount guard sees none and
     # renders the explicit banner (M4/L6)
     conn = build_conn()
-    {:ok, _view, html} = live(conn, "/")
+    {:ok, _view, html} = live(conn, "/intake")
     assert html =~ "nothing to show"
   end
 

@@ -96,6 +96,17 @@ defmodule Kyber.DurableStore do
     GenServer.call(__MODULE__, {:subscribe, pid})
   end
 
+  @doc """
+  T19 (FlowLive) — the live subscriber pids, newest registration first (the
+  registered set's own order). Read-only: dead pids are pruned from the
+  reply so a view can never render a corpse, but the registered set itself
+  is left to the fan-out's own prune (this call changes no store semantics).
+  """
+  @spec subscribers() :: [pid()]
+  def subscribers do
+    GenServer.call(__MODULE__, :subscribers)
+  end
+
   @doc "T16 (F2) — remove a subscriber pid."
   @spec unsubscribe(pid()) :: :ok
   def unsubscribe(pid) when is_pid(pid) do
@@ -266,6 +277,10 @@ defmodule Kyber.DurableStore do
     # serialized call, so there is no commit gap between them
     subs = if pid in state.subscribers, do: state.subscribers, else: [pid | state.subscribers]
     {:reply, {:ok, state.set}, %{state | subscribers: subs}}
+  end
+
+  def handle_call(:subscribers, _from, state) do
+    {:reply, Enum.filter(state.subscribers, &Process.alive?/1), state}
   end
 
   def handle_call({:unsubscribe, pid}, _from, state) do

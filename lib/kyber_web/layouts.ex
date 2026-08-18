@@ -40,11 +40,35 @@ defmodule KyberWeb.Layouts do
           .span-row td:first-child { white-space: nowrap; }
           .kind { color: #c678dd; }
           .muted { color: #8b93a7; }
+          svg.flow { width: 100%; max-width: 900px; display: block; margin: 0 auto 1rem; }
+          .funnel { fill: #1d2b3b; stroke: #61afef; stroke-width: 1.5; }
+          .edge { stroke: #2a2f3a; stroke-width: 1.5; }
+          .node { fill: #171a23; stroke: #8b93a7; stroke-width: 1.5; }
+          .node-label { fill: #8b93a7; font-size: 13px;
+                        font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+          @keyframes packet-flow {
+            from { offset-distance: 0%; opacity: 1; }
+            to   { offset-distance: 100%; opacity: 0.15; }
+          }
+          /* offset-path animates a transform about transform-origin; the SVG
+             default (view-box centre) would launch packets from mid-scene, so
+             the origin is pinned to the viewBox origin and the packet cx/cy
+             are 0 — the path alone supplies the position. */
+          .packet { cursor: pointer; animation: packet-flow 1.2s ease-out forwards;
+                    transform-box: view-box; transform-origin: 0 0; }
+          .p-received { fill: #61afef; }
+          .p-sent { fill: #7ee2a8; }
+          .p-checkpoint { fill: #8b93a7; }
+          .p-seed { fill: #c678dd; }
+          .p-agent { fill: #56b6c2; }
+          .p-default { fill: #8b93a7; }
         </style>
       </head>
       <body>
         <nav>
-          <a href="/">intake</a>
+          <a href="/">flow</a>
+          <span class="muted">·</span>
+          <a href="/intake">intake</a>
           <span class="muted">·</span>
           <a href="/trace/intake">trace</a>
         </nav>

@@ -1,6 +1,7 @@
 defmodule KyberWeb.TraceLive do
   @moduledoc """
-  T19 view 2 — the OTel-style span/trace waterfall (AC2/AC3). Per trace id:
+  T19 view 2 at `/trace/:id` — the OTel-style span/trace waterfall (AC2/AC3).
+  Reached by clicking a delta in view 0 (`/`) or view 1 (`/intake`). Per trace id:
   spans parent-attached, durations from monotonic clocks (end_mono_ms −
   start_mono_ms), statuses shown. Click-through resolution (AC3, pinned
   order): `:l19_traces` first (trace_id = the BARE received delta id, so a
