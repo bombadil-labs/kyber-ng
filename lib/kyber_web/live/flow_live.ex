@@ -37,7 +37,12 @@ defmodule KyberWeb.FlowLive do
   fails is never rendered as a healthy topology. `store_call/1` separates a
   call that TIMED OUT (`:slow` — the store is alive but behind a queue of
   appends, so the tick keeps the last-known topology and re-reads next tick)
-  from one that exited for any other reason (`:down` — only that detaches).
+  from one that exited for any other reason (`:down` — only that detaches);
+  consecutive `:slow` ticks are reported as a hint, since a store stuck
+  behind its append queue otherwise renders as a healthy idle one. The
+  re-subscribe ack carries the store's current set, so the recent table is
+  rebuilt from that snapshot rather than emptied — a restarted store still
+  holds every delta it replayed from its log.
 
   `DurableStore.subscribers/0` is a blocking call into the process that
   serializes appends, and it sweeps the whole subscriber set for liveness —
@@ -69,6 +74,10 @@ defmodule KyberWeb.FlowLive do
   # packets * viewers circles — quadratic in viewers. The overflow is
   # reported as a "+N more" label node instead.
   @max_nodes 8
+  # consecutive timed-out ticks (~3s) before the view reports the store as
+  # slow rather than rendering a stale topology in silence
+  @slow_hint_ticks 3
+  @slow_hint "store is slow — queued behind appends (topology is from the last healthy tick)"
 
   @scene_width 900
   @funnel %{x: 450, y: 90}
@@ -97,6 +106,8 @@ defmodule KyberWeb.FlowLive do
       |> assign(:seq, 0)
       |> assign(:subscribed?, subscribed?)
       |> assign(:tick, 0)
+      |> assign(:slow_ticks, 0)
+      |> assign(:slow_hint, nil)
       |> assign_topology(subscriber_row())
 
     {:ok, socket}
@@ -226,6 +237,8 @@ defmodule KyberWeb.FlowLive do
       true ->
         case read_subscribers() do
           {:ok, subscribers} ->
+            socket = clear_slow(socket)
+
             if self() in subscribers,
               do: assign_topology(socket, subscribers),
               else: resubscribe(socket)
@@ -233,7 +246,7 @@ defmodule KyberWeb.FlowLive do
           # a busy store is still the store: keep the last-known topology and
           # re-read on the next tick rather than retrying inside this one
           :slow ->
-            socket
+            note_slow(socket)
 
           :down ->
             assign_detached(socket)
@@ -244,28 +257,66 @@ defmodule KyberWeb.FlowLive do
   # The re-subscribe must be ACKED before the view may render as healthy: a
   # store that dies during the call leaves the view permanently off the
   # delta feed, and a healthy-looking topology would hide that forever. The
-  # fresh store mints fresh ids, so the ring is cleared with the
-  # re-subscribe rather than left holding unreachable deltas.
+  # ack carries the store's current set, so the table is REBUILT from it:
+  # a restarted store still holds every delta it replayed from its log, and
+  # the packets the view saw before the outage are no evidence of what the
+  # store now has. Only the packets ring is cleared — those were mid-flight
+  # when the store died, and the animation is a fresh world after a restart.
   defp resubscribe(socket) do
-    with {:ok, _reply} <- store_call(fn -> DurableStore.subscribe_seeded(self()) end),
+    with {:ok, {:ok, set}} <- store_call(fn -> DurableStore.subscribe_seeded(self()) end),
          {:ok, subscribers} <- read_subscribers() do
+      history = seed_history(set)
+
       socket
       |> assign(:banner, banner(true))
       |> assign(:subscribed?, true)
       |> assign(:packets, [])
-      |> assign(:history, [])
+      |> assign(:history, history)
+      |> assign(:seq, length(history))
+      |> clear_slow()
       |> assign_topology(subscribers)
     else
-      :slow -> socket
+      :slow -> note_slow(socket)
       :down -> assign_detached(socket)
     end
+  end
+
+  # `seq` is a per-socket render key, not a store property, so the snapshot
+  # carries none: the rebuilt rows are numbered 1..N oldest-first (the ring
+  # is oldest-first, and the table renders it reversed) and the socket's seq
+  # continues from N, so live packets never reuse a rebuilt row's number.
+  defp seed_history(set) do
+    set
+    |> Enum.sort_by(fn {id, {claims, _sig}} -> {claims.timestamp, id} end)
+    |> Enum.take(-@history_max)
+    |> Enum.with_index(1)
+    |> Enum.map(fn {{id, {claims, _sig}}, seq} ->
+      %{id: id, seq: seq, kind: kind(claims), ts: claims.timestamp, delivered: nil, pruned: nil}
+    end)
   end
 
   defp assign_detached(socket) do
     socket
     |> assign(:banner, banner(false))
     |> assign(:subscribed?, false)
+    |> clear_slow()
     |> assign_topology([])
+  end
+
+  # A `:slow` tick is invisible by design — the view keeps its last-known
+  # topology — so a store permanently behind its append queue renders
+  # exactly like a healthy idle one. Consecutive slow ticks are a queue
+  # rather than a blip, and the view says so instead of looking calm.
+  defp note_slow(socket) do
+    ticks = socket.assigns.slow_ticks + 1
+
+    socket
+    |> assign(:slow_ticks, ticks)
+    |> assign(:slow_hint, if(ticks >= @slow_hint_ticks, do: @slow_hint))
+  end
+
+  defp clear_slow(socket) do
+    socket |> assign(:slow_ticks, 0) |> assign(:slow_hint, nil)
   end
 
   # ------------------------------------------------------------- topology
@@ -372,6 +423,7 @@ defmodule KyberWeb.FlowLive do
       <%= if @banner do %>
         <div class="banner"><%= @banner %></div>
       <% end %>
+      <div :if={@slow_hint} class="muted"><%= @slow_hint %></div>
       <h2>delta flow</h2>
       <p class="muted">
         funnel = store append · packets = committed deltas · click a packet for its trace

@@ -17,7 +17,13 @@ defmodule KyberWeb.FlowLiveTest do
 
   @human_seed String.duplicate("cd", 32)
 
-  defp start_store! do
+  # returns the log path, so a test can restart the store on the SAME log
+  defp start_store!(path \\ fresh_log_path()) do
+    start_supervised!({DurableStore, path})
+    path
+  end
+
+  defp fresh_log_path do
     # `System.unique_integer/1` restarts from small values in every BEAM, so
     # a bare unique-integer path collides with a PREVIOUS run's leftover tmp
     # dir and the store replays that stale log into this test's set. The
@@ -29,7 +35,7 @@ defmodule KyberWeb.FlowLiveTest do
       )
 
     File.mkdir_p!(dir)
-    start_supervised!({DurableStore, Path.join(dir, "store.jsonl")})
+    Path.join(dir, "store.jsonl")
   end
 
   defp received_wire(ts, msg_id, content) do
@@ -249,7 +255,7 @@ defmodule KyberWeb.FlowLiveTest do
   end
 
   test "FLOW-7: the refresh tick recovers the view across a store restart" do
-    start_store!()
+    path = start_store!()
 
     conn = build_conn()
     {:ok, view, html} = live(conn, "/")
@@ -282,9 +288,11 @@ defmodule KyberWeb.FlowLiveTest do
     assert Floki.find(down_doc, "svg.flow line.edge") == []
     assert packet_ids(still_down) == []
 
-    # a FRESH store: its registered set has never heard of this view, so the
-    # tick must re-subscribe rather than render an empty topology forever
-    start_store!()
+    # the store comes back on the SAME log, so it replays every delta it
+    # committed. Its subscriber set, though, is fresh and has never heard of
+    # this view: the tick must re-subscribe rather than render an empty
+    # topology forever
+    start_store!(path)
 
     send(view.pid, :refresh)
     back = render(view)
@@ -292,16 +300,29 @@ defmodule KyberWeb.FlowLiveTest do
     refute back =~ "nothing to show"
     assert "viewer" in node_labels(back)
 
-    # the fresh store mints fresh ids, so the re-subscribe clears BOTH rings:
-    # the pre-outage row is no longer reachable and does not linger
+    # the re-subscribe REBUILDS the table from the seeded snapshot instead of
+    # emptying it: the delta committed before the outage is back in the table
+    # although nothing has committed since. The packets ring is not rebuilt —
+    # those were mid-flight when the store died
+    before_id = delta_id(4_290.0)
     {:ok, back_doc} = Floki.parse_document(back)
-    assert Floki.find(back_doc, "tbody tr") == []
 
-    # the re-subscribe is live, not cosmetic — the fresh store's feed lands
+    assert length(Floki.find(back_doc, "tbody tr")) == 1
+    assert back =~ String.slice(before_id, 0, 12)
+    assert packet_ids(back) == []
+
+    # the re-subscribe is live, not cosmetic — the restarted store's feed lands
     assert :ok = DurableStore.append(received_wire(4_300.0, "flow7-restart", "recovered"))
     id = delta_id(4_300.0)
 
-    assert packet_ids(render(view)) == [id]
+    live_html = render(view)
+    assert packet_ids(live_html) == [id]
+
+    # the live delta is numbered AFTER the rebuilt rows, so it gets its own
+    # row rather than colliding with the snapshot's
+    {:ok, live_doc} = Floki.parse_document(live_html)
+    assert length(Floki.find(live_doc, "tbody tr")) == 2
+    assert Floki.find(live_doc, "tr#flow-row-2") != []
   end
 
   test "FLOW-8: the subscriber row is capped and the overflow collapses to one node" do
