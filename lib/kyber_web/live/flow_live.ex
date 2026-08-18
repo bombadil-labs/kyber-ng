@@ -59,7 +59,13 @@ defmodule KyberWeb.FlowLive do
   proportion to viewers². Liveness (`Process.whereis`) is checked every
   tick because it is free; the subscriber ROW is re-read only every
   `@topology_refresh_ticks` ticks, which is indistinguishable from every
-  tick at human timescales. A view also unsubscribes in `terminate/2`, so a
+  tick at human timescales, and the STATIC (pre-websocket) render reads it
+  not at all — an unthrottled sweep per HTTP GET, milliseconds before the
+  connected mount does the real read. The row is geometry, never the
+  attachment: a subscribe ack is the authority on being on the feed, so a
+  row read that times out afterwards is missing detail, not a lost
+  subscription to redo next window. A view also unsubscribes in
+  `terminate/2` (on the same short timeout as every other call), so a
   closed tab leaves the set at once rather than lingering until the next
   delta's fan-out prune; a hard-killed view cannot run terminate and is
   left to that prune, or to the membership read, which keeps the liveness
@@ -118,25 +124,29 @@ defmodule KyberWeb.FlowLive do
 
   @impl true
   def mount(_params, _session, socket) do
-    {subscribed?, banner, history} =
+    {subscribed?, banner, history, subscribers} =
       if connected?(socket) do
         # the pinned source: the view IS a subscriber node, so it appears in
         # its own topology and receives the live feed. The ack carries the
         # store's current set, and the table is rebuilt from it exactly as a
         # re-subscribe rebuilds it — a freshly opened tab reads the store it
         # is attached to, not an empty page that a later recovery would fill.
-        {ack, history} =
+        {acked?, history} =
           case store_call(fn -> DurableStore.subscribe_seeded(self(), @store_call_timeout) end) do
-            {:ok, {:ok, set}} -> {{:ok, set}, seed_history(set)}
-            other -> {other, []}
+            {:ok, {:ok, set}} -> {true, seed_history(set)}
+            _refused_slow_or_down -> {false, []}
           end
 
         # ticks even with no store: the tick is what notices one arriving
         Process.send_after(self(), :refresh, @refresh_ms)
-        acked? = match?({:ok, {:ok, _set}}, ack)
-        {acked?, mount_banner(acked?), history}
+        {acked?, feed_banner(acked?), history, subscriber_row(acked?)}
       else
-        {false, banner(store_up?()), []}
+        # the STATIC render makes no store call at all: `subscribers/1` is a
+        # blocking, O(subscribers) sweep inside the process that serializes
+        # appends, and it is unthrottled here — every plain HTTP GET would tax
+        # the append path milliseconds before the websocket mount does the real
+        # read. The banner carries the state until that connect lands.
+        {false, banner(store_up?()), [], []}
       end
 
     socket =
@@ -150,7 +160,7 @@ defmodule KyberWeb.FlowLive do
       |> assign(:tick, 0)
       |> assign(:slow_ticks, 0)
       |> assign(:slow_hint, nil)
-      |> assign_topology(subscriber_row())
+      |> assign_topology(subscribers)
 
     {:ok, socket}
   end
@@ -210,11 +220,13 @@ defmodule KyberWeb.FlowLive do
 
   # A closed tab leaves the subscriber set here rather than lingering as a
   # corpse until some later delta's fan-out prunes it. The call is guarded
-  # like every other: `unsubscribe/1` into a missing store EXITS, and the
-  # result is nothing terminate could act on anyway.
+  # like every other: `unsubscribe/2` into a missing store EXITS, and the
+  # result is nothing terminate could act on anyway. It carries the same
+  # fraction-of-a-tick timeout as every other call the view makes — a store
+  # queued behind its appends must not hold a closing tab for five seconds.
   @impl true
   def terminate(_reason, _socket) do
-    store_call(fn -> DurableStore.unsubscribe(self()) end)
+    store_call(fn -> DurableStore.unsubscribe(self(), @store_call_timeout) end)
     :ok
   end
 
@@ -248,18 +260,24 @@ defmodule KyberWeb.FlowLive do
     store_call(fn -> Enum.reverse(DurableStore.subscribers(@store_call_timeout)) end)
   end
 
-  defp subscriber_row do
+  # the row is best-effort geometry, never the attachment itself: an ACKED
+  # subscribe proves this view is in the store's set, so a read that merely
+  # TIMED OUT still renders the view's own node rather than the blank that
+  # reads as an idle store. The next throttle window re-reads the full row.
+  defp subscriber_row(acked?) do
     case read_subscribers() do
       {:ok, subscribers} -> subscribers
-      _down_or_slow -> []
+      :slow -> if acked?, do: [self()], else: []
+      :down -> []
     end
   end
 
-  # an unacked mount is NOT a healthy one: the store being registered makes
-  # `banner/1` return nil, so without this the page renders with no banner
-  # and no nodes — a blank that reads as an idle store. Not being on the
-  # delta feed outranks the collector's own (transient, trace-only) notice.
-  defp mount_banner(acked?) do
+  # a view that is not on the delta feed is NOT a healthy one: the store being
+  # registered makes `banner/1` return nil, so without this the page renders
+  # with no banner and no nodes — a blank that reads as an idle store. Not
+  # being on the feed outranks the collector's own (transient, trace-only)
+  # notice; a store that is gone outranks both.
+  defp feed_banner(acked?) do
     cond do
       not store_up?() -> banner(false)
       not acked? -> @connecting
@@ -343,27 +361,59 @@ defmodule KyberWeb.FlowLive do
   # store now has. Only the packets ring is cleared — those were mid-flight
   # when the store died, and the animation is a fresh world after a restart.
   defp resubscribe(socket) do
-    with {:ok, {:ok, set}} <-
-           store_call(fn -> DurableStore.subscribe_seeded(self(), @store_call_timeout) end),
-         {:ok, subscribers} <- read_subscribers() do
-      history = seed_history(set)
+    case store_call(fn -> DurableStore.subscribe_seeded(self(), @store_call_timeout) end) do
+      # the ack is the authority on attachment; the row read that follows is
+      # only geometry, and its failure may never discard a subscribe that
+      # succeeded — a discarded ack leaves `subscribed?` false against a store
+      # that already holds this pid, so every window re-copies the whole set
+      # forever while the page renders as connecting.
+      {:ok, {:ok, set}} ->
+        history = seed_history(set)
 
-      socket
-      |> assign(:banner, banner(true))
-      |> assign(:subscribed?, true)
-      |> assign(:packets, [])
-      |> assign(:history, history)
-      |> assign(:seq, length(history))
-      |> clear_slow()
-      |> assign_topology(subscribers)
-    else
-      :slow -> note_slow(socket)
-      :down -> assign_detached(socket)
-      # the guarantee that a failing subscribe can never take the socket down
-      # is structural, not a coincidence of the reply shapes known today: an
-      # unknown-but-successful reply leaves the view as it was, and the next
-      # tick re-evaluates it
-      _other -> socket
+        socket
+        |> assign(:banner, banner(true))
+        |> assign(:subscribed?, true)
+        |> assign(:packets, [])
+        |> assign(:history, history)
+        |> assign(:seq, length(history))
+        |> clear_slow()
+        |> assign_recovered_row()
+
+      :slow ->
+        note_slow(socket)
+
+      :down ->
+        assign_detached(socket)
+
+      # the guarantee that a failing subscribe is never rendered as healthy is
+      # structural, not a coincidence of the reply shapes known today: a view
+      # whose subscribe OUTCOME is unknown renders as detached (banner, no
+      # nodes) and the next window re-attempts, rather than keeping the old
+      # healthy-looking topology over a view that may be off the feed forever
+      _other ->
+        assign_detached(socket)
+    end
+  end
+
+  # the row read that follows an acked re-subscribe: one read, never two, and
+  # never a verdict on the attachment the ack already settled.
+  defp assign_recovered_row(socket) do
+    case read_subscribers() do
+      {:ok, subscribers} ->
+        assign_topology(socket, subscribers)
+
+      # missing geometry, not a missing attachment: keep the last-known row,
+      # or this view's own node when there is none (the ack proves it is in
+      # the store's set, and a healthy banner over an empty row would read as
+      # an idle store). The next window re-reads.
+      :slow ->
+        if socket.assigns.subscribers == [],
+          do: assign_topology(socket, [self()]),
+          else: socket
+
+      # the store died between the two calls — the ack is worthless now
+      :down ->
+        assign_detached(socket)
     end
   end
 
@@ -381,9 +431,12 @@ defmodule KyberWeb.FlowLive do
     end)
   end
 
+  # detached is "not on the delta feed", which is not the same claim as "no
+  # store on this BEAM": a store that is registered but whose subscribe
+  # outcome is unknown gets the connecting banner, not the separate-BEAM one.
   defp assign_detached(socket) do
     socket
-    |> assign(:banner, banner(false))
+    |> assign(:banner, feed_banner(false))
     |> assign(:subscribed?, false)
     |> clear_slow()
     |> assign_topology([])

@@ -109,10 +109,14 @@ defmodule Kyber.DurableStore do
     GenServer.call(__MODULE__, :subscribers, timeout)
   end
 
-  @doc "T16 (F2) — remove a subscriber pid."
-  @spec unsubscribe(pid()) :: :ok
-  def unsubscribe(pid) when is_pid(pid) do
-    GenServer.call(__MODULE__, {:unsubscribe, pid})
+  @doc """
+  T16 (F2) — remove a subscriber pid. `timeout` is the caller's own patience,
+  as with `subscribers/1`: a view unsubscribing from its `terminate/2` cannot
+  afford to hold a shutting-down tab for the default five seconds.
+  """
+  @spec unsubscribe(pid(), timeout()) :: :ok
+  def unsubscribe(pid, timeout \\ 5_000) when is_pid(pid) do
+    GenServer.call(__MODULE__, {:unsubscribe, pid}, timeout)
   end
 
   @doc """

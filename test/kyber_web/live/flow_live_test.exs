@@ -75,8 +75,13 @@ defmodule KyberWeb.FlowLiveTest do
 
   # the view blocks its store calls behind a throttle, so a recovery needs a
   # whole throttle window of ticks — any `refresh_ticks()` consecutive ticks
-  # cross the counter's zero exactly once, whatever it started at (and a
-  # real 1s timer tick landing in the middle cannot break that)
+  # cross the counter's zero AT LEAST once, whatever phase it started at. The
+  # view's own 1s timer keeps ticking during a test, so the phase is not the
+  # test's to control: every assertion here is written to hold under an extra
+  # tick (one more crossing = one more identical recovery attempt), never on
+  # an exact tick count. Sends are messages, so they queue behind whatever the
+  # timer already delivered; the following `render/1` is a call, so it is
+  # strictly ordered after all of them.
   defp tick_through_throttle(view) do
     for _n <- 1..FlowLive.refresh_ticks(), do: send(view.pid, :refresh)
   end
@@ -132,6 +137,11 @@ defmodule KyberWeb.FlowLiveTest do
     assert "daemon" in labels
     assert Enum.count(labels, &(&1 == "viewer")) == 2
 
+    # the mount subscribe was ACKED, so the view is on the delta feed and says
+    # nothing else: the connecting banner belongs to a mount that is NOT
+    # attached, and a healthy tab that flies it is lying about the store
+    refute html =~ "connecting to the store"
+
     {:ok, doc} = Floki.parse_document(html)
     assert length(Floki.find(doc, "svg.flow circle.node")) == 3
     # one edge from the funnel to each subscriber node
@@ -163,6 +173,16 @@ defmodule KyberWeb.FlowLiveTest do
     assert Floki.attribute([packet], "style") == [
              "offset-path: path('M450,90 L450,300')"
            ]
+
+    # an acked mount is SUBSCRIBED, so the first membership window recognises
+    # this view in the store's set and leaves it alone: a view that discarded
+    # its own mount ack would re-subscribe here, sweeping the packet in flight
+    # and rebuilding the table under a tab that never lost the feed
+    tick_through_throttle(view)
+    settled = render(view)
+
+    refute settled =~ "connecting to the store"
+    assert packet_ids(settled) == [id]
 
     {:error, {:live_redirect, %{to: to}}} =
       view
@@ -401,9 +421,20 @@ defmodule KyberWeb.FlowLiveTest do
     start_store!()
 
     # tick 1 of the throttle window: the store is back, but re-subscribing
-    # is two blocking calls into the process that serializes appends — the
-    # view waits for its window instead of storming a store that may be the
-    # slow one that detached it in the first place
+    # is a blocking call into the process that serializes appends — the view
+    # waits for its window instead of storming a store that may be the slow
+    # one that detached it in the first place.
+    #
+    # The view also schedules its OWN 1s timer, which this test cannot
+    # cancel: the send below is therefore "at least one tick", not exactly
+    # one. That is enough — the counter heals only when it returns to zero,
+    # which takes `refresh_ticks()` (5) ticks, so this assertion could only
+    # be invalidated by FOUR of the view's own timers firing between the
+    # mount above and the render below. Those fire one per second; the lines
+    # in between are a store start and a send, microseconds of work. The
+    # assertion is about the throttle, and it is read here through the
+    # store's registered set — the authoritative record of whether the view
+    # attempted its re-subscribe at all.
     send(view.pid, :refresh)
     assert render(view) =~ "nothing to show"
     refute view.pid in registered_subscribers()
@@ -465,7 +496,8 @@ defmodule KyberWeb.FlowLiveTest do
     # is not in it and must re-subscribe) plus one re-subscribe that times
     # out. The banner may not go healthy on the way: the view is still off
     # the delta feed, and a nil banner over an empty topology reads as an
-    # idle store
+    # idle store. (A stray tick from the view's own 1s timer can only add a
+    # crossing, which is one more identical window — the assertions hold.)
     for _window <- 1..FlowLive.slow_hint_ticks() do
       tick_through_throttle(view)
       assert render(view) =~ "connecting to the store"
@@ -478,6 +510,72 @@ defmodule KyberWeb.FlowLiveTest do
     # hint could never reach its threshold
     assert stalled =~ "store is slow"
     assert node_labels(stalled) == ["store"]
+  end
+
+  test "FLOW-13: an acked re-subscribe survives a membership read that times out" do
+    # the stand-in ACKS every subscribe instantly and then stalls the row read
+    # that follows it. The ack is the authority on being on the delta feed: a
+    # view that discarded it because the row read timed out would sit at
+    # "not subscribed" against a store that already holds its pid, re-copying
+    # the whole set every window forever and reporting as slow a store that
+    # answered every subscribe it was sent.
+    flaky_row_store!()
+
+    {:ok, view, html} = live(build_conn(), "/")
+
+    # the mount ack proves membership, so a row read that merely timed out
+    # still renders this view's own node — not the blank (healthy banner,
+    # no nodes) that reads as an idle store
+    refute html =~ "connecting to the store"
+    assert "viewer" in node_labels(html)
+
+    for _window <- 1..FlowLive.slow_hint_ticks() do
+      tick_through_throttle(view)
+      refute render(view) =~ "connecting to the store"
+    end
+
+    healthy = render(view)
+
+    # every window's subscribe was acked, so no window may count as a slow
+    # tick: the hint appearing here would mean the acks were being thrown away
+    refute healthy =~ "store is slow"
+    assert "viewer" in node_labels(healthy)
+
+    # and the table is the store's snapshot rebuilt from the ack — one row,
+    # rebuilt identically each window rather than accumulating
+    {:ok, doc} = Floki.parse_document(healthy)
+    assert length(Floki.find(doc, "tbody tr")) == 1
+  end
+
+  # a one-delta store snapshot in the shape `subscribe_seeded/2` returns
+  @snapshot %{"flow13-delta" => {%{timestamp: 4_500.0, pointers: [%{role: "received"}]}, "sig"}}
+
+  # acks every subscribe instantly, and never replies to the row read that
+  # FOLLOWS one (the view's own call timeout is what ends it). Every other
+  # call is answered at once, so each throttle window is: a membership read
+  # that says "you are not in the set", a subscribe that IS acked, and a row
+  # read that times out.
+  defp flaky_row_store! do
+    pid = spawn(fn -> flaky_row_loop(false) end)
+    Process.register(pid, DurableStore)
+    on_exit(fn -> Process.exit(pid, :kill) end)
+    pid
+  end
+
+  defp flaky_row_loop(stall_row?) do
+    receive do
+      {:"$gen_call", from, {:subscribe_seeded, _pid}} ->
+        GenServer.reply(from, {:ok, @snapshot})
+        flaky_row_loop(true)
+
+      {:"$gen_call", from, :subscribers} ->
+        unless stall_row?, do: GenServer.reply(from, [])
+        flaky_row_loop(false)
+
+      {:"$gen_call", from, _other} ->
+        GenServer.reply(from, :ok)
+        flaky_row_loop(stall_row?)
+    end
   end
 
   # the FLOW-11 stub, extended: after refusing the mount subscribe it stops
