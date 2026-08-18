@@ -43,7 +43,9 @@ defmodule KyberWeb.FlowLive do
   call that TIMED OUT (`:slow` — the store is alive but behind a queue of
   appends, so the tick keeps the last-known topology and re-reads next tick)
   from one that exited for any other reason (`:down` — only that detaches);
-  consecutive `:slow` ticks are reported as a hint, since a store stuck
+  the timeout it calls with is a fraction of the tick, because the view is
+  single-threaded and a call on the default 5s would freeze the tab for five
+  ticks. Consecutive `:slow` ticks are reported as a hint, since a store stuck
   behind its append queue otherwise renders as a healthy idle one. The
   re-subscribe ack carries the store's current set, so the recent table is
   rebuilt from that snapshot rather than emptied — a restarted store still
@@ -60,7 +62,8 @@ defmodule KyberWeb.FlowLive do
   tick at human timescales. A view also unsubscribes in `terminate/2`, so a
   closed tab leaves the set at once rather than lingering until the next
   delta's fan-out prune; a hard-killed view cannot run terminate and is
-  left to that prune.
+  left to that prune, or to the membership read, which keeps the liveness
+  sweep it already paid for.
   """
 
   use Phoenix.LiveView
@@ -84,6 +87,12 @@ defmodule KyberWeb.FlowLive do
   # packets * viewers circles — quadratic in viewers. The overflow is
   # reported as a "+N more" label node instead.
   @max_nodes 8
+  # a LiveView is single-threaded: a store call blocks the tick, the delta
+  # feed and every event this tab has. The default 5s call timeout would
+  # stall a tab for five ticks per call (ten per recovery, which makes two);
+  # under the tick interval, a slow store costs less than one tick per call
+  # and turns `:slow` into a fast, honest signal instead of a freeze.
+  @store_call_timeout 800
   # consecutive timed-out topology reads before the view reports the store
   # as slow rather than rendering a stale topology in silence
   @slow_hint_ticks 3
@@ -102,6 +111,11 @@ defmodule KyberWeb.FlowLive do
   # exactly as many ticks as a recovery needs without pinning the interval
   def refresh_ticks, do: @topology_refresh_ticks
 
+  @doc false
+  # the slow-hint threshold, read by the test so it can drive exactly as many
+  # throttle windows as the hint needs without pinning the number
+  def slow_hint_ticks, do: @slow_hint_ticks
+
   @impl true
   def mount(_params, _session, socket) do
     {subscribed?, banner, history} =
@@ -112,7 +126,7 @@ defmodule KyberWeb.FlowLive do
         # re-subscribe rebuilds it — a freshly opened tab reads the store it
         # is attached to, not an empty page that a later recovery would fill.
         {ack, history} =
-          case store_call(fn -> DurableStore.subscribe_seeded(self()) end) do
+          case store_call(fn -> DurableStore.subscribe_seeded(self(), @store_call_timeout) end) do
             {:ok, {:ok, set}} -> {{:ok, set}, seed_history(set)}
             other -> {other, []}
           end
@@ -214,7 +228,9 @@ defmodule KyberWeb.FlowLive do
   # `:down` is the store being gone — distinct from a reply that is itself
   # `nil`, and never confusable with success. A call that TIMES OUT is
   # `:slow`: a store busy behind a queue of appends is alive, so the caller
-  # must skip this tick rather than declare it dead.
+  # must skip this tick rather than declare it dead. Every call it guards
+  # carries `@store_call_timeout`, so `:slow` costs a fraction of a tick
+  # rather than the default five.
   defp store_call(fun) when is_function(fun, 0) do
     if store_up?() do
       try do
@@ -229,7 +245,7 @@ defmodule KyberWeb.FlowLive do
   end
 
   defp read_subscribers do
-    store_call(fn -> Enum.reverse(DurableStore.subscribers()) end)
+    store_call(fn -> Enum.reverse(DurableStore.subscribers(@store_call_timeout)) end)
   end
 
   defp subscriber_row do
@@ -288,19 +304,25 @@ defmodule KyberWeb.FlowLive do
   defp check_membership(socket) do
     case read_subscribers() do
       {:ok, subscribers} ->
-        # the banner is re-read on the healthy path too: the collector can die
-        # while the view stays attached to a fine store, and its notice would
-        # otherwise never appear (a healthy read returns nil, so this is a
-        # no-op whenever nothing changed)
-        socket = socket |> clear_slow() |> assign(:banner, banner(true))
-
         # a pid that is in the set but whose subscribe was never ACKED is
         # already on the feed — the call ran, only the reply was lost — but
         # its history was never seeded, so it re-subscribes ONCE to rebuild
         # (the call is idempotent) rather than once per tick forever
-        if self() in subscribers and socket.assigns.subscribed?,
-          do: assign_topology(socket, subscribers),
-          else: resubscribe(socket)
+        if self() in subscribers and socket.assigns.subscribed? do
+          # the banner is re-read on the HEALTHY path only: the collector can
+          # die while the view stays attached to a fine store, and its notice
+          # would otherwise never appear (a healthy read returns nil, so this
+          # is a no-op whenever nothing changed). Re-reading it before the
+          # re-subscribe outcome is known would render a healthy store over a
+          # view that is not on the delta feed, and would reset the slow
+          # counter that the re-subscribe is about to increment.
+          socket
+          |> clear_slow()
+          |> assign(:banner, banner(true))
+          |> assign_topology(subscribers)
+        else
+          resubscribe(socket)
+        end
 
       # a busy store is still the store: keep the last-known topology and
       # re-read on the next tick rather than retrying inside this one
@@ -321,7 +343,8 @@ defmodule KyberWeb.FlowLive do
   # store now has. Only the packets ring is cleared — those were mid-flight
   # when the store died, and the animation is a fresh world after a restart.
   defp resubscribe(socket) do
-    with {:ok, {:ok, set}} <- store_call(fn -> DurableStore.subscribe_seeded(self()) end),
+    with {:ok, {:ok, set}} <-
+           store_call(fn -> DurableStore.subscribe_seeded(self(), @store_call_timeout) end),
          {:ok, subscribers} <- read_subscribers() do
       history = seed_history(set)
 

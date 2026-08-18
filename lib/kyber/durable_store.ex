@@ -98,13 +98,15 @@ defmodule Kyber.DurableStore do
 
   @doc """
   T19 (FlowLive) — the live subscriber pids, newest registration first (the
-  registered set's own order). Read-only: dead pids are pruned from the
-  reply so a view can never render a corpse, but the registered set itself
-  is left to the fan-out's own prune (this call changes no store semantics).
+  registered set's own order). Dead pids are pruned from the reply so a view
+  can never render a corpse, AND from the registered set itself, so a poll
+  does not re-sweep the same corpses forever; the set is still authoritatively
+  pruned by the fan-out (this call changes no store semantics). `timeout` is
+  the caller's own patience — a view on a 1s tick cannot afford the default.
   """
-  @spec subscribers() :: [pid()]
-  def subscribers do
-    GenServer.call(__MODULE__, :subscribers)
+  @spec subscribers(timeout()) :: [pid()]
+  def subscribers(timeout \\ 5_000) do
+    GenServer.call(__MODULE__, :subscribers, timeout)
   end
 
   @doc "T16 (F2) — remove a subscriber pid."
@@ -122,9 +124,9 @@ defmodule Kyber.DurableStore do
   fable-5 P5 medium: a separate seed-then-attach permanently loses deltas
   committed between the two calls.)
   """
-  @spec subscribe_seeded(pid()) :: {:ok, DeltaSet.t()}
-  def subscribe_seeded(pid) when is_pid(pid) do
-    GenServer.call(__MODULE__, {:subscribe_seeded, pid})
+  @spec subscribe_seeded(pid(), timeout()) :: {:ok, DeltaSet.t()}
+  def subscribe_seeded(pid, timeout \\ 5_000) when is_pid(pid) do
+    GenServer.call(__MODULE__, {:subscribe_seeded, pid}, timeout)
   end
 
   @doc "The pinned replay observable: refused/torn line numbers from the last boot, plus the live count of failed live appends."
@@ -280,7 +282,11 @@ defmodule Kyber.DurableStore do
   end
 
   def handle_call(:subscribers, _from, state) do
-    {:reply, Enum.filter(state.subscribers, &Process.alive?/1), state}
+    # the sweep is already paid for, so the pruned list is kept: otherwise
+    # every corpse is re-swept by every later poll, inside the process that
+    # serializes appends
+    subs = Enum.filter(state.subscribers, &Process.alive?/1)
+    {:reply, subs, %{state | subscribers: subs}}
   end
 
   def handle_call({:unsubscribe, pid}, _from, state) do

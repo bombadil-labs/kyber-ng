@@ -451,6 +451,63 @@ defmodule KyberWeb.FlowLiveTest do
     assert node_labels(html) == ["store"]
   end
 
+  test "FLOW-12: a re-subscribe that times out is never rendered as a healthy store" do
+    # the stand-in is REGISTERED and alive, so the store-down banner never
+    # applies: it refuses the mount subscribe (the view is off the feed and
+    # says so) and then stops replying to subscribe_seeded altogether, which
+    # is what a call queued behind a slow store's appends looks like
+    stall_store!()
+
+    {:ok, view, html} = live(build_conn(), "/")
+    assert html =~ "connecting to the store"
+
+    # each window is one membership read (instant, an empty set — so the view
+    # is not in it and must re-subscribe) plus one re-subscribe that times
+    # out. The banner may not go healthy on the way: the view is still off
+    # the delta feed, and a nil banner over an empty topology reads as an
+    # idle store
+    for _window <- 1..FlowLive.slow_hint_ticks() do
+      tick_through_throttle(view)
+      assert render(view) =~ "connecting to the store"
+    end
+
+    stalled = render(view)
+
+    # and the timeouts ACCUMULATE across windows: clearing the counter before
+    # the re-subscribe's outcome is known would reset it every window, so the
+    # hint could never reach its threshold
+    assert stalled =~ "store is slow"
+    assert node_labels(stalled) == ["store"]
+  end
+
+  # the FLOW-11 stub, extended: after refusing the mount subscribe it stops
+  # replying to `subscribe_seeded` at all, so the view's own call timeout is
+  # what ends the call (a store alive but behind its append queue).
+  # `:subscribers` is still answered instantly, so every throttle window
+  # reaches the re-subscribe.
+  defp stall_store! do
+    pid = spawn(fn -> stall_loop(:refuse) end)
+    Process.register(pid, DurableStore)
+    on_exit(fn -> Process.exit(pid, :kill) end)
+    pid
+  end
+
+  defp stall_loop(mode) do
+    receive do
+      {:"$gen_call", from, {:subscribe_seeded, _pid}} ->
+        if mode == :refuse, do: GenServer.reply(from, {:error, :unavailable})
+        stall_loop(:stall)
+
+      {:"$gen_call", from, :subscribers} ->
+        GenServer.reply(from, [])
+        stall_loop(mode)
+
+      {:"$gen_call", from, _other} ->
+        GenServer.reply(from, :ok)
+        stall_loop(mode)
+    end
+  end
+
   # replies to the store's call protocol: the FIRST subscribe_seeded is
   # refused, every later one is acked (so the view's own refresh tick
   # recovers against it rather than crashing on an unexpected reply)
