@@ -82,7 +82,7 @@ defmodule Kyber.AgentDaemonTest do
   end
 
   defp fresh_dir(base, tag) do
-    Path.join(base, "kyber-agent-#{tag}-#{System.unique_integer([:positive])}")
+    Path.join(base, "kyber-agent-#{tag}-#{System.os_time()}-#{System.unique_integer([:positive])}")
   end
 
   defp boot_on(log_path) do

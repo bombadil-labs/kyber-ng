@@ -104,7 +104,7 @@ defmodule KyberWeb.TraceLiveTest do
   # ---------------------------------------------------------------- AC3
 
   test "AC3: clicking a root delta in view 1 opens the full trace in view 2" do
-    dir = Path.join(System.tmp_dir!(), "kyber-trace-#{System.unique_integer([:positive])}")
+    dir = Path.join(System.tmp_dir!(), "kyber-trace-#{System.os_time()}-#{System.unique_integer([:positive])}")
     File.mkdir_p!(dir)
     start_supervised!({DurableStore, Path.join(dir, "store.jsonl")})
 

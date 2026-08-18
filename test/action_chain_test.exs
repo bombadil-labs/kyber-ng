@@ -65,7 +65,7 @@ defmodule Kyber.Agent.ActionChainTest do
   end
 
   defp tmp_workspace do
-    ws = Path.join(System.tmp_dir!(), "kyber-t12-ws-#{System.unique_integer([:positive])}")
+    ws = Path.join(System.tmp_dir!(), "kyber-t12-ws-#{System.os_time()}-#{System.unique_integer([:positive])}")
     File.mkdir_p!(ws)
     File.write!(Path.join(ws, "notes.txt"), @fixture_content)
     on_exit(fn -> File.rm_rf(ws) end)

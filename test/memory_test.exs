@@ -135,7 +135,7 @@ defmodule Kyber.Agent.MemoryTest do
       |> remember!(@ts, "user:myk", "Myk prefers Elixir")
 
     vault_dir =
-      Path.join(System.tmp_dir!(), "kyber-memory-eol-#{System.unique_integer([:positive])}")
+      Path.join(System.tmp_dir!(), "kyber-memory-eol-#{System.os_time()}-#{System.unique_integer([:positive])}")
 
     {:ok, %{files: 1}} = Projector.project(set, vault_dir)
     path = Projector.path(vault_dir, "user:myk")
@@ -204,7 +204,7 @@ defmodule Kyber.Agent.MemoryTest do
     start_supervised!(Kyber.Store)
 
     vault_dir =
-      Path.join(System.tmp_dir!(), "kyber-memory-ab-#{System.unique_integer([:positive])}")
+      Path.join(System.tmp_dir!(), "kyber-memory-ab-#{System.os_time()}-#{System.unique_integer([:positive])}")
 
     {:ok, memory_a} = Memory.start_link(name: nil)
 

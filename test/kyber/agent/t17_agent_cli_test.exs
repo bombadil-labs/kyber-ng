@@ -707,7 +707,7 @@ defmodule Kyber.Agent.T17AgentCliTest do
       # the would-be victim: a sibling of the registry — exactly what
       # `agent new ../<dir> --force` used to rm_rf
       victim =
-        Path.join(Path.dirname(registry), "t17-victim-#{System.unique_integer([:positive])}")
+        Path.join(Path.dirname(registry), "t17-victim-#{System.os_time()}-#{System.unique_integer([:positive])}")
 
       File.mkdir_p!(victim)
       canary = Path.join(victim, "keep.txt")
@@ -740,7 +740,7 @@ defmodule Kyber.Agent.T17AgentCliTest do
 
     test "an absolute-path name is refused; the target dir survives", %{registry: registry} do
       victim =
-        Path.join(System.tmp_dir!(), "t17-abs-victim-#{System.unique_integer([:positive])}")
+        Path.join(System.tmp_dir!(), "t17-abs-victim-#{System.os_time()}-#{System.unique_integer([:positive])}")
 
       File.mkdir_p!(victim)
       on_exit(fn -> File.rm_rf(victim) end)

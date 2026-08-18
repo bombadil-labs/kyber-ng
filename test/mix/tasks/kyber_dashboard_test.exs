@@ -170,7 +170,7 @@ defmodule Mix.Tasks.Kyber.DashboardTest do
     outside = Path.join(System.tmp_dir!(), "kyber-dash-outside/store.jsonl")
 
     relocated =
-      Path.join(System.tmp_dir!(), "kyber-dash-tmpdir-#{System.unique_integer([:positive])}")
+      Path.join(System.tmp_dir!(), "kyber-dash-tmpdir-#{System.os_time()}-#{System.unique_integer([:positive])}")
 
     File.mkdir_p!(relocated)
 
@@ -203,7 +203,7 @@ defmodule Mix.Tasks.Kyber.DashboardTest do
     # by reflex — which is the habit the tripwire exists to prevent. /var/tmp
     # stands in for it here: outside /tmp, outside home, and POSIX-standard.
     relocated =
-      Path.join("/var/tmp", "kyber-dash-varfolders-#{System.unique_integer([:positive])}")
+      Path.join("/var/tmp", "kyber-dash-varfolders-#{System.os_time()}-#{System.unique_integer([:positive])}")
 
     File.mkdir_p!(relocated)
 

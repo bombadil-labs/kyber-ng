@@ -517,7 +517,7 @@ defmodule Kyber.Agent.T17DaemonIdentityTest do
     on_exit(fn -> System.delete_env("T17_DI_OVERRIDE") end)
 
     registry =
-      Path.join(System.tmp_dir!(), "kyber-t17di-reg-#{System.unique_integer([:positive])}")
+      Path.join(System.tmp_dir!(), "kyber-t17di-reg-#{System.os_time()}-#{System.unique_integer([:positive])}")
 
     File.mkdir_p!(Path.join(registry, "wisp"))
     on_exit(fn -> File.rm_rf(registry) end)

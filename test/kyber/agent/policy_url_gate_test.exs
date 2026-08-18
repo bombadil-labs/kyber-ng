@@ -42,7 +42,7 @@ defmodule Kyber.Agent.PolicyUrlGateTest do
   end
 
   defp tmp_workspace do
-    ws = Path.join(System.tmp_dir!(), "kyber-t14b-urlgate-#{System.unique_integer([:positive])}")
+    ws = Path.join(System.tmp_dir!(), "kyber-t14b-urlgate-#{System.os_time()}-#{System.unique_integer([:positive])}")
     File.mkdir_p!(ws)
     on_exit(fn -> File.rm_rf(ws) end)
     ws
