@@ -209,6 +209,12 @@ defmodule KyberWeb.FlowLiveTest do
     ids = packet_ids(html)
     assert delta_id(4_240.0) in ids
     refute delta_id(4_201.0) in ids
+
+    # the table is history, not animation: it has its own (deeper, 50-row)
+    # bound, so the rows for the deltas whose packets rolled off are still
+    # there — including the very first one
+    assert length(Floki.find(doc, "tbody tr")) == 40
+    assert Floki.find(doc, "tr#flow-row-1") != []
   end
 
   test "FLOW-5: the banner renders when the store is absent (separate-BEAM state)" do
@@ -249,6 +255,8 @@ defmodule KyberWeb.FlowLiveTest do
     {:ok, view, html} = live(conn, "/")
     refute html =~ "nothing to show"
 
+    assert :ok = DurableStore.append(received_wire(4_290.0, "flow7-before", "pre-outage"))
+
     # the store dies under the view; `stop_supervised!` blocks until it is
     # down, so the following send is strictly ordered after the death
     stop_supervised!(Kyber.DurableStore)
@@ -258,6 +266,9 @@ defmodule KyberWeb.FlowLiveTest do
 
     assert down =~ "nothing to show"
     assert node_labels(down) == ["store"]
+    # the outage does not rewrite history: the row for the delta that DID
+    # commit stays, and the banner is what reports the live state
+    assert down =~ "flow-row-1"
 
     # banner and row agree: a re-subscribe that could not be acked never
     # renders a healthy topology (no nodes, no edges) while detached — and
@@ -280,6 +291,11 @@ defmodule KyberWeb.FlowLiveTest do
 
     refute back =~ "nothing to show"
     assert "viewer" in node_labels(back)
+
+    # the fresh store mints fresh ids, so the re-subscribe clears BOTH rings:
+    # the pre-outage row is no longer reachable and does not linger
+    {:ok, back_doc} = Floki.parse_document(back)
+    assert Floki.find(back_doc, "tbody tr") == []
 
     # the re-subscribe is live, not cosmetic — the fresh store's feed lands
     assert :ok = DurableStore.append(received_wire(4_300.0, "flow7-restart", "recovered"))
@@ -313,5 +329,11 @@ defmodule KyberWeb.FlowLiveTest do
     # is the CAP, not the live subscriber count
     assert length(Floki.find(doc, "svg.flow line.edge")) == 8
     assert length(packet_ids(html)) == 8
+
+    # the cap may never hide the viewing LiveView from its own topology: the
+    # view subscribed LAST, so an oldest-first take would drop it. Nodes are
+    # keyed by pid hash and every rendered node carries the packet, so the
+    # view's own packet circle is the proof that its node is in the row.
+    assert Floki.find(doc, ~s(circle.packet[id="packet-1-#{:erlang.phash2(view.pid)}"])) != []
   end
 end

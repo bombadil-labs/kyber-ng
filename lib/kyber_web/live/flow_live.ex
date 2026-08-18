@@ -10,7 +10,9 @@ defmodule KyberWeb.FlowLive do
   a number.
 
   The view is itself a subscriber, so it always renders at least its own
-  node. Node labels are honest: a registered pid is labelled by the last
+  node — its own pid is pinned to the front of the capped row, since the
+  cap would otherwise drop a view that attached after `@max_nodes` others.
+  Node labels are honest: a registered pid is labelled by the last
   segment of its registered name (`Kyber.Daemon` → "daemon"), an anonymous
   pid is "viewer" — the dashboard views and the index server are all
   anonymous and are NOT guessed apart.
@@ -20,6 +22,8 @@ defmodule KyberWeb.FlowLive do
   packet is therefore rendered down EVERY live edge and the authoritative
   delivered/pruned counts are surfaced as text in the recent table. The two
   disagree only for a subscriber that attached after the delta committed.
+  The table reads the `@history_max` ring, not the packets: animation ends
+  at `@packet_ttl_ms`, but the record of what committed persists.
 
   Separate-BEAM / store-down states render the same explicit banner as
   view 1 (M4/L6). Animation is CSS (offset-path + keyframes) inside the SVG —
@@ -30,7 +34,10 @@ defmodule KyberWeb.FlowLive do
   banner when it went away. Every store read is guarded (`store_call/1`), so
   a store that dies between the liveness check and the call cannot take the
   socket — and every dashboard tab — down with it, and a re-subscribe that
-  fails is never rendered as a healthy topology.
+  fails is never rendered as a healthy topology. `store_call/1` separates a
+  call that TIMED OUT (`:slow` — the store is alive but behind a queue of
+  appends, so the tick keeps the last-known topology and re-reads next tick)
+  from one that exited for any other reason (`:down` — only that detaches).
 
   `DurableStore.subscribers/0` is a blocking call into the process that
   serializes appends, and it sweeps the whole subscriber set for liveness —
@@ -55,6 +62,9 @@ defmodule KyberWeb.FlowLive do
   @max_packets 30
   # a packet leaves the DOM once its animation has finished (dur + slack)
   @packet_ttl_ms 2_500
+  # the table is the page's record of what committed, so it outlives the
+  # animation: history is bounded by rows, not by the packet TTL
+  @history_max 50
   # every open tab is itself a subscriber, so an uncapped row would render
   # packets * viewers circles — quadratic in viewers. The overflow is
   # reported as a "+N more" label node instead.
@@ -83,6 +93,7 @@ defmodule KyberWeb.FlowLive do
       |> assign(:banner, banner(store_up?()))
       |> assign(:funnel, @funnel)
       |> assign(:packets, [])
+      |> assign(:history, [])
       |> assign(:seq, 0)
       |> assign(:subscribed?, subscribed?)
       |> assign(:tick, 0)
@@ -113,8 +124,13 @@ defmodule KyberWeb.FlowLive do
     # oldest-first ring, capped at @max_packets (the same append-and-take
     # shape view 1 uses for its waterfall rows)
     packets = Enum.take(socket.assigns.packets ++ [packet], -@max_packets)
+    history = Enum.take(socket.assigns.history ++ [Map.delete(packet, :at)], -@history_max)
 
-    {:noreply, socket |> assign(:packets, packets) |> assign(:seq, seq)}
+    {:noreply,
+     socket
+     |> assign(:packets, packets)
+     |> assign(:history, history)
+     |> assign(:seq, seq)}
   end
 
   def handle_info(:refresh, socket) do
@@ -127,12 +143,12 @@ defmodule KyberWeb.FlowLive do
       |> Enum.reject(&(now_ms() - &1.at > @packet_ttl_ms))
       |> Enum.map(&refresh_counts/1)
 
-    # steady state is an unchanged list: re-assigning it would make LiveView
-    # re-diff the packets × subscribers block every second for nothing
+    history = Enum.map(socket.assigns.history, &refresh_counts/1)
+
     socket =
-      if packets == socket.assigns.packets,
-        do: socket,
-        else: assign(socket, :packets, packets)
+      socket
+      |> assign_changed(:packets, packets)
+      |> assign_changed(:history, history)
 
     {:noreply, socket}
   end
@@ -147,12 +163,15 @@ defmodule KyberWeb.FlowLive do
   # store's append-serialization process: it can die between the liveness
   # check and the call, and an exiting call would take the socket with it.
   # `:down` is the store being gone — distinct from a reply that is itself
-  # `nil`, and never confusable with success.
+  # `nil`, and never confusable with success. A call that TIMES OUT is
+  # `:slow`: a store busy behind a queue of appends is alive, so the caller
+  # must skip this tick rather than declare it dead.
   defp store_call(fun) when is_function(fun, 0) do
     if store_up?() do
       try do
         {:ok, fun.()}
       catch
+        :exit, {:timeout, _call} -> :slow
         :exit, _ -> :down
       end
     else
@@ -167,7 +186,7 @@ defmodule KyberWeb.FlowLive do
   defp subscriber_row do
     case read_subscribers() do
       {:ok, subscribers} -> subscribers
-      :down -> []
+      _down_or_slow -> []
     end
   end
 
@@ -211,6 +230,11 @@ defmodule KyberWeb.FlowLive do
               do: assign_topology(socket, subscribers),
               else: resubscribe(socket)
 
+          # a busy store is still the store: keep the last-known topology and
+          # re-read on the next tick rather than retrying inside this one
+          :slow ->
+            socket
+
           :down ->
             assign_detached(socket)
         end
@@ -229,8 +253,10 @@ defmodule KyberWeb.FlowLive do
       |> assign(:banner, banner(true))
       |> assign(:subscribed?, true)
       |> assign(:packets, [])
+      |> assign(:history, [])
       |> assign_topology(subscribers)
     else
+      :slow -> socket
       :down -> assign_detached(socket)
     end
   end
@@ -255,7 +281,7 @@ defmodule KyberWeb.FlowLive do
   # rendered (capped) nodes carry edges and packets; the overflow is one
   # label node holding the last slot.
   defp layout(pids) do
-    shown = Enum.take(pids, @max_nodes)
+    shown = pids |> self_first() |> Enum.take(@max_nodes)
     hidden = length(pids) - length(shown)
     slots = length(shown) + min(hidden, 1)
 
@@ -280,6 +306,13 @@ defmodule KyberWeb.FlowLive do
     {nodes, more}
   end
 
+  # the view is its own subscriber, and the row is capped: without this a
+  # view that attached after @max_nodes others would be cut from its own
+  # topology. The displaced node is counted in "+N more" like any other.
+  defp self_first(pids) do
+    if self() in pids, do: [self() | List.delete(pids, self())], else: pids
+  end
+
   defp spread(i, slots), do: round(@scene_width * (i + 1) / (slots + 1))
 
   defp label_for(pid) do
@@ -302,10 +335,20 @@ defmodule KyberWeb.FlowLive do
 
   # ------------------------------------------------------------- packets
 
-  defp refresh_counts(packet) do
-    counts = Collector.fan_out_counts(packet.id)
-    %{packet | delivered: counts.delivered, pruned: counts.pruned}
+  # steady state is an unchanged list: re-assigning it would make LiveView
+  # re-diff the packets × subscribers block every second for nothing
+  defp assign_changed(socket, key, value) do
+    if value == socket.assigns[key], do: socket, else: assign(socket, key, value)
   end
+
+  # the fan-out span is written once, so a filled entry is terminal — only
+  # the still-nil ones are worth re-reading (history holds @history_max)
+  defp refresh_counts(%{delivered: nil} = entry) do
+    counts = Collector.fan_out_counts(entry.id)
+    %{entry | delivered: counts.delivered, pruned: counts.pruned}
+  end
+
+  defp refresh_counts(entry), do: entry
 
   defp now_ms, do: System.monotonic_time(:millisecond)
 
@@ -385,7 +428,7 @@ defmodule KyberWeb.FlowLive do
           </tr>
         </thead>
         <tbody>
-          <tr :for={p <- Enum.reverse(@packets)} id={"flow-row-#{p.seq}"}>
+          <tr :for={p <- Enum.reverse(@history)} id={"flow-row-#{p.seq}"}>
             <td>
               <a class="delta" href={"/trace/" <> p.id} phx-click="open" phx-value-id={p.id}>
                 <%= short(p.id) %>
